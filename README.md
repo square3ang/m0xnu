@@ -1,6 +1,6 @@
-# m0xnu — iOS 9.3.5 (XNU) on Samsung Galaxy S3 3G (GT-I9300 / Exynos 4412)
+# m0xnu — iOS 9.3.5 (XNU) on Samsung Galaxy S3 3G (GT-I9300 / SHW-M440S / Exynos 4412)
 
-> **Experimental bare-metal port of Apple XNU / iOS 9.3.5 (`iPhone4,1`, `13G36`) running natively and standalone from eMMC on the Samsung Galaxy S3 3G (`GT-I9300`, codename `m0` / `midas`).**
+> **Experimental bare-metal port of Apple XNU / iOS 9.3.5 (`iPhone4,1`, `13G36`) running natively and standalone from eMMC on the Samsung Galaxy S3 3G (`GT-I9300` / `SHW-M440S`, codename `m0` / `midas`).**
 
 Full Build & Installation Guide: **[docs/INSTALL.md](docs/INSTALL.md)**
 
@@ -14,7 +14,7 @@ No Apple, Samsung, or Broadcom proprietary binaries are included in this reposit
 
 ---
 
-## Hardware Support Status (`GT-I9300`)
+## Hardware Support Status (`GT-I9300` / `SHW-M440S`)
 
 | Subsystem | Hardware | Status | Implementation |
 | --- | --- | --- | --- |
