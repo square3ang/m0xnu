@@ -1,0 +1,20 @@
+[binaries]
+c = '@M0XNU_ROOT@/gpu/ios-gl/toolchain/ios9-cc'
+cpp = '@M0XNU_ROOT@/gpu/ios-gl/toolchain/ios9-cxx'
+objc = '@M0XNU_ROOT@/gpu/ios-gl/toolchain/ios9-cc'
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['-fno-stack-protector', '-D__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__=90000', '-I@M0XNU_ROOT@/gpu/ios-gl/toolchain/drm/include', '-I@M0XNU_ROOT@/gpu/linux-lima/include/uapi']
+cpp_args = ['-fno-stack-protector', '-D__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__=90000', '-I@M0XNU_ROOT@/gpu/ios-gl/toolchain/drm/include', '-I@M0XNU_ROOT@/gpu/linux-lima/include/uapi']
+
+[properties]
+pkg_config_libdir = '@M0XNU_ROOT@/gpu/ios-gl/toolchain/pkgconfig'
+
+[host_machine]
+system = 'darwin'
+cpu_family = 'arm'
+cpu = 'armv7'
+endian = 'little'

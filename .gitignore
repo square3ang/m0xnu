@@ -1,0 +1,26 @@
+# User-supplied proprietary Apple/Samsung firmware & device backups (NEVER commit)
+fw/
+backup/
+out/
+prebuilt/
+recovery/
+
+# Upstream trees (cloned & patched via patches/*.patch)
+u-boot/
+gpu/mesa-lima/
+gpu/linux-lima/
+tools/cctools/
+
+# Build & Python caches
+__pycache__/
+*.pyc
+*.o
+*.elf
+*.itb
+*.raw
+*.simg
+*.dmg
+*.ipsw
+*.macho
+*.cdhash
+a.out

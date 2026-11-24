@@ -1,0 +1,785 @@
+diff --git a/arch/arm/dts/exynos4412-midas.dts b/arch/arm/dts/exynos4412-midas.dts
+index 9c3bb5a6..378b9204 100644
+--- a/arch/arm/dts/exynos4412-midas.dts
++++ b/arch/arm/dts/exynos4412-midas.dts
+@@ -336,6 +336,9 @@
+ 
+ 			ldo25_reg: LDO25 {
+ 				regulator-compatible = "LDO25";
++				regulator-name = "LCD_VCC_3.3V";	/* s6e8aa0 vci (Linux galaxy-s3) */
++				regulator-min-microvolt = <2800000>;
++				regulator-max-microvolt = <2800000>;
+ 				regulator-mem-idle;
+ 			};
+ 
+diff --git a/board/samsung/midas/Kconfig b/board/samsung/midas/Kconfig
+index f40bb7af..9a6c957c 100644
+--- a/board/samsung/midas/Kconfig
++++ b/board/samsung/midas/Kconfig
+@@ -11,4 +11,13 @@ config SYS_VENDOR
+ config SYS_CONFIG_NAME
+ 	default "midas"
+ 
++config MIDAS_CHAINLOAD
++	bool "Build for chainloading from the installed U-Boot"
++	help
++	  Enter fastboot mode when no boot mode was requested. Meant for a copy
++	  started from the installed U-Boot (FIT in the "boot" partition), so it
++	  can be driven over USB without UART.
++	  Do not flash such a build as the bootloader: it would never boot an OS
++	  on its own.
++
+ endif
+diff --git a/board/samsung/midas/Makefile b/board/samsung/midas/Makefile
+index e73cc304..04cedbd8 100644
+--- a/board/samsung/midas/Makefile
++++ b/board/samsung/midas/Makefile
+@@ -5,3 +5,7 @@
+ #
+ 
+ obj-y	+= board_detect.o midas.o led.o
++obj-$(CONFIG_EXYNOS_MIPI_DSIM) += xnufb.o
++ifndef CONFIG_SPL_BUILD
++obj-$(CONFIG_MIDAS_CHAINLOAD) += malitest.o
++endif
+diff --git a/board/samsung/midas/midas.c b/board/samsung/midas/midas.c
+index 99aebb7d..9948a9fe 100644
+--- a/board/samsung/midas/midas.c
++++ b/board/samsung/midas/midas.c
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier: GPL-2.0+
+  */
+ #include <common.h>
++#include <cpu_func.h>
+ #include <asm/gpio.h>
+ #include <asm/arch/gpio.h>
+ #include <asm/arch/power.h>
+@@ -419,9 +420,8 @@ static enum boot_mode midas_check_keycombo(void)
+ 		return MODE_CONSOLE;
+ 	}
+ 
+-	/* Power key pressed means that LPM should be skipped.
+-	 * TODO: there's probably a better way to determine wakeup source... */
+-	if (ret & KEY_POWER)
++	/* Power key pressed means that LPM should be skipped. */
++	if (ret & COMBO_POWER)
+ 		return MODE_SKIP_LPM;
+ 
+ 	return MODE_NONE;
+@@ -434,6 +434,14 @@ static enum boot_mode midas_get_boot_mode(void)
+ 	u32 inform = readl(&pwr->inform3);
+ 	/* clear out inform3 for subsequent boots */
+ 	writel(0, &pwr->inform3);
++	if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD)) {
++		u32 inform2 = readl(&pwr->inform2);
++		if (inform2) {
++			writel(0, &pwr->inform2);
++			if ((inform2 & ~MODE_MAX) == INFORM_MAGIC)
++				inform = inform2;
++		}
++	}
+ 	printf("inform3: 0x%08x: ", inform);
+ 	if ((inform & ~MODE_MAX) != INFORM_MAGIC) {
+ 		printf("invalid\n");
+@@ -495,21 +503,253 @@ int exynos_init(void)
+ 	return 0;
+ }
+ 
++#define LPM_FB_PA	0x60000000UL
++#define LPM_W		720
++#define LPM_H		1280
++
++static void lpm_fill_rect(u32 *fb, int x, int y, int w, int h, u32 col)
++{
++	int ix, iy;
++
++	if (x < 0) { w += x; x = 0; }
++	if (y < 0) { h += y; y = 0; }
++	if (x + w > LPM_W) w = LPM_W - x;
++	if (y + h > LPM_H) h = LPM_H - y;
++	for (iy = y; iy < y + h; iy++) {
++		u32 *row = fb + iy * LPM_W + x;
++		for (ix = 0; ix < w; ix++)
++			row[ix] = col;
++	}
++}
++
++static void lpm_draw_glyph(u32 *fb, int x0, int y0, int scale, int idx, u32 col)
++{
++	/* 5x7 glyphs for '0'..'9' (0..9) and '%' (10) */
++	static const u8 font[11][7] = {
++		{ 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e }, /* 0 */
++		{ 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e }, /* 1 */
++		{ 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f }, /* 2 */
++		{ 0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e }, /* 3 */
++		{ 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 }, /* 4 */
++		{ 0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e }, /* 5 */
++		{ 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e }, /* 6 */
++		{ 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 }, /* 7 */
++		{ 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e }, /* 8 */
++		{ 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c }, /* 9 */
++		{ 0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03 }, /* % */
++	};
++	int r, c;
++
++	if (idx < 0 || idx > 10)
++		return;
++	for (r = 0; r < 7; r++)
++		for (c = 0; c < 5; c++)
++			if (font[idx][r] & (1u << (4 - c)))
++				lpm_fill_rect(fb, x0 + c * scale, y0 + r * scale,
++					      scale, scale, col);
++}
++
++static void lpm_draw_screen(int soc)
++{
++	u32 *fb = (u32 *)LPM_FB_PA;
++	int bx = 224, by = 520, bw = 260, bh = 124, bdr = 6, pad = 10;
++	int inner_w = bw - 2 * (bdr + pad);
++	int fill_w;
++	u32 fill_col;
++	int digs[4], nd = 0, s, tw, tx, ty, i;
++
++	if (soc < 0) soc = 0;
++	if (soc > 100) soc = 100;
++	fill_w = (inner_w * soc) / 100;
++	if (soc > 0 && fill_w < 8)
++		fill_w = 8;
++	fill_col = (soc <= 15) ? 0xffff3b30u : 0xff34c759u; /* iOS Red / Green */
++
++	/* Pure black OLED background */
++	lpm_fill_rect(fb, 0, 0, LPM_W, LPM_H, 0xff000000u);
++	/* Battery body outline + inner well + positive terminal cap */
++	lpm_fill_rect(fb, bx, by, bw, bh, 0xff8e8e93u);
++	lpm_fill_rect(fb, bx + bdr, by + bdr, bw - 2 * bdr, bh - 2 * bdr, 0xff141416u);
++	lpm_fill_rect(fb, bx + bw + 4, by + 36, 14, bh - 72, 0xff8e8e93u);
++	/* Live charge bar */
++	if (fill_w > 0)
++		lpm_fill_rect(fb, bx + bdr + pad, by + bdr + pad,
++			      fill_w, bh - 2 * (bdr + pad), fill_col);
++
++	/* Centered percentage digits (e.g. "86%") */
++	s = soc;
++	if (s >= 100) {
++		digs[nd++] = 1; digs[nd++] = 0; digs[nd++] = 0;
++	} else if (s >= 10) {
++		digs[nd++] = s / 10; digs[nd++] = s % 10;
++	} else {
++		digs[nd++] = s;
++	}
++	digs[nd++] = 10; /* '%' */
++	tw = nd * (5 * 6 + 10) - 10;
++	tx = (LPM_W - tw) / 2;
++	ty = by + bh + 44;
++	for (i = 0; i < nd; i++)
++		lpm_draw_glyph(fb, tx + i * 40, ty, 6, digs[i], 0xffe5e5eau);
++
++	flush_dcache_range(LPM_FB_PA, LPM_FB_PA + (ulong)LPM_W * LPM_H * 4UL);
++}
++
++static enum boot_mode midas_lpm_charge(void)
++{
++	struct udevice *bat = NULL, *extcon = NULL, *charger = NULL;
++	int cur = 0, soc = 0, disp_on = 1, disp_inited = 0;
++	int screen_ms = 0, pwr_ms = 0, vdown_ms = 0, unplug_cnt = 0, tick = 0;
++
++	printf("Entering offline charging (LPM) mode\n");
++	uclass_get_device(UCLASS_BATTERY, 0, &bat);
++	uclass_get_device(UCLASS_EXTCON, 0, &extcon);
++	uclass_get_device(UCLASS_CHARGER, 0, &charger);
++
++	if (extcon)
++		cur = extcon_get_max_charge_current(extcon);
++	if (charger)
++		charger_set_current(charger, cur > 0 ? cur : 500000);
++	if (bat)
++		soc = battery_get_soc(bat);
++
++	midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
++	midas_led_action(soc >= 95 ? LED_GREEN : LED_RED, LEDST_ON);
++
++	if (IS_ENABLED(CONFIG_EXYNOS_MIPI_DSIM)) {
++		lpm_draw_screen(soc);
++		if (xnufb_start(LPM_FB_PA, 32) == 0)
++			disp_inited = 1;
++	}
++
++	for (;;) {
++		int pwr, home, vdown;
++
++		mdelay(50);
++		tick++;
++
++		/* Charger disconnect -> power off cleanly */
++		if (extcon) {
++			cur = extcon_get_max_charge_current(extcon);
++			if (cur <= 0) {
++				if (++unplug_cnt >= 4) {
++					printf("LPM: charger unplugged, powering off\n");
++					if (disp_inited && disp_on)
++						xnufb_display_enable(0);
++					midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
++					midas_power_off();
++				}
++			} else {
++				unplug_cnt = 0;
++			}
++		}
++
++		pwr   = !gpio_get_value(EXYNOS4X12_GPIO_X27);
++		home  = !gpio_get_value(EXYNOS4X12_GPIO_X01);
++		vdown = !gpio_get_value(EXYNOS4X12_GPIO_X33);
++
++		/* Hold Vol-Down (>=300ms) -> fastboot */
++		if (vdown) {
++			vdown_ms += 50;
++			if (vdown_ms >= 300) {
++				if (disp_inited && !disp_on)
++					xnufb_display_enable(1);
++				return MODE_FASTBOOT;
++			}
++		} else {
++			vdown_ms = 0;
++		}
++
++		/* Hold Power (>=800ms) -> boot iOS; short press -> toggle OLED */
++		if (pwr) {
++			pwr_ms += 50;
++			if (pwr_ms >= 800) {
++				printf("LPM: power held, booting iOS\n");
++				if (disp_inited && !disp_on)
++					xnufb_display_enable(1);
++				return MODE_SKIP_LPM;
++			}
++		} else {
++			if (pwr_ms > 0 && pwr_ms < 800 && disp_inited) {
++				if (disp_on) {
++					xnufb_display_enable(0);
++					disp_on = 0;
++				} else {
++					if (bat) soc = battery_get_soc(bat);
++					lpm_draw_screen(soc);
++					xnufb_display_enable(1);
++					disp_on = 1;
++					screen_ms = 0;
++				}
++			}
++			pwr_ms = 0;
++		}
++
++		/* Home press wakes screen for 8s */
++		if (home && disp_inited) {
++			if (!disp_on) {
++				if (bat) soc = battery_get_soc(bat);
++				lpm_draw_screen(soc);
++				xnufb_display_enable(1);
++				disp_on = 1;
++			}
++			screen_ms = 0;
++		}
++
++		/* Refresh SoC, LED and charging gauge every 2s */
++		if (tick % 40 == 0) {
++			if (bat)
++				soc = battery_get_soc(bat);
++			midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
++			midas_led_action(soc >= 95 ? LED_GREEN : LED_RED, LEDST_ON);
++			if (disp_inited && disp_on)
++				lpm_draw_screen(soc);
++		}
++
++		/* Auto-blank OLED after 8s to save power and avoid burn-in */
++		if (disp_inited && disp_on) {
++			screen_ms += 50;
++			if (screen_ms >= 8000) {
++				xnufb_display_enable(0);
++				disp_on = 0;
++			}
++		}
++	}
++}
++
+ int exynos_late_init(void)
+ {
++	struct exynos4412_power *pwr = (struct exynos4412_power *)samsung_get_base_power();
++	u32 rst_stat = readl(&pwr->rst_stat);
++
+ 	board_load_info();
+ 
+ 	env_set("bootmode", "normal");
+ 	enum boot_mode mode = midas_get_boot_mode();
+ 	if (mode == MODE_NONE)
+ 		mode = midas_check_keycombo();
++	/*
++	 * Chainloaded copy: auto-boot XNU from eMMC CACHE partition (xnuboot) on normal power-on
++	 * with zero USB required. Hold Vol-Down (or Vol-Down+Home) or trigger INFORM3=MODE_FASTBOOT
++	 * to enter fastboot instead.
++	 */
++	if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD) &&
++	    mode != MODE_FASTBOOT && mode != MODE_RECOVERY && mode != MODE_CONSOLE &&
++	    !gpio_get_value(EXYNOS4X12_GPIO_X33))
++		mode = MODE_FASTBOOT;
+ 
+ 	enum battery_boot_mode bat_state = midas_check_battery();
+ 	if (bat_state == BATTERY_ABORT) {
+ 		/* release PS_HOLD - turn off board */
+ 		midas_power_off();
+ 	} else if (bat_state == BATTERY_LPM && mode == MODE_NONE) {
+-		env_set("bootmode", "lpm");
++		/* Enter offline charging only on cold boot (not WDT/SW reboot from running iOS) */
++		if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD) &&
++		    !(rst_stat & (0x20000000u | 0x00000800u))) {
++			mode = midas_lpm_charge();
++		} else {
++			env_set("bootmode", "lpm");
++		}
+ 	}
+ 
+ 	init_overlays();
+@@ -537,6 +777,8 @@ int exynos_late_init(void)
+ 	default:
+ 		printf("Booting normally...\n");
+ 		midas_led_action(LED_GREEN | LED_RED, LEDST_ON);
++		if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD))
++			env_set("bootcmd", "run xnuboot");
+ 	}
+ 
+ 	return 0;
+diff --git a/board/samsung/midas/midas.h b/board/samsung/midas/midas.h
+index bafd1f97..47089820 100644
+--- a/board/samsung/midas/midas.h
++++ b/board/samsung/midas/midas.h
+@@ -10,6 +10,8 @@
+ int midas_led_action(int mask, enum led_state_t state);
+ void init_overlays(void);
+ unsigned long midas_ram_size(void);
++int xnufb_start(ulong fb, int bpp);
++void xnufb_display_enable(int on);
+ 
+ #define INFORM_MAGIC 0x12345670
+ enum boot_mode {
+diff --git a/drivers/fastboot/fb_getvar.c b/drivers/fastboot/fb_getvar.c
+index 95cb4341..bcebfc5a 100644
+--- a/drivers/fastboot/fb_getvar.c
++++ b/drivers/fastboot/fb_getvar.c
+@@ -30,6 +30,9 @@ static void getvar_partition_type(char *part_name, char *response);
+ static void getvar_partition_size(char *part_name, char *response);
+ #endif
+ static void getvar_is_userspace(char *var_parameter, char *response);
++#ifdef CONFIG_MIDAS_CHAINLOAD
++static void getvar_mem(char *var_parameter, char *response);
++#endif
+ 
+ static const struct {
+ 	const char *variable;
+@@ -80,9 +83,33 @@ static const struct {
+ 	}, {
+ 		.variable = "is-userspace",
+ 		.dispatch = getvar_is_userspace
++#ifdef CONFIG_MIDAS_CHAINLOAD
++	}, {
++		.variable = "mem",
++		.dispatch = getvar_mem
++#endif
+ 	}
+ };
+ 
++#ifdef CONFIG_MIDAS_CHAINLOAD
++/*
++ * "getvar mem:<hex addr>": 4 words at addr. Bring-up mailbox readback after a
++ * watchdog reset; arbitrary memory read, so only in the chainload dev build.
++ */
++static void getvar_mem(char *var_parameter, char *response)
++{
++	u32 *p;
++
++	if (!var_parameter) {
++		fastboot_fail("usage: mem:<hex addr>", response);
++		return;
++	}
++	p = (u32 *)(simple_strtoul(var_parameter, NULL, 16) & ~3UL);
++	fastboot_response("OKAY", response, "%08x %08x %08x %08x",
++			  p[0], p[1], p[2], p[3]);
++}
++#endif
++
+ #if CONFIG_IS_ENABLED(FASTBOOT_FLASH)
+ /**
+  * Get partition number and size for any storage type.
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index df7119d6..7c9cc127 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -18,6 +18,9 @@ obj-$(CONFIG_DM_VIDEO) += video_bmp.o
+ endif
+ 
+ obj-${CONFIG_EXYNOS_FB} += exynos/
++ifndef CONFIG_EXYNOS_FB
++obj-${CONFIG_EXYNOS_MIPI_DSIM} += exynos/
++endif
+ obj-${CONFIG_VIDEO_ROCKCHIP} += rockchip/
+ obj-${CONFIG_VIDEO_STM32} += stm32/
+ obj-${CONFIG_VIDEO_TEGRA124} += tegra124/
+diff --git a/drivers/video/s6e8ax0.c b/drivers/video/s6e8ax0.c
+index 9c7b5f6a..0fcac863 100644
+--- a/drivers/video/s6e8ax0.c
++++ b/drivers/video/s6e8ax0.c
+@@ -220,9 +220,10 @@ static void s6e8ax0_panel_init(struct mipi_dsim_device *dsim_dev)
+ 
+ 	s6e8ax0_apply_level1_key(dsim_dev);
+ 	s6e8ax0_apply_mtp_key(dsim_dev);
++	mdelay(20);	/* delays as in Linux panel-samsung-s6e8aa0.c */
+ 
+ 	s6e8ax0_sleep_out(dsim_dev);
+-	mdelay(5);
++	mdelay(40);
+ 	s6e8ax0_panel_cond(dsim_dev);
+ 	s6e8ax0_display_cond(dsim_dev);
+ 	s6e8ax0_gamma_cond(dsim_dev);
+@@ -236,6 +237,7 @@ static void s6e8ax0_panel_init(struct mipi_dsim_device *dsim_dev)
+ 	s6e8ax0_etc_power_control(dsim_dev);
+ 	s6e8ax0_etc_mipi_control3(dsim_dev);
+ 	s6e8ax0_etc_mipi_control4(dsim_dev);
++	mdelay(100);	/* init-delay before display on */
+ }
+ 
+ static int s6e8ax0_panel_set(struct mipi_dsim_device *dsim_dev)
+diff --git a/include/configs/midas.h b/include/configs/midas.h
+index ed04e7e4..8c6ec127 100644
+--- a/include/configs/midas.h
++++ b/include/configs/midas.h
+@@ -25,6 +25,12 @@
+ #define CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG
+ #define CONFIG_REVISION_TAG
+ 
++/* xnufb (board/samsung/midas/xnufb.c): legacy Exynos4 DSIM + s6e8ax0 panel */
++#ifndef CONFIG_SPL_BUILD
++#define CONFIG_EXYNOS_MIPI_DSIM
++#define CONFIG_S6E8AX0
++#endif
++
+ /* 1GB of DRAM */
+ #define CONFIG_NR_DRAM_BANKS 4
+ #define CONFIG_SYS_SDRAM_BASE 0x40000000
+@@ -90,12 +96,17 @@
+ 		"run setbootargs; if test ${fit_config} = \"\"; then; bootm ${fitloadaddr}; else; bootm ${fitloadaddr}#${fit_config}${lcd_overlay}; fi\0" \
+ 	"mmcboot=" /* Command to boot OS from eMMC */ \
+ 		"read mmc 0 boot ${fitloadaddr} 0x0 end && run bootimage; run fastboot\0" \
++	"xnuboot=" /* Standalone eMMC XNU boot from GPT CACHE partition (22 MiB FIT) */ \
++		"read mmc 0 CACHE ${fitloadaddr} 0x0 0xb000 && " \
++		"if fdt addr ${fitloadaddr}; then source ${fitloadaddr}:script; fi; " \
++		"run fastboot\0" \
+ 	"mmcrecovery=" /* Command to boot recovery from eMMC */ \
+ 		"read mmc 0 recovery ${fitloadaddr} 0x0 end && run bootimage; run fastboot\0" \
+ 	"autoboot=run mmcboot\0" /* Run on normal boot */ \
+ 	"recoveryboot=run mmcrecovery\0" /* Run on recovery keycombo/INFORM3 value */ \
+ 	/* fastboot may have wrapped our FIT image in an Android boot.img, which means the FIT will be one page (2048 bytes by default) past ${fitloadaddr} */ \
+-	"fastboot_bootcmd=if fdt addr ${fitloadaddr}; then; else; setexpr fitloadaddr ${fitloadaddr} + 0x800; fdt addr ${fitloadaddr}; fi; run bootimage\0" \
++	"fastboot_bootcmd=if fdt addr ${fitloadaddr}; then; else; setexpr fitloadaddr ${fitloadaddr} + 0x800; fdt addr ${fitloadaddr}; fi; " \
++		"if source ${fitloadaddr}:script; then; else; run bootimage; fi\0" /* a FIT with a "script" image runs it instead (bring-up loaders) */ \
+ 	"fastboot=mw ${fitloadaddr} 0x0 0x100; fastboot -l ${fitloadaddr} 0; run autoboot\0" /* Run on fastboot keycombo/INFORM3 value */ \
+ 	"readsb20=setexpr.l h01 *0x50001fb0 && setexpr.l h02 *0x50001fb4 && setexpr.l h03 *0x50001fb8\0" /* In a valid BL1, this will be "SB20_CONTEXT" */ \
+ 	"checksb20=test ${h01} = 30324253 && test ${h02} = 4e4f435f && test ${h03} = 54584554\0" \
+diff --git a/include/lcd.h b/include/lcd.h
+index 9a4c0da5..420c4fc1 100644
+--- a/include/lcd.h
++++ b/include/lcd.h
+@@ -45,7 +45,7 @@ void lcd_set_flush_dcache(int flush);
+ #include <pxa_lcd.h>
+ #elif defined(CONFIG_ATMEL_LCD) || defined(CONFIG_ATMEL_HLCD)
+ #include <atmel_lcd.h>
+-#elif defined(CONFIG_EXYNOS_FB)
++#elif defined(CONFIG_EXYNOS_FB) || defined(CONFIG_EXYNOS_MIPI_DSIM)
+ #include <exynos_lcd.h>
+ #else
+ typedef struct vidinfo {
+diff --git a/board/samsung/midas/xnufb.c b/board/samsung/midas/xnufb.c
+new file mode 100644
+index 00000000..28d85657
+--- /dev/null
++++ b/board/samsung/midas/xnufb.c
+@@ -0,0 +1,217 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * xnufb: light the Galaxy S3 (midas) s6e8aa0 panel and leave FIMD0 scanning out a
++ * framebuffer, for the XNU bring-up (the kernel gets it as its video console).
++ *
++ * Power, reset and timings follow Linux (exynos4412-galaxy-s3.dtsi); FIMD and DSIM
++ * settings are Trats2's (exynos4412-trats2.dts), the same panel. DSIM and the panel
++ * init sequence are U-Boot's legacy drivers (drivers/video/exynos, s6e8ax0.c).
++ *
++ * usage: xnufb <fb address> [16|32]
++ */
++#include <common.h>
++#include <command.h>
++#include <lcd.h>
++#include <asm/io.h>
++#include <asm/gpio.h>
++#include <asm/arch/clk.h>
++#include <asm/arch/clock.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/fb.h>
++#include <asm/arch/mipi_dsim.h>
++#include <asm/arch/power.h>
++#include <asm/arch/system.h>
++#include <power/regulator.h>
++
++#define FIMD0_BASE	0x11c00000
++#define DSIM0_BASE	0x11c80000
++#define PMU_MIPI_PHY0	0x10020710
++
++static vidinfo_t xnufb_panel = {
++	/* vl_width/vl_height: the DSIM code takes them as the resolution (MDRESOL), not mm */
++	.vl_col = 720, .vl_row = 1280, .vl_width = 720, .vl_height = 1280,
++	.vl_freq = 60, .vl_clkp = 0, .vl_hsp = 1, .vl_vsp = 1, .vl_dp = 1,
++	.vl_hspw = 5, .vl_hbpd = 5, .vl_hfpd = 5,	/* galaxy-s3.dtsi, 57.15 MHz pixel clock */
++	.vl_vspw = 2, .vl_vbpd = 1, .vl_vfpd = 13, .vl_cmd_allow_len = 0xf,
++	.interface_mode = 1, .mipi_enabled = 1,
++};
++
++static struct mipi_dsim_config dsim_config = {
++	.e_interface = DSIM_VIDEO,
++	.e_virtual_ch = DSIM_VIRTUAL_CH_0,
++	.e_pixel_format = DSIM_24BPP_888,
++	.e_burst_mode = DSIM_BURST_SYNC_EVENT,
++	.e_no_data_lane = DSIM_DATA_LANE_4,
++	.e_byte_clk = DSIM_PLL_OUT_DIV8,
++	/* Linux s6e8aa0 mode_flags: VIDEO | BURST | VSYNC_FLUSH | AUTO_VERT, HFP on */
++	.auto_vertical_cnt = 1,
++	.p = 3, .m = 125, .s = 1,	/* 24 MHz * 125 / 3 / 2 = 500 MHz (midas burst-clock) */
++	.pll_stable_time = 500,
++	.esc_clk = 20000000,
++	.stop_holding_cnt = 0x7ff,
++	.bta_timeout = 0xff,
++	.rx_timeout = 0xffff,
++};
++
++static int reg_on(const char *name, int uV)
++{
++	struct udevice *dev;
++	int ret = regulator_get_by_platname(name, &dev);
++
++	if (!ret && uV)
++		ret = regulator_set_value(dev, uV);
++	if (!ret)
++		ret = regulator_set_enable(dev, true);
++	if (ret)
++		printf("xnufb: regulator %s: %d\n", name, ret);
++	return ret;
++}
++
++/* exynos_mipi_dsi_init: DSIM core and I/O rails */
++int mipi_power(void)
++{
++	return reg_on("VMIPI_1.0V", 0) | reg_on("VMIPI_1.8V", 0);
++}
++
++/* exynos_mipi_dsi_init: panel vdd3 (GPC0[1]) and vci (LDO25), then a reset pulse */
++static int lcd_power(void)
++{
++	gpio_request(EXYNOS4X12_GPIO_C01, "lcd_vdd3");
++	gpio_direction_output(EXYNOS4X12_GPIO_C01, 1);
++	reg_on("LCD_VCC_3.3V", 2800000);
++	mdelay(50);
++	gpio_request(EXYNOS4X12_GPIO_F21, "lcd_reset");
++	gpio_direction_output(EXYNOS4X12_GPIO_F21, 0);
++	mdelay(10);
++	gpio_set_value(EXYNOS4X12_GPIO_F21, 1);
++	mdelay(100);
++	return 0;
++}
++
++/* set_mipi_phy_ctrl() only handles the 4210 */
++static void phy_enable(unsigned int index, unsigned int enable)
++{
++	setbits_le32(PMU_MIPI_PHY0, EXYNOS_MIPI_PHY_MRESETN | EXYNOS_MIPI_PHY_ENABLE);
++}
++
++static struct exynos_platform_mipi_dsim dsim_pd = {
++	.lcd_panel_name = "s6e8ax0",
++	.dsim_config = &dsim_config,
++	.lcd_panel_info = &xnufb_panel,
++	.lcd_power = lcd_power,
++	.mipi_power = mipi_power,
++	.phy_enable = phy_enable,
++};
++
++static struct mipi_dsim_lcd_device dsim_lcd = {
++	.name = "s6e8ax0",
++	.id = -1,
++	.bus_id = 0,
++	.reverse_panel = 1,
++	.platform_data = &dsim_pd,
++};
++
++/* RGB interface into the DSIM, window 0 from fb; see exynos_fimd_lcd_init() */
++static void fimd_init(ulong fb, int bpp)
++{
++	struct exynos_fb *reg = (struct exynos_fb *)FIMD0_BASE;
++	unsigned int off = exynos_fimd_get_base_offset(), cfg, stride = 720 * bpp / 8;
++	ulong pclk = 60 * (5 + 5 + 5 + 720) * (2 + 13 + 1 + 1280);
++
++	writel(EXYNOS_VIDCON0_VIDOUT_RGB, &reg->vidcon0);
++	clrsetbits_le32(&reg->vidcon2, EXYNOS_VIDCON2_WB_MASK | EXYNOS_VIDCON2_TVFORMATSEL_MASK |
++			EXYNOS_VIDCON2_TVFORMATSEL_YUV_MASK, EXYNOS_VIDCON2_WB_DISABLE);
++	writel(EXYNOS_VIDCON1_IVCLK_RISING_EDGE, (ulong)&reg->vidcon1 + off);
++	writel(EXYNOS_VIDTCON0_VFPD(13 - 1) | EXYNOS_VIDTCON0_VBPD(1 - 1) |
++	       EXYNOS_VIDTCON0_VSPW(2 - 1), (ulong)&reg->vidtcon0 + off);
++	writel(EXYNOS_VIDTCON1_HFPD(5 - 1) | EXYNOS_VIDTCON1_HBPD(5 - 1) |
++	       EXYNOS_VIDTCON1_HSPW(5 - 1), (ulong)&reg->vidtcon1 + off);
++	writel(EXYNOS_VIDTCON2_HOZVAL(719) | EXYNOS_VIDTCON2_LINEVAL(1279) |
++	       EXYNOS_VIDTCON2_HOZVAL_E(719) | EXYNOS_VIDTCON2_LINEVAL_E(1279),
++	       (ulong)&reg->vidtcon2 + off);
++
++	cfg = EXYNOS_WINCON_DATAPATH_DMA | EXYNOS_WINCON_BURSTLEN_16WORD;
++	cfg |= bpp == 16 ? EXYNOS_WINCON_BPPMODE_16BPP_565 | EXYNOS_WINCON_HAWSWP_ENABLE
++			 : EXYNOS_WINCON_BPPMODE_24BPP_888 | EXYNOS_WINCON_WSWP_ENABLE;
++	writel(cfg, &reg->wincon0);
++	writel(EXYNOS_VIDOSD_LEFT_X(0) | EXYNOS_VIDOSD_TOP_Y(0), &reg->vidosd0a);
++	writel(EXYNOS_VIDOSD_RIGHT_X(719) | EXYNOS_VIDOSD_BOTTOM_Y(1279) |
++	       EXYNOS_VIDOSD_RIGHT_X_E(1) | EXYNOS_VIDOSD_BOTTOM_Y_E(0), &reg->vidosd0b);
++	writel(EXYNOS_VIDOSD_SIZE(720 * 1280), &reg->vidosd0c);
++	writel(fb, &reg->vidw00add0b0);
++	writel(fb + stride * 1280, &reg->vidw00add1b0);
++	writel(EXYNOS_VIDADDR_PAGEWIDTH(stride) | EXYNOS_VIDADDR_PAGEWIDTH_E(stride),
++	       &reg->vidw00add2);
++
++	cfg = readl(&reg->vidcon0) & ~(EXYNOS_VIDCON0_CLKSEL_MASK | EXYNOS_VIDCON0_CLKVALUP_MASK |
++		EXYNOS_VIDCON0_CLKVAL_F(0xff) | EXYNOS_VIDCON0_VCLKEN_MASK | EXYNOS_VIDCON0_CLKDIR_MASK);
++	cfg |= EXYNOS_VIDCON0_CLKSEL_SCLK | EXYNOS_VIDCON0_CLKVALUP_ALWAYS |
++	       EXYNOS_VIDCON0_VCLKEN_NORMAL | EXYNOS_VIDCON0_CLKDIR_DIVIDED |
++	       EXYNOS_VIDCON0_CLKVAL_F(DIV_ROUND_CLOSEST(get_lcd_clk(), pclk) - 1);
++	writel(cfg | EXYNOS_VIDCON0_ENVID_ENABLE | EXYNOS_VIDCON0_ENVID_F_ENABLE, &reg->vidcon0);
++	setbits_le32(&reg->wincon0, EXYNOS_WINCON_ENWIN_ENABLE);
++	setbits_le32(&reg->winshmap, EXYNOS_WINSHMAP_CH_ENABLE(0));
++}
++
++int xnufb_start(ulong fb, int bpp)
++{
++	int ret;
++
++	if (bpp != 16 && bpp != 32)
++		return -1;
++	xnufb_panel.vl_bpix = bpp == 16 ? 4 : 5;
++
++	set_system_display_ctrl();
++	set_lcd_clk();
++	fimd_init(fb, bpp);
++	exynos_mipi_dsi_register_lcd_device(&dsim_lcd);
++	s6e8ax0_init();		/* binds to the device registered above */
++	ret = exynos_mipi_dsi_init(&dsim_pd);
++	printf("xnufb: %dx%d %d bpp at %#lx: %d\n", 720, 1280, bpp, fb, ret);
++	return ret;
++}
++
++static void dsim_short_dcs(u8 cmd)
++{
++	int i;
++
++	for (i = 0; i < 5000; i++) {
++		if (readl(DSIM0_BASE + 0x44) & (1u << 22)) /* SFR_HEADER_EMPTY */
++			break;
++		udelay(2);
++	}
++	writel(0x05u | ((u32)cmd << 8), DSIM0_BASE + 0x34); /* MIPI_DSI_DCS_SHORT_WRITE */
++}
++
++void xnufb_display_enable(int on)
++{
++	if (on) {
++		dsim_short_dcs(0x11); /* Sleep Out */
++		mdelay(120);
++		dsim_short_dcs(0x29); /* Display On */
++	} else {
++		dsim_short_dcs(0x28); /* Display Off */
++		mdelay(20);
++		dsim_short_dcs(0x10); /* Sleep In */
++		mdelay(80);
++	}
++}
++
++static int do_xnufb(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
++{
++	ulong fb;
++	int bpp, ret;
++
++	if (argc < 2)
++		return CMD_RET_USAGE;
++	fb = simple_strtoul(argv[1], NULL, 16);
++	bpp = argc > 2 ? simple_strtoul(argv[2], NULL, 10) : 32;
++	if (bpp != 16 && bpp != 32)
++		return CMD_RET_USAGE;
++
++	ret = xnufb_start(fb, bpp);
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(xnufb, 3, 0, do_xnufb, "light the panel, scan out a framebuffer",
++	   "<fb address (hex)> [16|32]");
+diff --git a/board/samsung/midas/malitest.c b/board/samsung/midas/malitest.c
+new file mode 100644
+index 00000000..c11c30dc
+--- /dev/null
++++ b/board/samsung/midas/malitest.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * malitest: bring up the Mali-400 (gpu/mali400) and clear a 720x1280x32 framebuffer
++ * with the GPU. Pair with "xnufb <fb> 32" to see the result on the panel.
++ *
++ * usage: malitest <fb address> [rgba]   (rgba = 0xAABBGGRR, default 0xff00ff00)
++ *        malitest <fb address> tri      (replay tri_job: GP + 4 PP, RGB triangle)
++ */
++#include <common.h>
++#include <command.h>
++#include <cpu_func.h>
++#include "../../../../gpu/mali400/mali400.c"
++#include "../../../../gpu/mali400/tri_job.h"
++
++#define MALI_WORK_PA	0x5f000000	/* above XNU RAM (0x4ff00000), below FB_PA */
++
++static void mali_flush(void *p, uint32_t len)
++{
++	ulong s = (ulong)p & ~(ulong)(CONFIG_SYS_CACHELINE_SIZE - 1);
++
++	flush_dcache_range(s, ALIGN((ulong)p + len, CONFIG_SYS_CACHELINE_SIZE));
++}
++
++static void mali_udelay(unsigned us)
++{
++	udelay(us);
++}
++
++static int do_malitest(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
++{
++	const struct mali_env env = {
++		.gpu = 0x13000000, .cmu = 0x10030000, .pmu = 0x10020000,
++		.mem = (uint8_t *)MALI_WORK_PA, .mem_pa = MALI_WORK_PA,
++		.udelay = mali_udelay, .flush = mali_flush,
++	};
++	struct mali_fb fb = { .width = 720, .height = 1280, .stride = 2880 };
++	uint32_t rgba = 0xff00ff00;
++	int ret;
++
++	if (argc < 2)
++		return CMD_RET_USAGE;
++	fb.pa = simple_strtoul(argv[1], NULL, 16);
++	if (argc > 2 && strcmp(argv[2], "tri"))
++		rgba = simple_strtoul(argv[2], NULL, 16);
++
++	ret = mali_init(&env);
++	printf("malitest: init %d (%#x)\n", ret, mali_last_status);
++	if (!ret && argc > 2 && !strcmp(argv[2], "tri")) {
++		ret = mali_run_job(&env, &tri_job, &fb);
++		printf("malitest: tri %d (rawstat %#x)\n", ret, mali_last_status);
++		invalidate_dcache_range(fb.pa, fb.pa + fb.stride * fb.height);
++	} else if (!ret) {
++		ret = mali_pp_clear(&env, &fb, rgba);
++		printf("malitest: clear %d (rawstat %#x)\n", ret, mali_last_status);
++		invalidate_dcache_range(fb.pa, fb.pa + fb.stride * fb.height);
++	}
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(malitest, 3, 0, do_malitest, "clear a framebuffer with the Mali-400",
++	   "<fb address (hex)> [rgba (hex, 0xAABBGGRR) | tri]");

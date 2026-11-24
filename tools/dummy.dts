@@ -1,0 +1,20 @@
+/*
+ * Placeholder DT for chain.its: the installed 2018 U-Boot boots FIT "linux"
+ * images only with an FDT (otherwise "FDT creation failed! hanging...").
+ * The chainloaded U-Boot ignores it and uses its own built-in DTB.
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "midas chainload placeholder";
+	compatible = "samsung,midas";
+
+	chosen { };
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x40000000>;
+	};
+};

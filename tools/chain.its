@@ -1,0 +1,46 @@
+/*
+ * FIT for the installed 2018 U-Boot's normal boot path:
+ *   mmcboot: read mmc 0 boot 0x50000000 ... && bootm 0x50000000#${fit_config}${lcd_overlay}
+ * Payload is our U-Boot as a plain ARM "linux" image, loaded at CONFIG_SYS_TEXT_BASE;
+ * U-Boot proper skips lowlevel init, so DRAM and clocks set up by the SPL stay as they are.
+ * Built by tools/build-chain.sh (needs out/dummy.dtb).
+ */
+/dts-v1/;
+
+/ {
+	description = "chainloaded midas U-Boot";
+	#address-cells = <1>;
+
+	images {
+		uboot {
+			description = "U-Boot (MIDAS_CHAINLOAD)";
+			data = /incbin/("../u-boot/u-boot.bin");
+			type = "kernel";
+			arch = "arm";
+			os = "linux";
+			compression = "none";
+			load = <0x43e00000>;
+			entry = <0x43e00000>;
+		};
+		dummy {
+			description = "placeholder FDT (see dummy.dts)";
+			data = /incbin/("../out/dummy.dtb");
+			type = "flat_dt";
+			arch = "arm";
+			compression = "none";
+		};
+	};
+
+	/*
+	 * fit_config is the detected board (board_detect.c). SHW-M440S detection is
+	 * unverified, so provide every name the installed U-Boot can pick.
+	 */
+	configurations {
+		default = "exynos4412-i9300";
+		exynos4412-midas { kernel = "uboot"; fdt = "dummy"; };
+		exynos4412-i9300 { kernel = "uboot"; fdt = "dummy"; };
+		exynos4412-i9305 { kernel = "uboot"; fdt = "dummy"; };
+		exynos4412-n7100 { kernel = "uboot"; fdt = "dummy"; };
+		exynos4412-n7105 { kernel = "uboot"; fdt = "dummy"; };
+	};
+};
