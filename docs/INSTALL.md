@@ -1,14 +1,14 @@
-# m0xnu Build & Installation Guide (Samsung Galaxy S3 3G / GT-I9300 & SHW-M440S)
+# m0xnu Build & Installation Guide (Samsung Galaxy S3 3G / SHW-M440S & GT-I9300)
 
-> **Warning**: This procedure overwrites internal eMMC partitions (`boot`, `CACHE`, `SYSTEM`, `USERDATA`) on the **Samsung Galaxy S3 3G (`GT-I9300` / `SHW-M440S`, Exynos 4412, Midas)**. **Never flash these images on LTE variants (`GT-I9305`, `SHV-E210*`, etc.).** Always back up your `EFS` and bootloader partitions before starting.
+> **Warning**: This procedure overwrites internal eMMC partitions (`boot`, `CACHE`, `SYSTEM`, `USERDATA`) on the **Samsung Galaxy S3 3G (`SHW-M440S` tested / `GT-I9300` untested, Exynos 4412 Midas)**. **Never flash these images on LTE variants (`GT-I9305`, `SHV-E210*`, etc.).** Always back up your `EFS` and bootloader partitions before starting.
 
 ---
 
 ## 0. Prerequisites
 
 ### Hardware
-- **Samsung Galaxy S3 3G (`GT-I9300` or Korean 3G `SHW-M440S`)** — Exynos 4412, Midas board
-  - *Note for `SHW-M440S`*: Verify your `SYSTEM` and `USERDATA` start LBAs in your PIT (`heimdall print-pit`) against `EMMC_SYSTEM_LBA` / `EMMC_USERDATA_LBA` in `tools/mkxnu.py` before building `out/xnu.itb`.
+- **Samsung Galaxy S3 3G (`SHW-M440S`, tested)** — Exynos 4412, Midas 3G board
+  - *Note for `GT-I9300` (untested)*: Hardware is nearly identical (`m0` / Exynos 4412), but verify your `SYSTEM` and `USERDATA` start LBAs in your PIT (`heimdall print-pit`) against `EMMC_SYSTEM_LBA` / `EMMC_USERDATA_LBA` in `tools/mkxnu.py` before building `out/xnu.itb`.
 - Data-capable Micro-USB cable + Linux PC (Arch / Ubuntu / Debian)
 
 ### Host Linux Packages
@@ -146,7 +146,7 @@ python3 tools/mkxnu.py \
 
 ---
 
-## 6. Flash to Galaxy S3 3G (`GT-I9300` / `SHW-M440S`)
+## 6. Flash to Galaxy S3 3G (`SHW-M440S` / `GT-I9300`)
 
 ### 6.1 One-Time Bootstrap: Install Base U-Boot via Heimdall / Odin
 1. Enter Samsung Download Mode (**Volume Down + Home + Power**).
