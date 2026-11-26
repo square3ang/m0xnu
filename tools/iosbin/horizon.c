@@ -87,7 +87,6 @@ static const char disabled_plist[] =
     "  <key>com.apple.imagent</key><true/>\n"
     "  <key>com.apple.identityservicesd</key><true/>\n"
     "  <key>com.apple.locationd</key><true/>\n"
-    "  <key>com.apple.wifid</key><true/>\n"
     "  <key>com.apple.wifiFirmwareLoader</key><true/>\n"
     "  <key>com.apple.assistantd</key><true/>\n"
     "  <key>com.apple.assistant_service</key><true/>\n"
@@ -209,6 +208,10 @@ static void write_disabled(void)
     /* Mirror migration + purplebuddy prefs into /private/var/root/Library/Preferences (matching var-j4.raw). */
     mk_dir("/private/var/root", 0, 0);
     mk_dir("/private/var/root/Library", 0, 0);
+    mk_dir("/private/var/root/Library/Logs", 0, 0);
+    chmod("/private/var/root/Library/Logs", 0777);
+    mk_dir("/private/var/root/Library/Logs/MobileContainerManager", 0, 0);
+    chmod("/private/var/root/Library/Logs/MobileContainerManager", 0777);
     mk_dir("/private/var/root/Library/Preferences", 0, 0);
     mk_dir("/private/var/root/Library/Preferences/ByHost", 0, 0);
     fd = open("/private/var/root/Library/Preferences/com.apple.migration.plist",
@@ -225,9 +228,10 @@ static void write_disabled(void)
         (void)write(fd, data_ark_plist, sizeof(data_ark_plist) - 1);
         close(fd);
     }
-    /* One-time Setup.app reset: clear previous SetupDone flags and LaunchServices/installd caches ONCE so
-     * iOS rescans /Applications/Setup.app and boots into the genuine "Hello" Setup Assistant. */
-    int mfd = open("/private/var/mobile/Library/Preferences/.exy_setup_reset_v3",
+    /* Ensure /private/var/tmp is world-writable so Setup.app (uid 501) can create /tmp/com.apple.purplebuddy.sentinel. */
+    chmod("/private/var/tmp", 01777);
+    /* One-time Setup.app reset (v4) to clear hw7's seeded SetupDone ONCE so genuine Setup runs and finishes cleanly. */
+    int mfd = open("/private/var/mobile/Library/Preferences/.exy_setup_reset_v4",
                    0x0a01 /* O_WRONLY|O_CREAT|O_EXCL */, 0644);
     int wiped = 0;
     if (mfd >= 0) {
@@ -235,6 +239,7 @@ static void write_disabled(void)
         unlink("/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist");
         unlink("/private/var/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist");
         unlink("/private/var/root/Library/Preferences/com.apple.purplebuddy.plist");
+        unlink("/private/var/tmp/com.apple.purplebuddy.sentinel");
         if (unlink("/private/var/mobile/Library/MobileInstallation/LastBuildInfo.plist") == 0) wiped++;
         if (unlink("/private/var/installd/Library/MobileInstallation/LastBuildInfo.plist") == 0) wiped++;
         if (unlink("/private/var/mobile/Library/MobileInstallation/LastLaunchServicesMap.plist") == 0) wiped++;
@@ -292,8 +297,46 @@ static void write_disabled(void)
     }
 }
 
-int main(void)
+/* Once: replace wifid's SCPreferences (no saved networks yet) with its logging keys pointed at
+ * /dev/console. v2: logging off; wifid filled the whole RAM console ring and hid everything else. */
+static void wifi_log_to_console(void)
 {
+    static const char marker[] = "/private/var/preferences/SystemConfiguration/.exy_wifilog_v4";
+    static const char plist[] = "/private/var/preferences/SystemConfiguration/com.apple.wifi.plist";
+    static const char xml[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\"><dict>\n"
+        "<key>LoggingEnabled</key><false/>\n"
+        "<key>LoggingFileEnabled</key><false/>\n"
+        "</dict></plist>\n";
+    int fd = open(marker, 0);
+    if (fd >= 0) {
+        close(fd);
+        return;
+    }
+    mk_dir("/private/var/preferences/SystemConfiguration", 0, 0);
+    fd = open(plist, 0x0601 /* O_WRONLY | O_CREAT | O_TRUNC */, 0644);
+    long w = fd >= 0 ? write(fd, xml, sizeof(xml) - 1) : -1;
+    if (fd >= 0)
+        close(fd);
+    if (w == (long)(sizeof(xml) - 1)) {
+        fd = open(marker, 0x0201 /* O_WRONLY | O_CREAT */, 0644);
+        if (fd >= 0)
+            close(fd);
+    }
+    int cfd = open("/dev/console", 1);
+    if (cfd >= 0) {
+        char msg[64];
+        int n = snprintf(msg, sizeof(msg), "[HORIZON] wifi log plist w=%ld\n", w);
+        if (n > 0) (void)write(cfd, msg, (unsigned long)n);
+        close(cfd);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
     /* Work around iOS 9.3.5 lsd first-boot NULL deref (MobileCoreServices+0x49cdc) when
      * _LSDatabaseGetSession returns kLSNoDatabaseErr and sem_open("lsd.firstboot_check", 0) fails. */
     umask(0);
@@ -389,6 +432,8 @@ int main(void)
             close(cfd);
         }
     }
+    wifi_log_to_console();
+    unlink("/private/var/root/Library/Preferences/com.apple.backboardd.plist");
     /* ExyTouchd is now spawned from backboardd (Mali400GLDriverEX) so it inherits a live System bootstrap_port. */
     return 0;
 }

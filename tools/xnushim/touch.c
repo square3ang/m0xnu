@@ -341,17 +341,35 @@ int exy_i2c_read_reg16(uintptr_t base, uint8_t addr7, uint16_t reg16, uint8_t *o
 #define i2c_write exy_i2c_write
 #define i2c_read_reg exy_i2c_read_reg
 
+static volatile uint32_t pmic_i2c_lock;
+
+static void pmic_lock(void)
+{
+    while (__sync_lock_test_and_set(&pmic_i2c_lock, 1u))
+        __asm__ volatile("yield" ::: "memory");
+}
+
+static void pmic_unlock(void)
+{
+    __sync_lock_release(&pmic_i2c_lock);
+}
+
 int exy_pmic_write_reg(uint8_t reg, uint8_t val)
 {
     if (!i2c7_va) return -1;
     uint8_t b[2] = { reg, val };
+    int rc = -1;
+    pmic_lock();
     for (int tries = 0; tries < 4; tries++) {
-        if (i2c_write(i2c7_va, MAX77686_ADDR, b, 2) == 0)
-            return 0;
+        if (i2c_write(i2c7_va, MAX77686_ADDR, b, 2) == 0) {
+            rc = 0;
+            break;
+        }
         udelay(300);
         i2c_init_hw(i2c7_va);
     }
-    return -1;
+    pmic_unlock();
+    return rc;
 }
 
 #define pmic_write_reg exy_pmic_write_reg
@@ -359,15 +377,6 @@ int exy_pmic_write_reg(uint8_t reg, uint8_t val)
 static int cur_cpu_opp = -1;
 volatile uint32_t exy_last_touch_mct;
 static uint8_t cur_buck4_code = 0x26u;
-
-static int set_buck2_dvs(uint8_t code)
-{
-    int ok = 1;
-    for (uint8_t r = MAX77686_BUCK2DVS1; r < MAX77686_BUCK2DVS1 + 8u; r++)
-        if (pmic_write_reg(r, code) != 0)
-            ok = 0;
-    return ok ? 0 : -1;
-}
 
 int exy_gpu_set_vdd(uint8_t code)
 {
@@ -382,42 +391,16 @@ int exy_gpu_set_vdd(uint8_t code)
     return ok ? 0 : -1;
 }
 
-/* Glitch-free Exynos 4412 CPU DVFS via CORE_RATIO divider + BUCK2 DVS (APLL locked at 1400 MHz):
- *   opp 0:  466 MHz @ 0.950V (BUCK2=0x1c, CORE=/3)  - idle / thermal >=75C
- *   opp 1:  700 MHz @ 1.000V (BUCK2=0x20, CORE=/2)  - normal UI / warm >=66C
- *   opp 2: 1400 MHz @ 1.250V (BUCK2=0x34, CORE=/1)  - touch/scroll/3D burst (<66C) */
+/* Runtime CPU MUX_CORE switching is unsafe across 4 active Cortex-A9 SMP cores on Exynos 4412
+ * (caused freezes/LPM trips on w45/w50b). CPU runs continuously at cool 1000 MHz @ 1.125V set
+ * single-core before SMP bring-up; thermal throttling scales Mali-400 GPU (440 <-> 220 MHz). */
 int exy_cpu_set_opp(int opp)
 {
-    if (!cmu_cpu_va || cur_cpu_opp < 0)
-        return -1;
-    if (opp < 0) opp = 0;
-    if (opp > 2) opp = 2;
-    if (opp == cur_cpu_opp)
-        return 0;
-    static const uint8_t buck_tbl[3]  = { 0x1cu, 0x20u, 0x34u };
-    static const uint32_t div0_tbl[3] = {
-        0x02155522u, /* CORE=/3 (466), COREM0=/3 (155), COREM1=/6 (77), PERIPH=/6, ATB=/6, APLL=/3 */
-        0x02155521u, /* CORE=/2 (700), COREM0=/3 (233), COREM1=/6 (116), PERIPH=/6, ATB=/6, APLL=/3 */
-        0x02157730u, /* CORE=/1 (1400), COREM0=/4 (350), COREM1=/8 (175), PERIPH=/8, ATB=/6, APLL=/3 */
-    };
-    if (opp > cur_cpu_opp) {
-        if (set_buck2_dvs(buck_tbl[opp]) != 0)
-            return -1;
-        udelay(200);
-        wr32(cmu_cpu_va + 0x500u, div0_tbl[opp]);
-        while (rd32(cmu_cpu_va + 0x600u) != 0u)
-            ;
-    } else {
-        wr32(cmu_cpu_va + 0x500u, div0_tbl[opp]);
-        while (rd32(cmu_cpu_va + 0x600u) != 0u)
-            ;
-        (void)set_buck2_dvs(buck_tbl[opp]);
-    }
-    cur_cpu_opp = opp;
+    (void)opp;
     return 0;
 }
 
-static void boost_apll_1400(void)
+static void boost_apll_1000(void)
 {
     if (!cmu_cpu_va)
         return;
@@ -425,15 +408,15 @@ static void boost_apll_1400(void)
     wr32(cmu_cpu_va + 0x200u, 0x01110000u);
     while (rd32(cmu_cpu_va + 0x400u) & 0x04440004u)
         ;
-    /* Stock Exynos 4412 1400 MHz dividers: CORE=/1, COREM0=/4 (350), COREM1=/8 (175), ATB=/6 (233), APLL=/3 */
+    /* Safe Exynos 4412 dividers at 1000 MHz: CORE=/1 (1000), COREM0=/4 (250), COREM1=/8 (125), ATB=/6 (167), APLL=/3 */
     wr32(cmu_cpu_va + 0x500u, 0x02157730u);
     while (rd32(cmu_cpu_va + 0x600u) != 0u)
         ;
     wr32(cmu_cpu_va + 0x504u, 0x00000505u);
     while (rd32(cmu_cpu_va + 0x604u) != 0u)
         ;
-    /* APLL = 24 MHz * 175 / 3 / 1 = 1400 MHz stock max (M=0xaf, P=3, S=0) */
-    wr32(cmu_cpu_va + 0x100u, 0x80af0300u);
+    /* APLL = 24 MHz * 125 / 3 / 1 = 1000 MHz (M=0x7d, P=3, S=0): ~42% less heat than 1400@1.25V */
+    wr32(cmu_cpu_va + 0x100u, 0x807d0300u);
     while (!(rd32(cmu_cpu_va + 0x100u) & (1u << 29)))
         ;
     /* Switch CPU back to APLL */
@@ -513,10 +496,10 @@ void exy_pmic_and_touch_init(void)
             for (uint8_t r = MAX77686_BUCK4DVS1; r < MAX77686_BUCK4DVS1 + 8u; r++)
                 pmic_write_reg(r, 0x26u);
             cur_buck4_code = 0x26u;
-            /* Set VDD_ARM (BUCK2) = 1.250V (0x34) for stock 1.4 GHz Exynos 4412 (DVFS lowers to 0.95V idle) */
+            /* Set VDD_ARM (BUCK2) = 1.125V (0x2a) for thermally stable 1.0 GHz Exynos 4412 */
             int ok = 1;
             for (uint8_t r = MAX77686_BUCK2DVS1; r < MAX77686_BUCK2DVS1 + 8u; r++)
-                if (pmic_write_reg(r, 0x34u) != 0)
+                if (pmic_write_reg(r, 0x2au) != 0)
                     ok = 0;
             uint8_t rb = 0;
             int rb_ok = 0;
@@ -533,9 +516,9 @@ void exy_pmic_and_touch_init(void)
             if (rb_ok) {
                 exy_touch_log.pkt0 = 0xb200u | rb;
                 exy_clean_line(&exy_touch_log);
-                if (rb == 0x34u) {
+                if (rb == 0x2au) {
                     udelay(5000);
-                    boost_apll_1400();
+                    boost_apll_1000();
                     if (bus_ok)
                         boost_buses_400();
                 }
@@ -634,6 +617,27 @@ static uint32_t read_buttons(void)
     return b;
 }
 
+/* Host USB synthetic button/touch injection for autonomous verification (drivers.c 0xfc/0xfd) */
+static volatile uint32_t synth_btn_mask;
+static volatile uint32_t synth_btn_until_mct;
+static volatile uint32_t synth_touch_pending;
+static volatile uint32_t synth_touch_down;
+static volatile uint16_t synth_touch_x, synth_touch_y;
+
+void exy_synth_btn_inject(uint32_t mask)
+{
+    synth_btn_mask = mask & 0x0fu;
+    synth_btn_until_mct = mct_lo() + 24000u * 150u; /* 150 ms press */
+}
+
+void exy_synth_touch_inject(uint16_t x, uint16_t y, uint32_t down)
+{
+    synth_touch_x = (x > 719u) ? 719u : x;
+    synth_touch_y = (y > 1279u) ? 1279u : y;
+    synth_touch_down = down ? 1u : 0u;
+    synth_touch_pending = 1u;
+}
+
 static void poll_mms114(void)
 {
     /* GPM2[3] is active-low TSP_INT; read 1 packet per poll so tap-down + lift-off never collapse. */
@@ -670,6 +674,10 @@ static void poll_mms114(void)
          * e[1] low nibble pairs with e[2] (screen X 0..719); e[1] high nibble pairs with e[3] (screen Y 0..1279). */
         uint32_t x = (uint32_t)e[2] | ((uint32_t)(e[1] & 0x0fu) << 8);
         uint32_t y = (uint32_t)e[3] | ((uint32_t)((e[1] >> 4) & 0x0fu) << 8);
+        /* Swipes from the bezel first report y=1245..1260, never the last ~13 pt iOS needs for
+         * the Control Center edge: stretch the bottom 80 px so 1250+ lands on the edge. */
+        if (y > 1200u)
+            y = 1200u + (y - 1200u) * 79u / 50u;
         if (x > 719u) x = 719u;
         if (y > 1279u) y = 1279u;
         struct exy_finger *f = &cur_state.f[id - 1u];
@@ -710,12 +718,32 @@ void exy_touch_poll(struct exy_touch_state *out)
     probe_tsp_once();
     uint32_t prev_seq = cur_state.seq;
     uint32_t btn = read_buttons();
+    if (synth_btn_mask) {
+        if ((int32_t)(mct_lo() - synth_btn_until_mct) < 0)
+            btn |= synth_btn_mask;
+        else
+            synth_btn_mask = 0u;
+    }
     if (btn != cur_state.buttons) {
         cur_state.buttons = btn;
         cur_state.seq++;
+        exy_putc('['); exy_putc('B'); exy_putc(']'); tsp_putx(btn); exy_putc('\n');
     }
-    if (cur_state.chip == 0x114u)
+    uint32_t was_down = cur_state.count;
+    if (synth_touch_pending) {
+        synth_touch_pending = 0u;
+        cur_state.f[0].id = 1u;
+        cur_state.f[0].down = (uint8_t)synth_touch_down;
+        cur_state.f[0].x = synth_touch_x;
+        cur_state.f[0].y = synth_touch_y;
+        cur_state.count = synth_touch_down ? 1u : 0u;
+        cur_state.seq++;
+    } else if (cur_state.chip == 0x114u)
         poll_mms114();
+    if (!was_down && cur_state.count) {  /* touch-down position: is a bottom-edge swipe near y=1279? */
+        exy_putc('['); exy_putc('T'); exy_putc(']');
+        tsp_putx((cur_state.f[0].x << 16) | cur_state.f[0].y); exy_putc('\n');
+    }
     if (cur_state.seq != prev_seq || cur_state.count > 0u)
         exy_last_touch_mct = mct_lo();
     if (out) {

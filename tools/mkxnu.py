@@ -885,7 +885,7 @@ def boot_args(top, dt_phys, dt_len, cmdline, fb=False):
     return ba
 
 
-STUB_AREA = (0x800c5110, 0x800c6040)  # zeros after ExceptionVectorsBase, in __text: shim code
+STUB_AREA = (0x800c5110, 0x800c6000)  # zeros after ExceptionVectorsBase (0x800c6024..0x800c6044 is overwritten by ExceptionVectorsTable at runtime)
 HDR_AREA = (0x80001a20, 0x80002000)   # zeros after the Mach-O load commands, in __TEXT: stubs, traces, vectors
 SHIM_DIR = os.path.join(ROOT, "tools/xnushim")
 # __text of com.apple.driver.AppleVXE380 (video encoder): no kext depends on it and its
@@ -929,10 +929,19 @@ VTABLE_HOOKS = {
     0x80404908: (0x800d4461, "exy_md_strategy"),  # memdev mdevbdevsw.d_strategy (not a vtable): --emmc-root
     0x80579038: (0x8054cb9d, "exy_cpu_quiesce"),  # AppleARMCPU::quiesceCPU()
     0x8057903c: (0x8054cbcd, "exy_cpu_start"),    # AppleARMCPU::startCPU(start_paddr, arg_paddr)
+    0x80b122cc: (0x80333951, "exy_audio_get_wl"),      # IOAudio2Device::getWorkLoop()
     0x80b12440: (0x80b0ef21, "exy_audio_start_io"),    # IOAudio2Device::startIO()
     0x80b12444: (0x80b0ef6d, "exy_audio_stop_io"),     # IOAudio2Device::stopIO()
     0x80b1246c: (0x80b0f381, "exy_audio_set_ctrl"),    # IOAudio2Device::setControlValue()
-    0x80b12498: (0x80b0f41d, "exy_audio_get_out_buf"), # IOAudio2Device::getOutputBuffer()
+    0x80b12470: (0x80b0f391, "exy_audio_set_mctrl"),   # IOAudio2Device::setMultiControlValue() (+0x374)
+    0x80b12480: (0x80b0f3f5, "exy_audio_change_sr"),   # IOAudio2Device::changeSampleRate() (+0x384)
+    0x80b12484: (0x80b0f3fd, "exy_audio_change_fmt"),  # IOAudio2Device::changeStreamFormat() (+0x388)
+    0x80b12488: (0x80b0f405, "exy_audio_set_active"),  # IOAudio2Device::setStreamActive() (+0x38c)
+    0x80b1248c: (0x80b0f409, "exy_audio_m7"),          # IOAudio2Device::m7 (+0x390)
+    0x80b12490: (0x80b0f411, "exy_audio_m12"),         # IOAudio2Device::m12 (+0x394)
+    0x80b12494: (0x80b0f415, "exy_audio_get_out_buf"), # IOAudio2Device::getIOBuffer() (+0x398, type 0x10000000)
+    0x80b12498: (0x80b0f41d, "exy_audio_get_in_buf"),  # IOAudio2Device::getInputBuffer() (+0x39c)
+    0x80b1249c: (0x80b0f425, "exy_audio_get_ctrl_buf"),# IOAudio2Device::getControlBuffer() (+0x3a0)
 }
 EMMC_SYSTEM_LBA = 2277376     # GPT "SYSTEM" (backup/pit.txt), 2048 MB
 EMMC_ROOT_SIZE = 0x7ffff000   # md0 size for --emmc-root: memdev keeps size << 12 in 32 bits
@@ -1107,7 +1116,11 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
         # Hook AppleKeyStore get_device_state (0x80f9fef0) -> exy_aks_get_device_state (kMobileLockStateDisabled=3)
         # and sel 31 get_configuration (0x80faf5a4) -> exy_aks_get_config (empty plist, fixes ManagedConfiguration).
         for aks_fn_va, aks_sym in ((0x80f9fef0, "exy_aks_get_device_state"),
-                                   (0x80faf5a4, "exy_aks_get_config")):
+                                   (0x80faf5a4, "exy_aks_get_config"),
+                                   (0x80fa1234, "exy_aks_find_aes"),
+                                   (0x80f9f35c, "exy_aks_hw_aes"),
+                                   (0x80fa0dec, "exy_aks_wrap_key"),
+                                   (0x80fa0ffc, "exy_aks_unwrap_key")):
             aks_o = v2p(aks_fn_va) - start
             img[aks_o:aks_o + 8] = bytes.fromhex("dff800f0") + struct.pack("<I", syms[aks_sym])
         # Skip nonexistent Apple /vram (PurpleGfxMem) & /arm-io/edram (PurpleEDRAM) regions in

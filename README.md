@@ -18,14 +18,14 @@ No Apple, Samsung, or Broadcom proprietary binaries are included in this reposit
 
 | Subsystem | Hardware | Status | Implementation |
 | --- | --- | --- | --- |
-| **SoC / SMP** | Exynos 4412 Quad (Cortex-A9) | Working (`cpus=2`, MCT 24 MHz, GICv1→AIC translation) | [tools/xnushim/shim.c](tools/xnushim/shim.c), [fiq.S](tools/xnushim/fiq.S) |
+| **SoC / SMP** | Exynos 4412 Quad (Cortex-A9) | Working (`cpus=4`, MCT 24 MHz, GICv1→AIC translation) | [tools/xnushim/shim.c](tools/xnushim/shim.c), [fiq.S](tools/xnushim/fiq.S) |
 | **Display** | S6E8AA0 720×1280 AMOLED + FIMD0 + MIPI DSIM0 | Working (zero-copy direct scanout, HW VSYNC latch) | [tools/xnushim/disp.c](tools/xnushim/disp.c), [patches/u-boot-midas-xnu.patch](patches/u-boot-midas-xnu.patch) |
 | **GPU (3D / UI)** | Mali-400 MP4 | Working (OpenGL ES 1.1/2.0 via Mesa Lima, SpringBoard/Safari/3D apps) | [tools/xnushim/gpu.c](tools/xnushim/gpu.c), [gpu/ios-gl/](gpu/ios-gl/), [patches/mesa-lima-ios.patch](patches/mesa-lima-ios.patch) |
 | **Storage** | Internal eMMC (`dw_mmc` IDMAC) | Working (standalone USB-less boot from `CACHE`/`SYSTEM`/`USERDATA`) | [tools/xnushim/touch.c](tools/xnushim/touch.c), [tools/build-chain.sh](tools/build-chain.sh) |
 | **Touch & Keys** | Melfas MMS114 + Home/Power/Vol+/Vol- | Working (`ExyTouchd` HID bridge + Vol HUD) | [tools/xnushim/touch.c](tools/xnushim/touch.c), [tools/iosbin/touchd.c](tools/iosbin/touchd.c) |
 | **Power / Thermal** | MAX77686 PMIC + MAX17047 FG + MAX77693 + TMU | Dynamic CPU/GPU DVFS (`466..1400 MHz` / `146..440 MHz`), `IOPMPowerSource`, U-Boot LPM offline charging | [tools/xnushim/drivers.c](tools/xnushim/drivers.c), [patches/u-boot-midas-xnu.patch](patches/u-boot-midas-xnu.patch) |
-| **Audio** | Wolfson WM1811 + Exynos EPLL/AUDSS/I2S0 | Experimental (`IOAudio2Device` kernel bridge → 48 kHz stereo I2S0 + WM1811) | [tools/xnushim/audio.c](tools/xnushim/audio.c), [tools/xnushim/drivers.c](tools/xnushim/drivers.c) |
-| **Wi-Fi** | Broadcom BCM4334 (SDHCI3) | Experimental (SDHCI3 CMD52/53 + FullMAC FW loader + BSD `en0`) | [tools/xnushim/wifi.c](tools/xnushim/wifi.c), [firmware/](firmware/) |
+| **Audio** | Wolfson WM1811 + Exynos EPLL/AUDSS/I2S0 | Working (native `IOAudio2Device` → 48 kHz stereo I2S0 + WM1811, dynamic volume) | [tools/xnushim/audio.c](tools/xnushim/audio.c), [tools/xnushim/drivers.c](tools/xnushim/drivers.c) |
+| **Wi-Fi** | Broadcom BCM4334 (SDHCI3) | Working (11-ch scan, BSD `en0`, `AppleKeyStore` Keychain + host WPA2-PSK 4-way handshake) | [tools/xnushim/wifi.c](tools/xnushim/wifi.c), [wifi_wpa.h](tools/xnushim/wifi_wpa.h), [firmware/](firmware/) |
 | **Sensors / Misc** | LSM330DLC, AK8975C, CM36651, AN30259A LED, Haptic, Torch, RTC | Working | [tools/xnushim/drivers.c](tools/xnushim/drivers.c) |
 | **Remote Recovery** | Exynos DWC2 USB OTG | Remote fastboot control endpoint (`18d1:4ee8`) | [tools/remote-fastboot.py](tools/remote-fastboot.py) |
 | **Cellular / Baseband** | Intel XMM6262 | Not implemented | — |
@@ -41,7 +41,7 @@ tools/
   build-chain.sh        # Builds chainloadable U-Boot FIT (out/chain.itb) with LPM & standalone xnuboot
   remote-fastboot.py    # Triggers clean WDT reboot to fastboot from running iOS via USB 18d1:4ee8
   xnushim/              # Bare-metal ARM/Thumb Exynos 4412 kernel shim drivers
-    shim.c, fiq.S, taps.S, disp.c, gpu.c, touch.c, drivers.c, audio.c, wifi.c
+    shim.c, fiq.S, taps.S, disp.c, gpu.c, touch.c, drivers.c, audio.c, wifi.c, wifi_wpa.h
   iosbin/               # iOS 9 armv7 userspace daemons (HorizonSetup, ExyTouchd)
 gpu/
   mali400/              # Low-level Mali-400 MP4 hardware job/MMU driver

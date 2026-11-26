@@ -69,31 +69,36 @@ volatile uint32_t exy_last_gpu_mct;
 extern int exy_gpu_set_vdd(uint8_t code);
 
 /* Glitch-free Exynos 4412 Mali-400 DVFS via CMU_DIV_G3D + BUCK4 (VPLL locked at 440 MHz):
- *   opp 0: 146 MHz @ 0.900V (BUCK4=0x18, DIV=/3) - idle / hot >=75C
- *   opp 1: 220 MHz @ 0.950V (BUCK4=0x1c, DIV=/2) - warm >=66C
- *   opp 2: 440 MHz @ 1.075V (BUCK4=0x26, DIV=/1) - active 3D/UI burst */
+ *   opp 0/1: 220 MHz @ 1.000V (BUCK4=0x20, DIV=/2) - idle / warm
+ *   opp 2:   440 MHz @ 1.075V (BUCK4=0x26, DIV=/1) - active 3D/UI burst */
+static void mali_lock(void);
+static void mali_unlock(void);
 int exy_gpu_set_opp(int opp)
 {
     if (!mali_ready || !mali_env.cmu)
         return -1;
-    if (opp < 0) opp = 0;
-    if (opp > 2) opp = 2;
-    if (opp == cur_gpu_opp)
+    int target = (opp >= 2) ? 2 : 1;
+    if (target == cur_gpu_opp)
         return 0;
-    static const uint8_t buck_tbl[3] = { 0x18u, 0x1cu, 0x26u };
-    static const uint32_t div_tbl[3] = { 2u, 1u, 0u };
-    if (opp > cur_gpu_opp) {
-        if (exy_gpu_set_vdd(buck_tbl[opp]) != 0)
+    uint8_t buck = (target == 2) ? 0x26u : 0x20u;
+    uint32_t div = (target == 2) ? 0u : 1u;
+    if (target > cur_gpu_opp) {
+        if (exy_gpu_set_vdd(buck) != 0)
             return -1;
-        gpu_udelay(200);
-        wr(mali_env.cmu + CMU_DIV_G3D, (rd(mali_env.cmu + CMU_DIV_G3D) & ~0xfu) | div_tbl[opp]);
+        gpu_udelay(500);
+        mali_lock();
+        wr(mali_env.cmu + CMU_DIV_G3D, (rd(mali_env.cmu + CMU_DIV_G3D) & ~0xfu) | div);
         (void)poll(&mali_env, mali_env.cmu + CMU_DIV_STAT_G3D, 1, 0, 1000);
+        cur_gpu_opp = target;
+        mali_unlock();
     } else {
-        wr(mali_env.cmu + CMU_DIV_G3D, (rd(mali_env.cmu + CMU_DIV_G3D) & ~0xfu) | div_tbl[opp]);
+        mali_lock();
+        wr(mali_env.cmu + CMU_DIV_G3D, (rd(mali_env.cmu + CMU_DIV_G3D) & ~0xfu) | div);
         (void)poll(&mali_env, mali_env.cmu + CMU_DIV_STAT_G3D, 1, 0, 1000);
-        (void)exy_gpu_set_vdd(buck_tbl[opp]);
+        cur_gpu_opp = target;
+        mali_unlock();
+        (void)exy_gpu_set_vdd(buck);
     }
-    cur_gpu_opp = opp;
     return 0;
 }
 static volatile uint32_t *mali_status_va;
@@ -161,13 +166,15 @@ void exy_gpu_demo(void)
 #define lck_mtx_sleep_fn    ((int (*)(void *, uint32_t, void *, uint32_t))0x80026db9)
 #define thread_wakeup_prim_fn ((int (*)(void *, int, int))0x8002ca11)
 
+#define EXY_DIRECT_FB_SLOTS 24u
+#define EXY_DIRECT_BB_SLOTS 8u  /* slots 0..7 reserved exclusively for backboardd BIND_SCANOUT */
 struct exy_direct_fb {
     uint32_t surf_pa;
     uint32_t fb_pa;
     uint32_t gen;
     uint32_t stride;
 };
-struct exy_direct_fb exy_direct_fbs[12];
+struct exy_direct_fb exy_direct_fbs[EXY_DIRECT_FB_SLOTS];
 uint32_t exy_direct_fb_gen;
 
 #define KIO_DIR_INOUT       3u          /* kIODirectionInOut */
@@ -856,11 +863,11 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
         mali_lock();
         uint32_t gen = ++exy_direct_fb_gen;
         int slot = -1;
-        for (int i = 0; i < 12; i++) {
+        for (int i = 0; i < (int)EXY_DIRECT_BB_SLOTS; i++) {
             if (exy_direct_fbs[i].surf_pa == spa) { slot = i; break; }
             if (slot < 0 && !exy_direct_fbs[i].surf_pa) slot = i;
         }
-        if (slot < 0) slot = (int)(gen % 12u);
+        if (slot < 0) slot = (int)(gen % EXY_DIRECT_BB_SLOTS);
         exy_direct_fbs[slot].surf_pa = spa;
         exy_direct_fbs[slot].fb_pa = fpa;
         exy_direct_fbs[slot].gen = gen;
@@ -954,7 +961,8 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
         }
         #define MALI_ZC_SLOTS 12u
         #define MALI_ZC_BASE  0x80000000u
-        #define MALI_ZC_DIRECT_PA 0x60c00000u /* 4x4 MiB contiguous zero-copy scanout slots (0x60c00000..0x61c00000) */
+        #define MALI_ZC_DIRECT_PA 0x60c00000u /* 5x4 MiB contiguous app scanout slots (0x60c00000..0x62000000) */
+        #define MALI_ZC_DIRECT_CNT 5u
         static struct { uint32_t pa0, pam, pae, sz, direct_pa; } zc_slots[MALI_ZC_SLOTS];
         static uint32_t zc_next, zc_direct_next;
         uint32_t gva = 0;
@@ -972,10 +980,12 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
             uint32_t base_va = MALI_ZC_BASE + slot * 0x00400000u;
             uint32_t direct_pa = 0u, direct_stride = 0u;
             if (sz == 0x003c0000u) {
-                direct_pa = MALI_ZC_DIRECT_PA + ((zc_direct_next++) & 3u) * 0x00400000u;
+                direct_pa = MALI_ZC_DIRECT_PA + zc_direct_next * 0x00400000u;
+                zc_direct_next = (zc_direct_next + 1u) % MALI_ZC_DIRECT_CNT;
                 direct_stride = 3072u;
             } else if (sz == 0x00384000u) {
-                direct_pa = MALI_ZC_DIRECT_PA + ((zc_direct_next++) & 3u) * 0x00400000u;
+                direct_pa = MALI_ZC_DIRECT_PA + zc_direct_next * 0x00400000u;
+                zc_direct_next = (zc_direct_next + 1u) % MALI_ZC_DIRECT_CNT;
                 direct_stride = 2880u;
             }
             int ok = 1;
@@ -997,6 +1007,30 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 for (unsigned i = 0; i < 5; i++)
                     wr(mali_env.gpu + M_MMU(i) + MMU_COMMAND, MMU_CMD_ZAP_CACHE);
                 l2_flush(&mali_env);
+                /* Clear stale app scanout/ZC entries so two surfaces never alias one direct_pa. */
+                if (zc_slots[slot].pa0) {
+                    for (uint32_t i = EXY_DIRECT_BB_SLOTS; i < EXY_DIRECT_FB_SLOTS; i++) {
+                        if (exy_direct_fbs[i].surf_pa == zc_slots[slot].pa0) {
+                            exy_direct_fbs[i].surf_pa = 0u;
+                            exy_direct_fbs[i].fb_pa = 0u;
+                        }
+                    }
+                }
+                if (direct_pa) {
+                    for (uint32_t i = 0; i < MALI_ZC_SLOTS; i++) {
+                        if (i != slot && zc_slots[i].direct_pa == direct_pa) {
+                            zc_slots[i].pa0 = 0u;
+                            zc_slots[i].sz = 0u;
+                            zc_slots[i].direct_pa = 0u;
+                        }
+                    }
+                    for (uint32_t i = EXY_DIRECT_BB_SLOTS; i < EXY_DIRECT_FB_SLOTS; i++) {
+                        if (exy_direct_fbs[i].fb_pa == direct_pa) {
+                            exy_direct_fbs[i].surf_pa = 0u;
+                            exy_direct_fbs[i].fb_pa = 0u;
+                        }
+                    }
+                }
                 zc_slots[slot].pa0 = pa0;
                 zc_slots[slot].pam = pam;
                 zc_slots[slot].pae = pae;
@@ -1007,11 +1041,12 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 if (direct_pa) {
                     uint32_t gen = ++exy_direct_fb_gen;
                     int dslot = -1;
-                    for (int i = 0; i < 12; i++) {
+                    for (int i = (int)EXY_DIRECT_BB_SLOTS; i < (int)EXY_DIRECT_FB_SLOTS; i++) {
                         if (exy_direct_fbs[i].surf_pa == pa0) { dslot = i; break; }
                         if (dslot < 0 && !exy_direct_fbs[i].surf_pa) dslot = i;
                     }
-                    if (dslot < 0) dslot = (int)(gen % 12u);
+                    if (dslot < 0)
+                        dslot = (int)(EXY_DIRECT_BB_SLOTS + (gen % (EXY_DIRECT_FB_SLOTS - EXY_DIRECT_BB_SLOTS)));
                     exy_direct_fbs[dslot].surf_pa = pa0;
                     exy_direct_fbs[dslot].fb_pa = direct_pa;
                     exy_direct_fbs[dslot].gen = gen;

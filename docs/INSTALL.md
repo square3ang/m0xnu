@@ -135,7 +135,7 @@ sudo umount /tmp/mnt_ios
 ```bash
 python3 tools/mkxnu.py \
   --emmc-root --emmc-var --fb --disp --gpu \
-  --args "cpus=2 serial=3 cs_enforcement_disable=1 amfi_get_out_of_my_way=1" \
+  --args "cpus=4 serial=3 cs_enforcement_disable=1 amfi_get_out_of_my_way=1" \
   --trust-cache out/iosbin/HorizonSetup.cdhash \
   --trust-cache out/iosbin/ExyTouchd.cdhash \
   --trust-cache out/ios-gl/mali_gld.cdhash \

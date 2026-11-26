@@ -29,7 +29,8 @@ def main():
     fd = os.open(path, os.O_RDWR)
     try:
         # bRequestType=0x40 (Vendor Host->Dev), bRequest=0xFB, wValue=0x1337, wIndex=0, wLength=0
-        ctrl = struct.pack("<BBHHHHIQ", 0x40, 0xFB, 0x1337, 0, 0, 0, 1000, 0)
+        # struct usbdevfs_ctrltransfer on x86_64: u8,u8,u16,u16,u16, u32 timeout, 4B pad, u64 data (24B)
+        ctrl = struct.pack("<BBHHHI4xQ", 0x40, 0xFB, 0x1337, 0, 0, 1000, 0)
         fcntl.ioctl(fd, USBDEVFS_CONTROL, ctrl)
         print(f"Sent remote fastboot command to {path} (18d1:4ee8)!")
         return 0

@@ -609,32 +609,24 @@ static void dvfs_thermal_update(void)
     int temp_c = (int)exy_drv_log.st.cpu_temp_c;
     if (temp_c < 20 || temp_c > 115) {
         uint16_t a = exy_drv_log.st.adc_ap;
-        if (a > 0u && a < 500u)      temp_c = 76;
-        else if (a > 0u && a < 620u) temp_c = 68;
-        else if (a > 0u && a < 800u) temp_c = 58;
-        else                         temp_c = 45;
+        if (a > 0u && a < 380u)      temp_c = 90;
+        else if (a > 0u && a < 460u) temp_c = 82;
+        else if (a > 0u && a < 540u) temp_c = 74;
+        else if (a > 0u && a < 640u) temp_c = 64;
+        else                         temp_c = 48;
     }
 
-    uint32_t dt_touch = now - exy_last_touch_mct;
-    uint32_t dt_gpu   = now - exy_last_gpu_mct;
-    uint32_t dt_disp  = now - exy_last_disp_mct;
-    int touch_act = (exy_last_touch_mct && dt_touch < 24000u * 1200u);
-    int gpu_act   = (exy_last_gpu_mct   && dt_gpu   < 24000u * 600u);
-    int disp_act  = (exy_last_disp_mct  && dt_disp  < 24000u * 1000u);
-
-    int cpu_opp = touch_act ? 2 : ((gpu_act || disp_act) ? 1 : 0);
-    int gpu_opp = gpu_act ? 2 : (touch_act ? 1 : 0);
-
-    /* Thermal throttle ceilings (keeps phone comfortably cool in hand) */
-    if (temp_c >= 75) {
+    int cpu_opp = 2, gpu_opp = 2;
+    /* Keep full stock speed (1400/440 MHz) below 80C to avoid SMP clock-mux/I2C stalls;
+     * throttle only on genuine high temperature. */
+    if (temp_c >= 88) {
         cpu_opp = 0;
         gpu_opp = 0;
-    } else if (temp_c >= 66) {
-        if (cpu_opp > 1) cpu_opp = 1;
-        if (gpu_opp > 1) gpu_opp = 1;
-    } else if (temp_c >= 58) {
-        if (!touch_act && cpu_opp > 1) cpu_opp = 1;
+    } else if (temp_c >= 80) {
+        cpu_opp = 1;
+        gpu_opp = 1;
     }
+    (void)now;
 
     (void)exy_cpu_set_opp(cpu_opp);
     (void)exy_gpu_set_opp(gpu_opp);
@@ -992,6 +984,20 @@ static int wm1811_write(uint16_t reg, uint16_t val)
     return exy_i2c_write(i2c4_va, 0x1au, b, 4);
 }
 
+static void drv_puts(const char *s)
+{
+    extern void exy_putc(char c);
+    while (*s) exy_putc(*s++);
+}
+
+static void drv_putx(uint32_t v)
+{
+    extern void exy_putc(char c);
+    static const char h[] = "0123456789abcdef";
+    for (int i = 28; i >= 0; i -= 4)
+        exy_putc(h[(v >> i) & 0xfu]);
+}
+
 extern int exy_drv_set_volume(uint8_t vol);
 
 static void audio_init(void)
@@ -1060,48 +1066,64 @@ static void audio_init(void)
     if (id == 0x8994u || id == 0x1811u || id == 0x8958u) {
         exy_drv_log.st.wm1811_id = id;
         exy_drv_log.st.probe_mask |= DRV_BIT_WM1811;
-        /* Soft reset + power up VMID / BIAS / speaker + headphone + DAC1 + FLL1 (24MHz -> 12.288MHz) */
+        /* Soft reset -> LDO1 (3.0V AVDD1) + LDO2 (1.05V DCVDD) -> VMID/BIAS -> FLL1 -> AIF1CLK -> DAC1 -> SPKOUT!
+         * CRITICAL: SPKOUTL/R must be enabled AFTER LDO1/2, VMID, and FLL1/AIF1CLK are stable,
+         * otherwise WM1811 clock-loss/anti-pop protection permanently mutes the Class-D speaker stage! */
         wm1811_write(0x0000u, 0x0000u);
-        exy_udelay(2000);
+        exy_udelay(5000);
+        wm1811_write(0x003bu /* LDO_1 (AVDD1 3.0V) */, 0x000du);
+        wm1811_write(0x003cu /* LDO_2 (DCVDD 1.05V) */, 0x0005u);
+        exy_udelay(10000);
         wm1811_write(0x0039u /* ANTIPOP2 */, 0x01e4u);
-        wm1811_write(0x0001u /* PWR_MGMT_1 */, 0x3303u); /* SPKOUTL+R, HPOUT1L+R, VMID_SEL=2x40k, BIAS */
-        wm1811_write(0x0003u /* PWR_MGMT_3 */, 0x0330u); /* SPKLVOL+RVOL, MIXOUTL+R */
-        wm1811_write(0x0005u /* PWR_MGMT_5 */, 0x0303u); /* AIF1DAC1L+R, DAC1L+R */
+        wm1811_write(0x0001u /* PWR_MGMT_1: VMID+BIAS only first */, 0x0003u);
+        exy_udelay(50000);
+        wm1811_write(0x0039u /* ANTIPOP2: switch to normal bias + VMID_BUF */, 0x0040u);
         /* FLL1: Fref = 24MHz / 2 = 12MHz -> Fvco = 98.304MHz (N=8, K=0x3126) -> OUTDIV=8 -> 12.288MHz */
         wm1811_write(0x0221u /* FLL1_CTRL_2 */, 0x0700u); /* FLL1_OUTDIV=8, FRATIO=1 */
         wm1811_write(0x0222u /* FLL1_CTRL_3 */, 0x3126u); /* FLL1_K */
         wm1811_write(0x0223u /* FLL1_CTRL_4 */, 0x0100u); /* FLL1_N=8 (bits 14:5) */
         wm1811_write(0x0224u /* FLL1_CTRL_5 */, 0x0008u); /* FLL1_CLK_REF_DIV=/2, SRC=MCLK1 */
         wm1811_write(0x0220u /* FLL1_CTRL_1 */, 0x0005u); /* FLL1_FRAC=1, FLL1_ENA=1 */
-        exy_udelay(5000);
+        exy_udelay(10000);
         wm1811_write(0x0200u /* AIF1_CLK_1 */, 0x0011u);  /* SRC=FLL1, ENA=1 */
-        wm1811_write(0x0208u /* CLOCKING_1 */, 0x000au);  /* AIF1DSPCLK + SYSDSPCLK */
+        wm1811_write(0x0208u /* CLOCKING_1 */, 0x001au);  /* TOCLK|AIF1DSPCLK|SYSDSPCLK, SYSCLK_SRC=0 (AIF1CLK!) */
         wm1811_write(0x0210u /* AIF1_RATE */, 0x0083u);   /* 48 kHz, 256fs */
         wm1811_write(0x0300u /* AIF1_CTRL_1 */, 0x4010u); /* 16-bit I2S */
+        wm1811_write(0x0302u /* AIF1_MSTR_SLV */, 0x4000u); /* WM1811 I2S Master (CBP_CFP, matching midas_wm1811.c) */
+        wm1811_write(0x0303u /* AIF1_BCLK */, 0x0070u);   /* BCLK_DIV=/8 -> 12.288M/8 = 1.536MHz (32fs) */
+        wm1811_write(0x0304u /* AIF1ADC_LRCLK */, 0x0020u); /* 32 BCLKs -> 48.000 kHz */
+        wm1811_write(0x0305u /* AIF1DAC_LRCLK */, 0x0020u); /* 32 BCLKs -> 48.000 kHz */
+        wm1811_write(0x0005u /* PWR_MGMT_5 */, 0x0303u);  /* AIF1DAC1L+R, DAC1L+R */
+        wm1811_write(0x0003u /* PWR_MGMT_3 */, 0x0330u);  /* SPKLVOL+RVOL, MIXOUTL+R */
+        wm1811_write(0x0402u /* AIF1_DAC1_L_VOL */, 0x01c0u); /* 0 dB + VU */
+        wm1811_write(0x0403u /* AIF1_DAC1_R_VOL */, 0x01c0u);
         wm1811_write(0x0420u /* AIF1_DAC1_FILT */, 0x0000u); /* unmute */
         wm1811_write(0x0601u /* DAC1_LEFT_MIX */, 0x0001u);
         wm1811_write(0x0602u /* DAC1_RIGHT_MIX */, 0x0001u);
-        wm1811_write(0x0610u /* DAC1_LEFT_VOL */, 0x01c0u); /* 0 dB + VU */
+        wm1811_write(0x0610u /* DAC1_LEFT_VOL */, 0x01c0u); /* 0 dB + VU + unmute */
         wm1811_write(0x0611u /* DAC1_RIGHT_VOL */, 0x01c0u);
-        /* Speaker path (GT-I9300 bottom mono speaker on SPKOUTL):
+        wm1811_write(0x0620u /* OVERSAMPLING */, 0x0002u); /* DAC_OSR128 default */
+        /* Speaker path (Galaxy S3 mono external speaker on SPKOUTL + SPKOUTR active):
          *   0x0036 SPEAKER_MIXER: DAC1L->SPKMIXL (bit 1) + DAC1R->SPKMIXR (bit 0)
-         *   0x0022/0x0023 SPKMIXL/R_ATTENUATION: 0x0000 = 0 dB UNMUTED (bit 8 was MUTE!)
-         *   0x0024 SPKOUT_MIXERS: 0x0013 = SPKMIXL+SPKMIXR -> SPKOUTL (mono mix) + SPKMIXR -> SPKOUTR
-         *   0x0025 CLASSD: 0x0168 = Class-D enabled + +3dB boost
+         *   0x0022/0x0023 SPKMIXL/R_ATTENUATION: 0x0000 = 0 dB UNMUTED
+         *   0x0024 SPKOUT_MIXERS: 0x0019 = SPKMIXL+SPKMIXR->SPKOUTL (b4|b3, midas_wm1811.c) | SPKMIXR->SPKOUTR (b0)
+         *   0x0025 CLASSD: 0x0177 = Class-D enabled + boost on L+R
          *   0x0026/0x0027 SPEAKER_VOLUME_LEFT/RIGHT: VU(0x100) | MUTE_N(0x040) | vol(0..63) */
         wm1811_write(0x0036u /* SPEAKER_MIXER */, 0x0003u);
         wm1811_write(0x0022u /* SPKMIXL_ATTEN */, 0x0000u);
         wm1811_write(0x0023u /* SPKMIXR_ATTEN */, 0x0000u);
-        wm1811_write(0x0024u /* SPKOUT_MIXERS */, 0x0013u);
-        wm1811_write(0x0025u /* CLASSD */,        0x0168u);
+        wm1811_write(0x0024u /* SPKOUT_MIXERS */, 0x0019u);
+        wm1811_write(0x0025u /* CLASSD */,        0x0177u); /* Class-D boost on L+R */
         /* Headphone path: DAC1L/R -> OUTPUT_MIX1/2 -> Charge Pump + DC Servo + ANALOGUE_HP_1 */
         wm1811_write(0x002du /* OUTPUT_MIX1 */,   0x0001u); /* DAC1L -> HPOUT1L */
         wm1811_write(0x002eu /* OUTPUT_MIX2 */,   0x0001u); /* DAC1R -> HPOUT1R */
         wm1811_write(0x004cu /* CHARGE_PUMP_1 */, 0x9f25u); /* CP_ENA for HPOUT1 */
         wm1811_write(0x0054u /* DC_SERVO_1 */,    0x0033u); /* enable + startup DC servo L/R */
+        /* Now enable SPKOUTL+R and HPOUT1L+R AFTER clocks/VMID/LDOs are stable */
+        wm1811_write(0x0001u /* PWR_MGMT_1 */, 0x3303u);
         exy_udelay(15000);
         wm1811_write(0x0060u /* ANALOGUE_HP_1 */, 0x00eeu); /* enable HP1L/R output stages, release shorts */
-        exy_drv_log.st.volume = 75u;
+        exy_drv_log.st.volume = 85u;
     }
     /* Headphone jack detect GPX3[0] (active-low) + Exynos I2S0 (0x03830000) + GPZ[0..4] pinmux */
     if (gpio_r_va) {
@@ -1110,11 +1132,11 @@ static void audio_init(void)
         exy_drv_log.st.hp_jack = (uint8_t)(!gpio_get(gpio_r_va + 0xc60u, 0));
     }
     if (exy_drv_log.st.probe_mask & DRV_BIT_WM1811)
-        exy_drv_set_volume(75u);
+        exy_drv_set_volume(85u);
     if (audss_va) {
-        /* AUDSS: MOUT_AUDSS = EPLL (49.152 MHz), DOUT_I2S = /4 (12.288 MHz = 256fs @ 48 kHz), ungate all */
+        /* AUDSS: MOUT_AUDSS = EPLL (49.152 MHz), BUS_RATIO=/4 & I2S_RATIO=/4 (12.288 MHz = 256fs @ 48.000 kHz exact!) */
         dwr(audss_va + 0x00u /* CLK_SRC */,  0x00000001u);
-        dwr(audss_va + 0x04u /* CLK_DIV */,  (3u << 8));
+        dwr(audss_va + 0x04u /* CLK_DIV */,  (3u << 8) | (3u << 4));
         dwr(audss_va + 0x08u /* CLK_GATE */, drd(audss_va + 0x08u) | 0x3fu);
     }
     if (gpz_va) {
@@ -1122,10 +1144,12 @@ static void audio_init(void)
         dwr(gpz_va + 0x00u, (drd(gpz_va + 0x00u) & ~0x000fffffu) | 0x00022222u);
     }
     if (i2s0_va) {
-        /* Configure I2S0: Master TX-only, 16-bit stereo I2S, RFS=256fs (0), BFS=32fs (0), bypass prescaler */
+        /* Deassert active-low CON_RESET (bit 31!), Exynos I2S0 = SLAVE (bit 11 = MOD_SLAVE, bit 12 = CDCLK_IN)
+         * clocked directly by WM1811 AIF1 Master (1.536 MHz BCLK, 48.000 kHz LRCLK), matching midas_wm1811.c! */
+        dwr(i2s0_va + 0x00u /* I2SCON */, (1u << 31) | (1u << 4)); /* CON_RESET=1 (run), TXCH_PAUSE */
+        dwr(i2s0_va + 0x04u /* I2SMOD */, (3u << 30) | (1u << 12) | (1u << 11)); /* OPCLK_PCLK | CDCLK_IN | SLAVE | 16-bit I2S | 256fs | 32fs */
         dwr(i2s0_va + 0x14u /* I2SPSR */, 0u);
-        dwr(i2s0_va + 0x04u /* I2SMOD */, (0u << 13) | (0u << 10) | (0u << 8) | (0u << 3) | (0u << 1));
-        dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15)); /* TFLUSH */
+        dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15));             /* FIC_TXFLUSH */
         dwr(i2s0_va + 0x08u, 0u);
         exy_drv_log.st.probe_mask |= DRV_BIT_I2S0;
     }
@@ -1159,9 +1183,9 @@ void exy_i2s0_set_active(int active)
     if (active) {
         dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15));
         dwr(i2s0_va + 0x08u, 0u);
-        dwr(i2s0_va + 0x00u /* I2SCON */, 1u); /* I2SACTIVE */
+        dwr(i2s0_va + 0x00u /* I2SCON */, (1u << 31) | 1u); /* CON_RESET=1 | CON_ACTIVE */
     } else {
-        dwr(i2s0_va + 0x00u, 0u);
+        dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4)); /* CON_RESET=1 | TXCH_PAUSE */
     }
 }
 
@@ -1170,8 +1194,8 @@ uint32_t exy_i2s0_push_frames(const uint32_t *frames, uint32_t count)
 {
     if (!(exy_drv_log.st.probe_mask & DRV_BIT_I2S0) || !i2s0_va || !frames)
         return 0u;
-    if (!(drd(i2s0_va + 0x00u) & 1u))
-        dwr(i2s0_va + 0x00u, 1u);
+    if ((drd(i2s0_va + 0x00u) & ((1u << 31) | 1u)) != ((1u << 31) | 1u))
+        dwr(i2s0_va + 0x00u, (1u << 31) | 1u);
     uint32_t pushed = 0u;
     while (pushed < count && !(drd(i2s0_va + 0x00u) & (1u << 8))) {
         dwr(i2s0_va + 0x10u /* I2STXD */, frames[pushed++]);
@@ -1181,32 +1205,65 @@ uint32_t exy_i2s0_push_frames(const uint32_t *frames, uint32_t count)
 
 int exy_drv_audio_tone(uint16_t hz, uint16_t ms)
 {
+    (void)hz; (void)ms;
+    return 0; /* muted during Wi-Fi bring-up per user request; I2S0/IOAudio2Device unchanged */
     if (!(exy_drv_log.st.probe_mask & DRV_BIT_I2S0) || !i2s0_va)
         return -1;
-    if (hz < 100u) hz = 440u;
+    if (hz < 100u) hz = 880u;
     if (hz > 8000u) hz = 8000u;
     if (ms > 500u) ms = 500u;
     if (!ms) return 0;
-    /* Stream 48 kHz 16-bit stereo triangle wave through I2S0 TX FIFO */
+    /* Stream 48 kHz 16-bit stereo triangle wave through I2S0 TX FIFO (keep CON_RESET bit 31 = 1!) */
     uint32_t total = ((uint32_t)ms * 48u);
     uint32_t period = 48000u / (uint32_t)hz;
     if (period < 4u) period = 4u;
     uint32_t half = period >> 1;
+    dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4));
     dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15));
     dwr(i2s0_va + 0x08u, 0u);
-    dwr(i2s0_va + 0x00u /* I2SCON */, 1u); /* I2SACTIVE */
-    for (uint32_t i = 0; i < total; i++) {
-        uint32_t pos = i % period;
-        int32_t tri = (pos < half) ? (int32_t)((pos * 12000u) / half) - 6000
-                                   : 6000 - (int32_t)(((pos - half) * 12000u) / half);
-        uint32_t sample = ((uint32_t)(uint16_t)(int16_t)tri) | ((uint32_t)(uint16_t)(int16_t)tri << 16);
-        uint32_t wait = 0;
-        while ((drd(i2s0_va + 0x00u) & (1u << 8)) && ++wait < 4000u) /* TXFIFO_FULL */
-            exy_udelay(1);
-        if (wait >= 4000u) break;
-        dwr(i2s0_va + 0x10u /* I2STXD */, sample);
+    /* Play two clear tones (hz, then 1.33*hz) at max speaker gain so user can hear easily */
+    exy_drv_set_volume(100u);
+    uint32_t t0 = exy_mct_lo(), pushed = 0u;
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t cur_hz = (pass == 0) ? (uint32_t)hz : ((uint32_t)hz * 4u) / 3u;
+        uint32_t period = 48000u / cur_hz;
+        if (period < 4u) period = 4u;
+        uint32_t half = period >> 1;
+        dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4));
+        dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15));
+        dwr(i2s0_va + 0x08u, 0u);
+        for (uint32_t i = 0; i < total; i++) {
+            uint32_t pos = i % period;
+            int32_t tri = (pos < half) ? (int32_t)((pos * 28000u) / half) - 14000
+                                       : 14000 - (int32_t)(((pos - half) * 28000u) / half);
+            uint32_t sample = ((uint32_t)(uint16_t)(int16_t)tri) | ((uint32_t)(uint16_t)(int16_t)tri << 16);
+            if (i == 16u)
+                dwr(i2s0_va + 0x00u /* I2SCON */, (1u << 31) | 1u);
+            uint32_t wait = 0;
+            while ((drd(i2s0_va + 0x00u) & (1u << 8)) && ++wait < 4000u)
+                exy_udelay(1);
+            if (wait >= 4000u) break;
+            dwr(i2s0_va + 0x10u /* I2STXD */, sample);
+            pushed++;
+        }
+        dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4));
+        if (pass == 0) exy_udelay(60000);
     }
-    dwr(i2s0_va + 0x00u, 0u);
+    uint32_t dt_us = (exy_mct_lo() - t0) / 24u;
+    (void)period; (void)half;
+    uint16_t irq2 = 0, p1 = 0, s26 = 0, c1 = 0, rst = 0, s24 = 0;
+    (void)wm1811_read(0x0731u, &irq2); /* INTERRUPT_STATUS_2: bit 5 = FLL1_LOCK */
+    (void)wm1811_read(0x0001u, &p1);
+    (void)wm1811_read(0x0026u, &s26);
+    (void)wm1811_read(0x0208u, &c1);
+    (void)wm1811_read(0x0212u, &rst); /* Rate Status (SR_ERROR) */
+    (void)wm1811_read(0x0024u, &s24);
+    drv_puts("[TONE] n="); drv_putx(pushed);
+    drv_puts(" us="); drv_putx(dt_us);
+    drv_puts(" wm="); drv_putx(((uint32_t)irq2 << 16) | s26);
+    drv_puts(" p1="); drv_putx(((uint32_t)s24 << 16) | p1);
+    drv_puts(" clk="); drv_putx(((uint32_t)c1 << 16) | rst);
+    drv_puts("\n");
     return 0;
 }
 
@@ -1301,10 +1358,15 @@ static void tmu_adc_init(void)
 
 static void tmu_adc_poll(void)
 {
-    if ((exy_drv_log.st.probe_mask & DRV_BIT_TMU) && tmu_va) {
+    if (tmu_va) {
         uint32_t raw = drd(tmu_va + 0x40u) & 0xffu;
-        if (raw > 0u && raw < 255u)
-            exy_drv_log.st.cpu_temp_c = (int16_t)((int32_t)raw - (int32_t)tmu_trim25 + 25);
+        if (raw > 0u && raw < 255u) {
+            int32_t tc = (int32_t)raw - (int32_t)tmu_trim25 + 25;
+            if (tc >= 0 && tc <= 125) {
+                exy_drv_log.st.cpu_temp_c = (int16_t)tc;
+                exy_drv_log.st.probe_mask |= DRV_BIT_TMU;
+            }
+        }
     }
     if ((exy_drv_log.st.probe_mask & DRV_BIT_ADC) && adc_va) {
         dwr(adc_va + 0x1cu, 1u);
@@ -1371,8 +1433,9 @@ static void wifi_bt_probe(void)
         dwr(uart0_va + 0x28u /* UBRDIV */, ubrdiv);
         dwr(uart0_va + 0x2cu /* UFRACVAL */, ufrac);
         exy_udelay(5000);
-        /* Drain RX + send HCI_Reset (01 03 0C 00) */
-        while (drd(uart0_va + 0x10u /* UTRSTAT */) & 1u) (void)drd(uart0_va + 0x24u);
+        /* Drain RX (bounded so floating/noisy UART0 RX never hangs boot) + send HCI_Reset (01 03 0C 00) */
+        for (uint32_t d = 0u; d < 64u && (drd(uart0_va + 0x10u /* UTRSTAT */) & 1u); d++)
+            (void)drd(uart0_va + 0x24u);
         static const uint8_t hci_rst[4] = { 0x01u, 0x03u, 0x0cu, 0x00u };
         for (int i = 0; i < 4; i++) {
             for (uint32_t w = 0; w < 2000u && !(drd(uart0_va + 0x10u) & 2u); w++) exy_udelay(5);
@@ -1402,6 +1465,7 @@ static void wifi_bt_probe(void)
 
 static void dwc2_ep0_arm_out(void)
 {
+    dwr(otg_va + 0xb08u /* DOEPINT0 */, 0xffu);
     dwr(otg_va + 0xb10u /* DOEPTSIZ0 */, (3u << 29) | (1u << 19) | 64u);
     dwr(otg_va + 0xb00u /* DOEPCTL0 */,  (1u << 31) | (1u << 26)); /* EPEna | CNAK */
 }
@@ -1409,6 +1473,15 @@ static void dwc2_ep0_arm_out(void)
 static void dwc2_ep0_tx(const uint8_t *buf, uint32_t len)
 {
     if (len > 64u) len = 64u;
+    if (drd(otg_va + 0x900u /* DIEPCTL0 */) & (1u << 31)) {
+        dwr(otg_va + 0x900u, (1u << 30) | (1u << 27)); /* EPDis | SNAK */
+        for (uint32_t i = 0; i < 200u && !(drd(otg_va + 0x908u) & (1u << 1)); i++)
+            exy_udelay(1);
+        dwr(otg_va + 0x10u /* GRSTCTL */, (1u << 5)); /* TxFFlsh FIFO 0 */
+        for (uint32_t i = 0; i < 200u && (drd(otg_va + 0x10u) & (1u << 5)); i++)
+            exy_udelay(1);
+    }
+    dwr(otg_va + 0x908u /* DIEPINT0 */, 0xffu);
     dwr(otg_va + 0x910u /* DIEPTSIZ0 */, (1u << 19) | len);
     dwr(otg_va + 0x900u /* DIEPCTL0 */,  (1u << 31) | (1u << 26)); /* EPEna | CNAK, MPS=64 */
     uint32_t words = (len + 3u) >> 2;
@@ -1436,6 +1509,7 @@ static void dwc2_handle_setup(const uint8_t s[8])
 
     uint8_t bm = s[0], req = s[1];
     uint16_t val = (uint16_t)s[2] | ((uint16_t)s[3] << 8);
+    uint16_t idx = (uint16_t)s[4] | ((uint16_t)s[5] << 8);
     uint16_t len = (uint16_t)s[6] | ((uint16_t)s[7] << 8);
 
     if (bm == 0x80u && req == 0x06u) { /* GET_DESCRIPTOR */
@@ -1473,6 +1547,20 @@ static void dwc2_handle_setup(const uint8_t s[8])
         dwc2_ep0_arm_out();
         return;
     }
+    if (bm == 0x40u && req == 0xfcu) { /* Vendor synthetic button press (val=bitmask) */
+        extern void exy_synth_btn_inject(uint32_t mask);
+        exy_synth_btn_inject(val);
+        dwc2_ep0_tx(0, 0u);
+        dwc2_ep0_arm_out();
+        return;
+    }
+    if (bm == 0x40u && req == 0xfdu) { /* Vendor synthetic touch (val=x|(down<<15), idx=y) */
+        extern void exy_synth_touch_inject(uint16_t x, uint16_t y, uint32_t down);
+        exy_synth_touch_inject(val & 0x7fffu, idx, (val >> 15) & 1u);
+        dwc2_ep0_tx(0, 0u);
+        dwc2_ep0_arm_out();
+        return;
+    }
     if (bm == 0x40u && req == 0xfbu && val == 0x1337u) { /* Vendor Remote Fastboot! */
         dwc2_ep0_tx(0, 0u);
         exy_udelay(30000);
@@ -1491,11 +1579,15 @@ static void exy_usb_poll_thread(void *param, int wait_res)
     (void)param; (void)wait_res;
     uint8_t setup[8] = { 0 };
     int have_setup = 0;
-    uint32_t idle = 0u;
+    uint32_t idle = 0u, setup_age = 0u;
     for (;;) {
+        extern volatile uint32_t exy_usb_hb;
+        exy_usb_hb++;
         uint32_t gint = drd(otg_va + 0x14u /* GINTSTS */);
         int busy = 0;
         if (gint & (1u << 12)) { /* USBRst */
+            have_setup = 0;
+            setup_age = 0u;
             dwr(otg_va + 0x800u, drd(otg_va + 0x800u) & ~(0x7fu << 4));
             dwr(otg_va + 0x908u /* DIEPINT0 */, 0xffu);
             dwr(otg_va + 0xb08u /* DOEPINT0 */, 0xffu);
@@ -1505,12 +1597,14 @@ static void exy_usb_poll_thread(void *param, int wait_res)
             busy = 1;
         }
         if (gint & (1u << 13)) { /* EnumDone */
+            have_setup = 0;
+            setup_age = 0u;
             dwr(otg_va + 0x900u, drd(otg_va + 0x900u) & ~3u); /* MPS = 64B */
             dwr(otg_va + 0x14u, (1u << 13));
             dwc2_ep0_arm_out();
             busy = 1;
         }
-        while (drd(otg_va + 0x14u) & (1u << 4)) { /* RXFLvl */
+        for (uint32_t rx_lim = 0; rx_lim < 32u && (drd(otg_va + 0x14u) & (1u << 4)); rx_lim++) { /* RXFLvl */
             busy = 1;
             uint32_t st = drd(otg_va + 0x20u /* GRXSTSP */);
             uint32_t bcnt = (st >> 4) & 0x7ffu;
@@ -1523,14 +1617,28 @@ static void exy_usb_poll_thread(void *param, int wait_res)
                 setup[4] = (uint8_t)w1;       setup[5] = (uint8_t)(w1 >> 8);
                 setup[6] = (uint8_t)(w1 >> 16); setup[7] = (uint8_t)(w1 >> 24);
                 have_setup = 1;
+                setup_age = 0u;
             } else if (psts == 4u && have_setup) { /* SETUP stage complete */
                 have_setup = 0;
+                setup_age = 0u;
                 dwc2_handle_setup(setup);
-            } else if (bcnt > 0u) {
-                uint32_t words = (bcnt + 3u) >> 2;
-                while (words--) (void)drd(otg_va + 0x1000u);
+            } else {
+                if (bcnt > 0u) {
+                    uint32_t words = (bcnt + 3u) >> 2;
+                    while (words--) (void)drd(otg_va + 0x1000u);
+                }
+                if (psts == 3u /* OUT_COMP */ || psts == 4u)
+                    dwc2_ep0_arm_out();
             }
         }
+        if (have_setup && ++setup_age > 10u) {
+            have_setup = 0;
+            setup_age = 0u;
+            dwc2_ep0_arm_out();
+        }
+        /* Keep EP0 OUT armed when idle so future remote-fastboot SETUP packets are never NAKed. */
+        if (!have_setup && !(drd(otg_va + 0xb00u) & (1u << 31)))
+            dwc2_ep0_arm_out();
         if (busy) {
             idle = 0u;
             k_iosleep_drv(1u);
@@ -1549,9 +1657,9 @@ static void exy_usb_gadget_init(void)
     uintptr_t cmu_fsys = ml_io_map(0x1003c000u, 0x1000u);
     if (cmu_fsys)
         dwr(cmu_fsys + 0x940u, drd(cmu_fsys + 0x940u) | (1u << 12) | (1u << 13));
-    /* 2. Power on VUOTG_3.0V (LDO12), VHSIC_1.0V (LDO15), VHSIC_1.8V (LDO16) + MAX77693 SAFEOUT1 & MUIC USB path */
+    /* 2. Power on VUOTG_3.0V (LDO12), VHSIC_1.0V (LDO15: 25mV step -> 0xc8=1.0V), VHSIC_1.8V (LDO16) + MAX77693 SAFEOUT1 & MUIC USB path */
     exy_pmic_write_reg(0x4bu /* LDO12 */, 0xecu);
-    exy_pmic_write_reg(0x4eu /* LDO15 */, 0xc4u);
+    exy_pmic_write_reg(0x4eu /* LDO15 */, 0xc8u);
     exy_pmic_write_reg(0x4fu /* LDO16 */, 0xd4u);
     struct bb_i2c m77 = bus_m77();
     uint8_t so = 0u;
@@ -1582,16 +1690,25 @@ static void exy_usb_gadget_init(void)
     dwr(otg_va + 0x10u /* GRSTCTL */, 1u);
     for (uint32_t i = 0; i < 10000u && (drd(otg_va + 0x10u) & 1u); i++) exy_udelay(1);
     exy_udelay(1000);
-    dwr(otg_va + 0x0cu /* GUSBCFG */, (1u << 30) | (5u << 10) | (1u << 3)); /* ForceDev | TRDT=5 | 16b UTMI */
+    /* Match U-Boot dwc2_udc_otg.c: ForceDev | NPTxRewind | TRDT=5 | 16-bit UTMI+ | ToutCal=7 */
+    dwr(otg_va + 0x0cu /* GUSBCFG */, (1u << 30) | (1u << 14) | (5u << 10) | (1u << 3) | 7u);
     dwr(otg_va + 0x08u /* GAHBCFG */, 0u); /* Slave PIO mode */
+    dwr(otg_va + 0x804u /* DCTL */, drd(otg_va + 0x804u) | (1u << 1)); /* Soft disconnect first */
+    exy_udelay(30000);
+    dwr(otg_va + 0x800u /* DCFG */, (1u << 18)); /* EP_MISS_CNT=1 | High Speed 2.0 */
+    dwr(otg_va + 0x818u /* DAINTMSK */, (1u << 16) | 1u);
+    dwr(otg_va + 0x810u /* DIEPMSK */,  0x0du);
+    dwr(otg_va + 0x814u /* DOEPMSK */,  0x0du);
     dwr(otg_va + 0x24u /* GRXFSIZ */, 256u);
     dwr(otg_va + 0x28u /* GNPTXFSIZ */, (64u << 16) | 256u);
     dwr(otg_va + 0x10u, (0x10u << 6) | (1u << 5) | (1u << 4)); /* Flush TX+RX FIFOs */
     for (uint32_t i = 0; i < 1000u && (drd(otg_va + 0x10u) & 0x30u); i++) exy_udelay(1);
-    dwr(otg_va + 0x800u /* DCFG */, 0u); /* High Speed */
+    dwr(otg_va + 0x18u /* GINTMSK */, (1u << 4) | (1u << 12) | (1u << 13));
     dwr(otg_va + 0x14u /* GINTSTS */, 0xffffffffu);
+    dwr(otg_va + 0x908u /* DIEPINT0 */, 0xffu);
+    dwr(otg_va + 0xb08u /* DOEPINT0 */, 0xffu);
     dwc2_ep0_arm_out();
-    dwr(otg_va + 0x804u /* DCTL */, 0u); /* Clear SftDiscon -> enumerate 18d1:4ee8! */
+    dwr(otg_va + 0x804u /* DCTL */, drd(otg_va + 0x804u) & ~(1u << 1)); /* Clear SftDiscon -> enumerate 18d1:4ee8! */
 
     void *th = 0;
     if (k_thread_drv(exy_usb_poll_thread, 0, &th) == 0)
@@ -1648,7 +1765,7 @@ void exy_drivers_init(void *parent_service)
     uart2_va   = ml_io_map(UART2_PA, 0x1000);
     sd2_va     = ml_io_map(SDHCI2_PA, 0x1000);
     sd3_va     = ml_io_map(SDHCI3_PA, 0x1000);
-    otg_va     = ml_io_map(OTG_PA, 0x1000);
+    otg_va     = ml_io_map(OTG_PA, 0x2000);
 
     exy_drv_log.init_done = 0x102u;
     exy_clean_line(&exy_drv_log);
@@ -1702,8 +1819,10 @@ void exy_drivers_init(void *parent_service)
     sensors_poll();
     exy_drv_log.init_done = 0x10cu; exy_clean_line(&exy_drv_log);
     extern void exy_audio_register(void *parent_service);
+    extern void exy_wifi_set_parent(void *parent_service);
     audio_init();
     exy_audio_register(parent_service);
+    exy_wifi_set_parent(parent_service);
     flash_init();
     tmu_adc_init();
     exy_drv_log.init_done = 0x10du; exy_clean_line(&exy_drv_log);

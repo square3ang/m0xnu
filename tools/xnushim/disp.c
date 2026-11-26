@@ -52,8 +52,8 @@ typedef int (*tc_enter_delayed_int_t)(void *, uint32_t, uint32_t, uint32_t,
 #define CMU_TOP_LCD_PA  0x1003c000u
 #define CMU_GATE_IP_LCD 0x934u
 
-#define DISP_FB_PA      0x60000000  /* mkxnu FB_PA */
-#define DISP_FB2_PA     0x60800000  /* ping-pong blit FB (in unused 0x60800000..0x62000000 carveout) */
+#define DISP_FB_PA      0x60400000  /* ping-pong blit FB #0 (separate from boot console 0x60000000) */
+#define DISP_FB2_PA     0x60800000  /* ping-pong blit FB #1 (in 0x60400000..0x60c00000 carveout) */
 #define DISP_W          720
 #define DISP_H          1280
 #define DISP_STRIDE     (DISP_W * 4)
@@ -93,7 +93,7 @@ static uint32_t disp_fb_idx;
 
 extern uintptr_t mct;
 extern void exy_clean_line(const void *p);
-extern struct exy_direct_fb { uint32_t surf_pa, fb_pa, gen, stride; } exy_direct_fbs[12];
+extern struct exy_direct_fb { uint32_t surf_pa, fb_pa, gen, stride; } exy_direct_fbs[24];
 extern uint32_t exy_direct_fb_gen;
 
 static void disp_clean(const void *p)
@@ -569,16 +569,16 @@ static uint32_t bb_pid = 0;
 
 void exy_log_extmethod(void **self, uint32_t sel, const uint64_t *sc, uint32_t sc_cnt)
 {
-    if (exy_disp_log.swaps < 717u || !self)
+    if (!self || exy_disp_log.swaps < 717u)
         return;
+    const void *meta = ((const void *(*)(void *))(*(void ***)self)[7])(self);
+    const char *cname = meta ? getClassName(meta) : "?";
     uint32_t pid = (uint32_t)proc_selfpid();
     if (bb_pid && pid != bb_pid)
         return;
     static uint32_t uclog = 0;
     if (uclog >= 60u)
         return;
-    const void *meta = ((const void *(*)(void *))(*(void ***)self)[7])(self);
-    const char *cname = meta ? getClassName(meta) : "?";
     /* Skip noisy IOHID calls unless low count */
     if (cname[0] == 'I' && cname[1] == 'O' && cname[2] == 'H' && uclog >= 8u)
         return;
@@ -682,7 +682,7 @@ void exy_clcd_swap_begin(uint8_t *self)
         uint32_t spa = get_surface_pa(surf0);
         exy_disp_log.last_pa = spa;
         uint32_t direct_fb = 0, direct_gen = 0, direct_stride = DISP_STRIDE;
-        for (int i = 0; i < 12; i++) {
+        for (int i = 0; i < 24; i++) {
             if (spa && exy_direct_fbs[i].surf_pa == spa) {
                 direct_fb = exy_direct_fbs[i].fb_pa;
                 direct_gen = exy_direct_fbs[i].gen;
@@ -694,6 +694,7 @@ void exy_clcd_swap_begin(uint8_t *self)
         if (direct_fb) {
             extern void exy_mali_wait_idle(void);
             exy_mali_wait_idle();
+            if (mct) exy_last_disp_mct = *(volatile uint32_t *)(mct + 0x100u);
             if (direct_fb != last_fimd_pa || direct_stride != last_fimd_stride || direct_gen != last_fb_gen) {
                 fimd_set_fb(direct_fb, direct_stride);
                 if (fimd_va) swap_vc1 = *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1);
@@ -717,7 +718,7 @@ void exy_clcd_swap_begin(uint8_t *self)
             if (blit_pa) {
                 fimd_set_fb(blit_pa, DISP_STRIDE);
                 if (fimd_va) swap_vc1 = *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1);
-                if (mct) swap_mct = *(volatile uint32_t *)(mct + 0x100u);
+                if (mct) { swap_mct = *(volatile uint32_t *)(mct + 0x100u); exy_last_disp_mct = swap_mct; }
                 swap_target_pa = blit_pa;
                 swap_fb_changed = (blit_pa != last_fimd_pa) ? 1u : 0u;
                 last_fimd_pa = blit_pa;
@@ -792,5 +793,141 @@ int exy_aks_get_config(void *aks, uint32_t handle, void **out_buf, uint32_t *out
         p[i] = kEmptyPlist[i];
     *out_buf = p;
     *out_len = n;
+    return 0;
+}
+
+/* shortcut: AppleKeyStore software AES backend (0x80fa1234 find_aes_driver + 0x80f9f35c hw_aes)
+ * using 128-bit Speck-CBC until Exynos SSS/hardware key engine is wired, unblocking securityd Keychain & Wi-Fi WPA2. */
+static inline uint64_t aks_ror64(uint64_t v, unsigned s) { return (v >> s) | (v << (64u - s)); }
+static inline uint64_t aks_rol64(uint64_t v, unsigned s) { return (v << s) | (v >> (64u - s)); }
+
+static uint64_t aks_ld64(const uint8_t *p)
+{
+    uint64_t v = 0ull;
+    for (unsigned i = 0; i < 8u; i++) v |= ((uint64_t)p[i]) << (i * 8u);
+    return v;
+}
+
+static void aks_st64(uint8_t *p, uint64_t v)
+{
+    for (unsigned i = 0; i < 8u; i++) p[i] = (uint8_t)(v >> (i * 8u));
+}
+
+int exy_aks_find_aes(uint8_t *aks)
+{
+    if (!aks) return 0;
+    *(uint32_t *)(aks + 0x88u) = 1u;  /* non-NULL sentinel */
+    *(uint32_t *)(aks + 0x8cu) = 64u; /* alignment */
+    *(uint32_t *)(aks + 0x90u) = 63u; /* alignment mask */
+    *(uint32_t *)(aks + 0x94u) = 64u; /* block size */
+    aks[0x98u] = 1u;                  /* UID+custom key supported */
+    return 1;
+}
+
+int exy_aks_hw_aes(void *aks, int enc, uint8_t *iv, uint8_t *cipher,
+                   uint8_t *plain, uint32_t len, uint32_t key_sel,
+                   const uint8_t *ukey, uint32_t ukey_len)
+{
+    (void)aks;
+    if (!cipher || !plain || (len & 15u) != 0u || key_sel < 1u || key_sel > 7u)
+        return 0;
+    uint8_t kb[16];
+    for (unsigned i = 0; i < 16u; i++)
+        kb[i] = (uint8_t)(0x5au ^ (key_sel * 29u + i * 17u));
+    if (key_sel == 3u && ukey && ukey_len) {
+        uint32_t n = (ukey_len > 32u) ? 32u : ukey_len;
+        for (uint32_t i = 0; i < n; i++)
+            kb[i & 15u] ^= ukey[i];
+    }
+    uint64_t rk[32];
+    uint64_t b = aks_ld64(kb), a = aks_ld64(kb + 8);
+    for (unsigned i = 0; i < 32u; i++) {
+        rk[i] = b;
+        a = (aks_ror64(a, 8u) + b) ^ (uint64_t)i;
+        b = aks_rol64(b, 3u) ^ a;
+    }
+    uint64_t iv0 = iv ? aks_ld64(iv) : 0ull;
+    uint64_t iv1 = iv ? aks_ld64(iv + 8) : 0ull;
+    for (uint32_t off = 0; off < len; off += 16u) {
+        if (enc) {
+            uint64_t y = aks_ld64(plain + off) ^ iv0;
+            uint64_t x = aks_ld64(plain + off + 8u) ^ iv1;
+            for (unsigned i = 0; i < 32u; i++) {
+                x = (aks_ror64(x, 8u) + y) ^ rk[i];
+                y = aks_rol64(y, 3u) ^ x;
+            }
+            aks_st64(cipher + off, y);
+            aks_st64(cipher + off + 8u, x);
+            iv0 = y; iv1 = x;
+        } else {
+            uint64_t c0 = aks_ld64(cipher + off);
+            uint64_t c1 = aks_ld64(cipher + off + 8u);
+            uint64_t y = c0, x = c1;
+            for (int i = 31; i >= 0; i--) {
+                y = aks_ror64(y ^ x, 3u);
+                x = aks_rol64((x ^ rk[i]) - y, 8u);
+            }
+            aks_st64(plain + off, y ^ iv0);
+            aks_st64(plain + off + 8u, x ^ iv1);
+            iv0 = c0; iv1 = c1;
+        }
+    }
+    if (iv) {
+        aks_st64(iv, iv0);
+        aks_st64(iv + 8, iv1);
+    }
+    return 1;
+}
+
+/* shortcut: AppleKeyStore sel 10 wrap_key (0x80fa0dec) & sel 11 unwrap_key (0x80fa0ffc)
+ * software key wrap ("AKSW"+kc+masked key, in_len+8 bytes) so securityd Keychain & Wi-Fi WPA2 work without system keybag. */
+int exy_aks_wrap_key(void *aks, void *uc, int32_t bag, uint32_t keyclass,
+                     uint32_t a4, uint32_t a5,
+                     const uint8_t *in_key, uint32_t in_len,
+                     uint8_t *out_buf, uint32_t *out_len, uint32_t *out_class)
+{
+    (void)aks; (void)uc; (void)bag; (void)a4; (void)a5;
+    if (!in_key || !in_len || in_len > 64u || !out_len)
+        return (int)0xe00002c2u;
+    if (!out_buf) {
+        *out_len = in_len + 8u;
+        if (out_class) *out_class = keyclass;
+        return 0;
+    }
+    if (*out_len < in_len + 8u)
+        return (int)0xe00002c2u;
+    out_buf[0] = 'A'; out_buf[1] = 'K'; out_buf[2] = 'S'; out_buf[3] = 'W';
+    out_buf[4] = (uint8_t)(keyclass & 0xffu);
+    out_buf[5] = (uint8_t)((keyclass >> 8) & 0xffu);
+    out_buf[6] = (uint8_t)((keyclass >> 16) & 0xffu);
+    out_buf[7] = (uint8_t)((keyclass >> 24) & 0xffu);
+    for (uint32_t i = 0; i < in_len; i++)
+        out_buf[8u + i] = (uint8_t)(in_key[i] ^ (uint8_t)(0x5au ^ (keyclass * 17u + i * 31u)));
+    *out_len = in_len + 8u;
+    if (out_class) *out_class = keyclass;
+    return 0;
+}
+
+int exy_aks_unwrap_key(void *aks, void *uc, int32_t bag, uint32_t keyclass,
+                       const uint8_t *in_wrapped, uint32_t in_len, uint32_t flags,
+                       uint8_t *out_buf, uint32_t *out_len)
+{
+    (void)aks; (void)uc; (void)bag; (void)keyclass; (void)flags;
+    if (!in_wrapped || in_len <= 8u || !out_len)
+        return (int)0xe00002c2u;
+    if (in_wrapped[0] != 'A' || in_wrapped[1] != 'K' || in_wrapped[2] != 'S' || in_wrapped[3] != 'W')
+        return (int)0xe00002bcu; /* reject legacy hardware-wrapped blobs cleanly */
+    uint32_t plen = in_len - 8u;
+    if (!out_buf) {
+        *out_len = plen;
+        return 0;
+    }
+    if (*out_len < plen)
+        return (int)0xe00002c2u;
+    uint32_t kc = (uint32_t)in_wrapped[4] | ((uint32_t)in_wrapped[5] << 8) |
+                  ((uint32_t)in_wrapped[6] << 16) | ((uint32_t)in_wrapped[7] << 24);
+    for (uint32_t i = 0; i < plen; i++)
+        out_buf[i] = (uint8_t)(in_wrapped[8u + i] ^ (uint8_t)(0x5au ^ (kc * 17u + i * 31u)));
+    *out_len = plen;
     return 0;
 }

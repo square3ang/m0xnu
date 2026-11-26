@@ -43,7 +43,7 @@ index e73cc304..04cedbd8 100644
 +obj-$(CONFIG_MIDAS_CHAINLOAD) += malitest.o
 +endif
 diff --git a/board/samsung/midas/midas.c b/board/samsung/midas/midas.c
-index 99aebb7d..9948a9fe 100644
+index 99aebb7d..bf666434 100644
 --- a/board/samsung/midas/midas.c
 +++ b/board/samsung/midas/midas.c
 @@ -5,6 +5,7 @@
@@ -54,7 +54,7 @@ index 99aebb7d..9948a9fe 100644
  #include <asm/gpio.h>
  #include <asm/arch/gpio.h>
  #include <asm/arch/power.h>
-@@ -419,9 +420,8 @@ static enum boot_mode midas_check_keycombo(void)
+@@ -419,14 +420,15 @@ static enum boot_mode midas_check_keycombo(void)
  		return MODE_CONSOLE;
  	}
  
@@ -66,12 +66,27 @@ index 99aebb7d..9948a9fe 100644
  		return MODE_SKIP_LPM;
  
  	return MODE_NONE;
-@@ -434,6 +434,14 @@ static enum boot_mode midas_get_boot_mode(void)
+ }
+ 
++#define XNU_BOOT_MAGIC_PA	0x5ef7fff0UL
++
+ static enum boot_mode midas_get_boot_mode(void)
+ {
+ 	struct exynos4412_power *pwr = (struct exynos4412_power *)samsung_get_base_power();
+@@ -434,6 +436,22 @@ static enum boot_mode midas_get_boot_mode(void)
  	u32 inform = readl(&pwr->inform3);
  	/* clear out inform3 for subsequent boots */
  	writel(0, &pwr->inform3);
 +	if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD)) {
 +		u32 inform2 = readl(&pwr->inform2);
++		u32 dram_magic = readl(XNU_BOOT_MAGIC_PA);
++		if (dram_magic) {
++			writel(0, XNU_BOOT_MAGIC_PA);
++			flush_dcache_range(XNU_BOOT_MAGIC_PA & ~63UL,
++					   (XNU_BOOT_MAGIC_PA & ~63UL) + 64UL);
++			if ((dram_magic & ~MODE_MAX) == INFORM_MAGIC)
++				inform = dram_magic;
++		}
 +		if (inform2) {
 +			writel(0, &pwr->inform2);
 +			if ((inform2 & ~MODE_MAX) == INFORM_MAGIC)
@@ -81,7 +96,7 @@ index 99aebb7d..9948a9fe 100644
  	printf("inform3: 0x%08x: ", inform);
  	if ((inform & ~MODE_MAX) != INFORM_MAGIC) {
  		printf("invalid\n");
-@@ -495,21 +503,253 @@ int exynos_init(void)
+@@ -495,21 +513,270 @@ int exynos_init(void)
  	return 0;
  }
  
@@ -177,6 +192,15 @@ index 99aebb7d..9948a9fe 100644
 +	flush_dcache_range(LPM_FB_PA, LPM_FB_PA + (ulong)LPM_W * LPM_H * 4UL);
 +}
 +
++static void lpm_blank_screen(void)
++{
++	/* Paint pure black and let 1 frame scan out before DCS 0x28/0x10 so s6e8aa0 never flashes. */
++	lpm_fill_rect((u32 *)LPM_FB_PA, 0, 0, LPM_W, LPM_H, 0xff000000u);
++	flush_dcache_range(LPM_FB_PA, LPM_FB_PA + (ulong)LPM_W * LPM_H * 4UL);
++	mdelay(25);
++	xnufb_display_enable(0);
++}
++
 +static enum boot_mode midas_lpm_charge(void)
 +{
 +	struct udevice *bat = NULL, *extcon = NULL, *charger = NULL;
@@ -195,10 +219,12 @@ index 99aebb7d..9948a9fe 100644
 +	if (bat)
 +		soc = battery_get_soc(bat);
 +
-+	midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
-+	midas_led_action(soc >= 95 ? LED_GREEN : LED_RED, LEDST_ON);
++	int last_full = (soc >= 95);
 +
-+	if (IS_ENABLED(CONFIG_EXYNOS_MIPI_DSIM)) {
++	midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
++	midas_led_action(last_full ? LED_GREEN : LED_RED, LEDST_ON);
++
++	if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD)) {
 +		lpm_draw_screen(soc);
 +		if (xnufb_start(LPM_FB_PA, 32) == 0)
 +			disp_inited = 1;
@@ -217,7 +243,7 @@ index 99aebb7d..9948a9fe 100644
 +				if (++unplug_cnt >= 4) {
 +					printf("LPM: charger unplugged, powering off\n");
 +					if (disp_inited && disp_on)
-+						xnufb_display_enable(0);
++						lpm_blank_screen();
 +					midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
 +					midas_power_off();
 +				}
@@ -254,7 +280,7 @@ index 99aebb7d..9948a9fe 100644
 +		} else {
 +			if (pwr_ms > 0 && pwr_ms < 800 && disp_inited) {
 +				if (disp_on) {
-+					xnufb_display_enable(0);
++					lpm_blank_screen();
 +					disp_on = 0;
 +				} else {
 +					if (bat) soc = battery_get_soc(bat);
@@ -278,12 +304,18 @@ index 99aebb7d..9948a9fe 100644
 +			screen_ms = 0;
 +		}
 +
-+		/* Refresh SoC, LED and charging gauge every 2s */
++		/* Refresh SoC, LED (only on state change) and charging gauge every ~2s */
 +		if (tick % 40 == 0) {
++			int full;
++
 +			if (bat)
 +				soc = battery_get_soc(bat);
-+			midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
-+			midas_led_action(soc >= 95 ? LED_GREEN : LED_RED, LEDST_ON);
++			full = (soc >= 95);
++			if (full != last_full) {
++				midas_led_action(LED_RED | LED_GREEN | LED_BLUE, LEDST_OFF);
++				midas_led_action(full ? LED_GREEN : LED_RED, LEDST_ON);
++				last_full = full;
++			}
 +			if (disp_inited && disp_on)
 +				lpm_draw_screen(soc);
 +		}
@@ -292,7 +324,7 @@ index 99aebb7d..9948a9fe 100644
 +		if (disp_inited && disp_on) {
 +			screen_ms += 50;
 +			if (screen_ms >= 8000) {
-+				xnufb_display_enable(0);
++				lpm_blank_screen();
 +				disp_on = 0;
 +			}
 +		}
@@ -328,7 +360,7 @@ index 99aebb7d..9948a9fe 100644
 -		env_set("bootmode", "lpm");
 +		/* Enter offline charging only on cold boot (not WDT/SW reboot from running iOS) */
 +		if (IS_ENABLED(CONFIG_MIDAS_CHAINLOAD) &&
-+		    !(rst_stat & (0x20000000u | 0x00000800u))) {
++		    !(rst_stat & 0x20000f00u)) {
 +			mode = midas_lpm_charge();
 +		} else {
 +			env_set("bootmode", "lpm");
@@ -336,7 +368,7 @@ index 99aebb7d..9948a9fe 100644
  	}
  
  	init_overlays();
-@@ -537,6 +777,8 @@ int exynos_late_init(void)
+@@ -537,6 +804,8 @@ int exynos_late_init(void)
  	default:
  		printf("Booting normally...\n");
  		midas_led_action(LED_GREEN | LED_RED, LEDST_ON);

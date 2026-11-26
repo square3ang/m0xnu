@@ -88,6 +88,8 @@ extern void *dlsym(void *handle, const char *symbol);
 #define kIOHIDDigitizerEventTouch                  (1u << 1)
 #define kIOHIDDigitizerEventPosition               (1u << 2)
 #define kIOHIDDigitizerEventIdentity               (1u << 5)
+#define kIOHIDDigitizerEventFromEdgeTip            (1u << 11) /* UIKit 0x24eb76c8 -> UITouch._edgeType = 1 */
+#define kIOHIDEventFieldDigitizerEventMask         0x000b0007u
 #define kIOHIDEventFieldDigitizerCollection        0x000b0016u
 #define kIOHIDEventFieldDigitizerChildEventMask    0x000b0018u
 #define kIOHIDEventFieldDigitizerIsDisplayIntegrated 0x000b0019u
@@ -127,6 +129,13 @@ static const uint8_t kHidDesc[] = {
     0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x04,
     0x09, 0x40, 0x09, 0x30, 0x09, 0xE9, 0x09, 0xEA, 0x81, 0x02,
     0x75, 0x04, 0x95, 0x01, 0x81, 0x03,
+    0xC0,
+    /* backboardd finds its digitizer by DeviceUsagePage 0x0D / DeviceUsage 0x0C (Multiple Point
+     * Digitizer) + Built-In (backboardd 0x141d8); without it, no hit-test regions, so no system
+     * edge gestures (Control Center). This collection only adds that usage pair: report ID 3 is
+     * never sent, touches stay in the 0x04 collection above. */
+    0x05, 0x0D, 0x09, 0x0C, 0xA1, 0x01, 0x85, 0x03,
+    0x06, 0x00, 0xFF, 0x09, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
     0xC0
 };
 
@@ -299,18 +308,31 @@ static void dispatch_buttons(void *client, uint32_t prev, uint32_t cur)
     }
 }
 
+/* Debug (gtest=4): route touches through the HID report path (kernel IOHIDEventDriver), so
+ * backboardd sees them as real digitizer-service events instead of client-injected ones. */
+static void *g_hid_dev;
+
 static void dispatch_touch(void *client, const struct exy_touch_state *prev,
                            const struct exy_touch_state *cur)
 {
+    if (g_hid_dev) {
+        (void)send_hid_touch_report(g_hid_dev, prev, cur);
+        return;
+    }
     if (!client)
         return;
     uint32_t any_down = 0, any_changed = 0, have_pos = 0;
     uint32_t hand_mask = 0;
     float hx = 0.0f, hy = 0.0f;
+    static uint8_t edge_finger[TOUCH_MAX_FINGERS];
 
     for (unsigned i = 0; i < TOUCH_MAX_FINGERS; i++) {
         const struct exy_finger *pf = &prev->f[i];
         const struct exy_finger *cf = &cur->f[i];
+        if (cf->down && !pf->down)
+            edge_finger[i] = (cf->y < 40u || cf->y >= 1240u) ? 1u : 0u;
+        else if (!cf->down)
+            edge_finger[i] = 0u;
         if (cf->down) {
             if (!any_down) {
                 hx = (float)cf->x / 720.0f;
@@ -334,6 +356,8 @@ static void dispatch_touch(void *client, const struct exy_touch_state *prev,
             hand_mask |= kIOHIDDigitizerEventPosition;
             any_changed = 1;
         }
+        if (cf->down && edge_finger[i])
+            hand_mask |= kIOHIDDigitizerEventFromEdgeTip;
     }
     if (!any_changed)
         return;
@@ -359,6 +383,8 @@ static void dispatch_touch(void *client, const struct exy_touch_state *prev,
             ? (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
                (cf->down ? (kIOHIDDigitizerEventPosition | kIOHIDDigitizerEventIdentity) : 0u))
             : kIOHIDDigitizerEventPosition;
+        if (cf->down && edge_finger[i])
+            fmask |= kIOHIDDigitizerEventFromEdgeTip;
         uint16_t fx_i = (!cf->down && !cf->x && !cf->y) ? pf->x : cf->x;
         uint16_t fy_i = (!cf->down && !cf->x && !cf->y) ? pf->y : cf->y;
         float fx = (float)fx_i / 720.0f;
@@ -368,6 +394,8 @@ static void dispatch_touch(void *client, const struct exy_touch_state *prev,
             NULL, ts, fid, fid, fmask, fx, fy, 0.0f,
             cf->down ? 1.0f : 0.0f, 0.0f, cf->down, cf->down, 0);
         if (finger) {
+            if (fmask & kIOHIDDigitizerEventFromEdgeTip)
+                IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerEventMask, (long)fmask);
             IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
             IOHIDEventSetSenderID(finger, g_sender_id);
             IOHIDEventAppendEvent(hand, finger, 0);
@@ -395,6 +423,23 @@ static int bootarg_has_bench(void)
             buf[i+4] == 'h' && buf[i+5] == '=' && (buf[i+6] >= '1' && buf[i+6] <= '5'))
             return (int)(buf[i+6] - '0');
     }
+    return 0;
+}
+
+/* Debug: "gtest=1" boot-arg -> scripted edge swipes for camera-checked gesture tests. */
+static int bootarg_has_gtest(void)
+{
+    typedef int (*sysctlbyname_t)(const char *, void *, size_t *, void *, size_t);
+    sysctlbyname_t fn = (sysctlbyname_t)dlsym((void *)-2, "sysctlbyname");
+    char buf[256];
+    size_t len = sizeof(buf) - 1;
+    if (!fn || fn("kern.bootargs", buf, &len, NULL, 0) != 0)
+        return 0;
+    buf[len] = '\0';
+    for (size_t i = 0; i + 7 <= len; i++)
+        if (buf[i] == 'g' && buf[i+1] == 't' && buf[i+2] == 'e' && buf[i+3] == 's' &&
+            buf[i+4] == 't' && buf[i+5] == '=' && buf[i+6] >= '1' && buf[i+6] <= '9')
+            return buf[i+6] - '0';
     return 0;
 }
 
@@ -870,10 +915,72 @@ static void run_ipa_bench(io_connect_t conn, void *client)
     (void)IOConnectCallStructMethod(conn, 11u /* MALI_CMD_BENCH_REBOOT */, NULL, 0, NULL, &z);
 }
 
+static void run_gesture_test(void *client, int mode)
+{
+    if (mode == 2) {
+        for (int r = 0; r < 6; r++) {
+            dlog("[GTEST] CC swipe\n");
+            bench_swipe(client, 360u, 1279u, 360u, 700u, 4, 16000u);
+            usleep(5000000u);
+            dlog("[GTEST] dismiss tap\n");
+            bench_swipe(client, 360u, 100u, 360u, 100u, 1, 20000u);
+            usleep(5000000u);
+        }
+        dlog("[GTEST] done\n");
+        return;
+    }
+    if (mode == 3 || mode == 4) { /* same swipes on the Home Screen (lock-screen CC is a plain UIKit grabber) */
+        dlog("[GTEST] unlock\n");
+        bench_swipe(client, 80u, 900u, 640u, 900u, 4, 16000u);
+        usleep(4000000u);
+        dlog("[GTEST] home CC swipe\n");
+        bench_swipe(client, 360u, 1279u, 360u, 600u, 4, 16000u);
+        usleep(5000000u);
+        bench_swipe(client, 360u, 100u, 360u, 100u, 1, 20000u);
+        usleep(3000000u);
+        dlog("[GTEST] home NC swipe\n");
+        bench_swipe(client, 360u, 0u, 360u, 800u, 4, 16000u);
+        usleep(5000000u);
+        bench_swipe(client, 360u, 1279u, 360u, 100u, 4, 16000u);
+        usleep(3000000u);
+        dlog("[GTEST] vol+ vol-\n");
+        dispatch_buttons(client, 0u, 1u << 2); usleep(100000u); dispatch_buttons(client, 1u << 2, 0u);
+        usleep(1000000u);
+        dispatch_buttons(client, 0u, 1u << 3); usleep(100000u); dispatch_buttons(client, 1u << 3, 0u);
+        usleep(2000000u);
+        dlog("[GTEST] open Settings > Wi-Fi\n");
+        bench_swipe(client, 450u, 560u, 450u, 560u, 1, 20000u); /* Settings icon, row 4 col 3 */
+        usleep(5000000u);
+        bench_swipe(client, 200u, 330u, 200u, 330u, 1, 20000u); /* Wi-Fi row */
+        usleep(20000000u);
+        dlog("[GTEST] done\n");
+        return;
+    }
+    for (int r = 0; r < 3; r++) {
+        dlog("[GTEST] CC swipe (bottom edge up)\n");
+        bench_swipe(client, 360u, 1279u, 360u, 700u, 4, 16000u);
+        usleep(7000000u);
+        dlog("[GTEST] dismiss tap\n");
+        bench_swipe(client, 360u, 100u, 360u, 100u, 1, 20000u);
+        usleep(3000000u);
+        dlog("[GTEST] NC swipe (top edge down)\n");
+        bench_swipe(client, 360u, 0u, 360u, 800u, 4, 16000u);
+        usleep(7000000u);
+        dlog("[GTEST] NC close swipe\n");
+        bench_swipe(client, 360u, 1279u, 360u, 100u, 4, 16000u);
+        usleep(3000000u);
+    }
+    dlog("[GTEST] done\n");
+}
+
 static void run_auto_bench(io_connect_t conn, void *client)
 {
     dlog("[BENCH] START: unlock Lock Screen\n");
     drv_log_status(conn);
+    {
+        uint64_t tone[2] = { 880u, 300u }; uint32_t oc = 0;
+        IOConnectCallScalarMethod(conn, MALI_CMD_DRV_AUDIO_TONE, tone, 2, NULL, &oc);
+    }
     usleep(3000000u);
     /* Slide to unlock (16 steps x 16ms across mid-screen) */
     bench_swipe(client, 80u, 640u, 640u, 640u, 4, 16000u);
@@ -1084,6 +1191,18 @@ static void wifi_boot_firmware(io_connect_t conn)
     }
 }
 
+static void *wifi_boot_thread(void *arg)
+{
+    (void)arg;
+    io_service_t svc = IOServiceGetMatchingService(
+        kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
+    io_connect_t wconn = 0;
+    if (svc && IOServiceOpen(svc, mach_task_self_, 0, &wconn) == 0 && wconn) {
+        wifi_boot_firmware(wconn);
+    }
+    return NULL;
+}
+
 int main(void)
 {
     /* Elevate above SpringBoard render loops so single-core CPU load never starves touch input. */
@@ -1134,6 +1253,8 @@ int main(void)
     getppid_t fn_getppid = (getppid_t)dlsym((void *)-2, "getppid");
     int bench_mode = bootarg_has_bench();
     int bench_done = 0;
+    int gtest = bootarg_has_gtest();
+    int wifi_started = 0;
     if (bench_mode)
         dlog("[BENCH] enabled (waiting for Lock Screen)\n");
     /* Adaptive polled loop: 250 Hz burst, 125 Hz finger-down, 100 Hz recent, ~33 Hz idle (saves CPU/heat). */
@@ -1170,7 +1291,6 @@ int main(void)
                 dlog(msg);
                 resolve_sender_id(hid_client);
                 drv_log_status(conn);
-                wifi_boot_firmware(conn);
             } else if (!bs_probed && el_sec >= 20u) {
                 bs_probed = 1;
                 mach_port_t bsp = 0;
@@ -1180,9 +1300,24 @@ int main(void)
                 dlog(msg);
             }
         }
+        /* Launch BCM4334 Wi-Fi firmware load once on a detached pthread as soon as HID server is live. */
+        if (cur_srv && !wifi_started) {
+            wifi_started = 1;
+            typedef int (*pt_create_t)(void **, const void *, void *(*)(void *), void *);
+            typedef int (*pt_detach_t)(void *);
+            pt_create_t fn_ptc = (pt_create_t)dlsym((void *)-2, "pthread_create");
+            pt_detach_t fn_ptd = (pt_detach_t)dlsym((void *)-2, "pthread_detach");
+            void *tid = NULL;
+            if (fn_ptc && fn_ptc(&tid, NULL, wifi_boot_thread, NULL) == 0 && fn_ptd && tid)
+                fn_ptd(tid);
+        }
         sz = sizeof(st);
         if (IOConnectCallStructMethod(conn, MALI_CMD_POLL_TOUCH, NULL, 0, &st, &sz) != 0)
             continue;
+        if (gtest && hid_client && cur_srv && el_sec >= (gtest >= 3 ? 130u : gtest == 2 ? 110u : 75u)) {
+            run_gesture_test(hid_client, gtest);
+            gtest = 0;
+        }
         if (bench_mode && !bench_done && hid_client && cur_srv &&
             ((st.chip >> 16) >= 17u || el_sec >= 48u)) {
             bench_done = 1;
@@ -1251,6 +1386,21 @@ int main(void)
                 uint8_t brep[2] = { 0x02, (uint8_t)(st.buttons & 0x0fu) };
                 IOHIDUserDeviceHandleReport(dev, brep, sizeof(brep));
             }
+        }
+
+        /* Edge snap: a real swipe from the bezel first reports tens of px inside the panel,
+         * outside backboardd's edge strip. Synthetic swipes from y=1279 open CC; real ones didn't. */
+        for (unsigned i = 0; i < TOUCH_MAX_FINGERS; i++) {
+            if (!st.f[i].down || prev.f[i].down)
+                continue;
+            uint16_t y0 = st.f[i].y;
+            if (y0 >= 1280u - 40u)
+                st.f[i].y = 1279u;
+            else if (y0 < 40u)
+                st.f[i].y = 0u;
+            snprintf(msg, sizeof(msg), "[TOUCHD] down f%u=(%u,%u)->y%u\n",
+                     i, (unsigned)st.f[i].x, (unsigned)y0, (unsigned)st.f[i].y);
+            dlog(msg);
         }
 
         if (hid_client && cur_srv)

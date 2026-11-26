@@ -97,9 +97,10 @@ typedef void *buf_t;
 #define MSHC_BMOD       0x080
 #define MSHC_DATA       0x200
 
-uintptr_t mct, gicd, gicc, wdt, mshc, exy_pl310, pmu_va, sysram_va;
+uintptr_t mct, gicd, gicc, wdt, mshc, exy_pl310, pmu_va, sysram_va, boot_magic_va;
 uint32_t exy_ncpus = 1;             /* patched by mkxnu.py from --args cpus=N (1..4) */
 uint32_t exy_wdt_sec = 86400;       /* patched by mkxnu.py to 160 when bench=1 */
+volatile uint32_t exy_usb_hb;       /* incremented by exy_usb_poll_thread; stalls stop WDT petting */
 uint64_t exy_deadline[4];           /* per-CPU deadlines read by exy_get_decrementer (fiq.S) */
 uint32_t exy_smp_boot_info[5] __attribute__((aligned(32))) = {
     0x00020001u, 0x80000000u, 0x40000000u, 0x1ef00000u, 0u
@@ -341,10 +342,19 @@ void exy_set_utc_time(void *self, uint32_t sec, uint32_t usec)
 /* Replaces PEHaltRestart(type): halt (0), restart (1) and UPS halt (3) reset the board
  * through the bring-up watchdog (RAM, and so the log, survives); other types are no-ops.
  * The platform's own haltRestart has no reset device here and times out into a panic. */
+__attribute__((section(".drv.text")))
 int exy_halt_restart(unsigned type)
 {
     if (type != 0 && type != 1 && type != 3)
         return 0;
+    /* Preserve MODE_FASTBOOT if set by exy_reboot_fastboot(), else mark warm reboot (MODE_SKIP_LPM). */
+    if (boot_magic_va) {
+        volatile uint32_t *dm = (volatile uint32_t *)(boot_magic_va + 0xff0u);
+        if (*dm != 0x12345671u) {
+            *dm = 0x12345670u;
+            __asm__ volatile("dsb" ::: "memory");
+        }
+    }
     /* Flush recent console/panic log lines from L1/L2 to DRAM before WDT reset. */
     extern void exy_log_flush(void);
     exy_log_flush();
@@ -354,15 +364,27 @@ int exy_halt_restart(unsigned type)
         __asm__ volatile("wfi");
 }
 
-/* Write midas U-Boot INFORM_MAGIC|MODE_FASTBOOT (0x12345671) to PMU INFORM2 (0x808) before WDT reset.
- * 2018 stage-1 U-Boot clears INFORM3 (0x80c) before chainloading boot, so INFORM2 passes cleanly to
- * our chainloaded U-Boot (out/chain.itb) and always enters our xnu-mem fastboot. */
-void exy_reboot_fastboot(void)
+/* Write midas U-Boot boot-mode magic to BOTH PMU INFORM2 (0x808) and reserved DRAM (0x5ef7fff0,
+ * mapped uncached via ml_io_map above XNU MEMSIZE+pram so XNU never allocates/overwrites it).
+ * BL2 stage-1 U-Boot clears PMU INFORM/RST_STAT before chainloading boot, whereas 0x5ef7fff0
+ * survives warm WDT reset intact so out/chain.itb enters fastboot (0x12345671) or skips LPM (0x12345670). */
+__attribute__((section(".drv.text")))
+static void exy_set_boot_magic(uint32_t magic)
 {
-    if (pmu_va) {
-        wr(pmu_va + 0x808u, 0x12345671u);
+    if (boot_magic_va) {
+        wr(boot_magic_va + 0xff0u, magic);
         __asm__ volatile("dsb" ::: "memory");
     }
+    if (pmu_va) {
+        wr(pmu_va + 0x808u, magic);
+        __asm__ volatile("dsb" ::: "memory");
+    }
+}
+
+__attribute__((section(".drv.text")))
+void exy_reboot_fastboot(void)
+{
+    exy_set_boot_magic(0x12345671u);
     exy_halt_restart(1u);
 }
 
@@ -390,6 +412,7 @@ struct {
 
 #define MSHC_FIFO_DEPTH 0x80  /* words, exynos4412 dw_mmc fifo-depth */
 
+__attribute__((section(".drv.text")))
 static uint32_t emmc_xfer(uint32_t lba, uint32_t n, uint32_t *p, int write)
 {
     uint32_t words = n * 128, st = 0, i;
@@ -451,6 +474,9 @@ static uint32_t emmc_xfer(uint32_t lba, uint32_t n, uint32_t *p, int write)
 #define MDEV_BMAJOR       (*(int *)0x80403be0)
 #define devfs_make_node   ((void *(*)(uint32_t, int, uint32_t, uint32_t, int, const char *, ...))0x80111c35)
 
+static const char md_node_fmt[] __attribute__((section(".drv.rodata"))) = "md%d";
+
+__attribute__((section(".drv.text")))
 static void md1_add(void)
 {
     static int done;
@@ -463,11 +489,12 @@ static void md1_add(void)
     md[2] = exy_var_sectors >> 3;  /* pages */
     md[4] = 512;
     md[5] = 1 | (uint32_t)MDEV_BMAJOR << 24;
-    md[7] = (uint32_t)devfs_make_node(md[5], 1 /* DEVFS_BLOCK */, 0, 5 /* operator */, 0600, "md%d", 1);
+    md[7] = (uint32_t)devfs_make_node(md[5], 1 /* DEVFS_BLOCK */, 0, 5 /* operator */, 0600, md_node_fmt, 1);
     md[3] |= 1;  /* mdInited */
 }
 
 /* Replaces mdevbdevsw.d_strategy. */
+__attribute__((section(".drv.text")))
 void exy_md_strategy(buf_t bp)
 {
     uint32_t minor = buf_device(bp) & 0xffffff;
@@ -686,6 +713,16 @@ uintptr_t exy_timer_init(uintptr_t aic_unused)
     exy_pl310 = ml_io_map(PL310_PA, 0x1000);
     pmu_va = ml_io_map(PMU_PA, 0x4000);
     sysram_va = ml_io_map(SYSRAM_PA, 0x1000);
+    boot_magic_va = ml_io_map(0x5ef7f000u, 0x1000u);
+
+    /* Pre-arm MODE_FASTBOOT in reserved DRAM (0x5ef7fff0, outside XNU MEMSIZE) & INFORM2 so any
+     * unexpected hardware WDT reset returns directly to fastboot (never LPM) with RAM logs intact. */
+    if (boot_magic_va) {
+        wr(boot_magic_va + 0xff0u, 0x12345671u);
+        __asm__ volatile("dsb" ::: "memory");
+    }
+    if (pmu_va)
+        wr(pmu_va + 0x808u, 0x12345671u);
 
     wr(mct + G_INT_ENB, 0);
     wr(mct + G_INT_CSTAT, 0xf);
@@ -760,11 +797,24 @@ void exy_log_flush(void)
 
 void exy_putc(char c)
 {
+    /* Drop "AppleKeyStore: o..." lines: thousands per boot evict the whole ring.
+     * Kernel lines end "\n\r", so the text starts 1 byte after line_start.
+     * shortcut: spot-checks 2 chars ("A" at 1, "o" at 16) and rewinds without locking; debug log only. */
+    static uint32_t line_start, skip;
+    if (skip) {
+        skip = c != '\n';
+        return;
+    }
     uint32_t p = __sync_fetch_and_add(&exy_log.pos, 1u);
     char *slot = &exy_log.buf[p % LOG_SIZE];
     *slot = c;
     exy_log.magic = LOG_MAGIC;
+    if (c == 'o' && p - line_start == 16u && exy_log.buf[(line_start + 1u) % LOG_SIZE] == 'A') {
+        exy_log.pos = line_start;
+        skip = 1;
+    }
     if (c == '\n') {
+        line_start = p + 1u;
         static uint32_t nl_cnt;
         if ((++nl_cnt & 15u) == 0u) {
             clean_line(slot);
@@ -812,8 +862,19 @@ void exy_set_decrementer(uint32_t v, uint32_t b, uint32_t c, uint8_t *cpu)
     uint32_t id = *(volatile uint16_t *)cpu & 3u;
     *(volatile uint32_t *)(cpu + CPU_DECREMENTER) = v;
     arm_comparator(id, v);
-    if (id == 0u && (exy_deadline[0] - boot_mct0) < (uint64_t)exy_wdt_sec * 24000000ull)
-        wr(wdt + WTCNT, rd(wdt + WTDAT));
+    if (id == 0u) {
+        static uint32_t last_hb;
+        static uint64_t last_hb_mct;
+        uint64_t now = mct_count();
+        uint32_t hb = exy_usb_hb;
+        if (hb != last_hb || !last_hb_mct) {
+            last_hb = hb;
+            last_hb_mct = now;
+        }
+        int alive = ((now - boot_mct0) < 35ull * 24000000ull) || ((now - last_hb_mct) < 25ull * 24000000ull);
+        if (alive && (now - boot_mct0) < (uint64_t)exy_wdt_sec * 24000000ull)
+            wr(wdt + WTCNT, rd(wdt + WTDAT));
+    }
 
     exy_dbg.sets++;
 }
