@@ -82,14 +82,15 @@
 /* work area layout */
 #define W_DTE			0x0000
 #define W_PT			0x1000
-#define W_PT_NUM		128	/* 128 x 4 MiB = 512 MiB GPU VA space (0x1000..0x81000) */
-#define W_RSW			0x81000
-#define W_CLEAR_PROG		0x81040
-#define W_STREAM		0x82000
-#define W_POOL			0x90000	/* job memory */
+#define W_PT_NUM		144	/* 144 x 4 MiB = 576 MiB GPU VA space (0x1000..0x91000) */
+#define W_RSW			0x91000
+#define W_CLEAR_PROG		0x91040
+#define W_STREAM		0x92000
+#define W_POOL			0xa0000	/* job memory */
 
 uint32_t mali_last_status;
 uint32_t mali_vpll_con0;
+static uint32_t mali_pt_used[(W_PT_NUM + 31) / 32];
 
 static uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
 static void wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
@@ -137,28 +138,37 @@ static int map_va(const struct mali_env *e, uint32_t va, uint32_t pa, uint32_t l
 {
 	uint32_t *dte = (uint32_t *)(e->mem + W_DTE);
 	uint32_t a, end = va + (len - 1);	/* inclusive: ranges may end at 4 GiB */
+	uint32_t last_dte = ~0u;
+	uint32_t *pt = 0;
 
 	pa &= ~0xfffu;
 	for (a = va & ~0xfffu; a <= end; a += 0x1000, pa += 0x1000) {
-		uint32_t *pt;
+		uint32_t dte_idx = a >> 22;
 
-		if (!(dte[a >> 22] & VM_PRESENT)) {
-			unsigned i;
-
-			for (i = 0; i < W_PT_NUM; i++) {
-				uint32_t pt_pa = e->mem_pa + W_PT + 0x1000 * i;
-				unsigned j, used = 0;
-
-				for (j = 0; j < 1024; j++)
-					used |= (dte[j] & ~0xfffu) == pt_pa;
-				if (!used)
-					break;
+		if (dte_idx != last_dte) {
+			uint32_t d = dte[dte_idx];
+			if (!(d & VM_PRESENT)) {
+				unsigned i = W_PT_NUM;
+				for (unsigned w = 0; w < (W_PT_NUM + 31) / 32; w++) {
+					uint32_t free_bits = ~mali_pt_used[w];
+					if (free_bits) {
+						unsigned bit = (unsigned)__builtin_ctz(free_bits);
+						unsigned cand = (w << 5) + bit;
+						if (cand < W_PT_NUM) {
+							mali_pt_used[w] |= 1u << bit;
+							i = cand;
+							break;
+						}
+					}
+				}
+				if (i == W_PT_NUM)
+					return MALI_ERR_MAP;
+				d = (e->mem_pa + W_PT + 0x1000 * i) | VM_PRESENT;
+				dte[dte_idx] = d;
 			}
-			if (i == W_PT_NUM)
-				return MALI_ERR_MAP;
-			dte[a >> 22] = (e->mem_pa + W_PT + 0x1000 * i) | VM_PRESENT;
+			pt = (uint32_t *)(e->mem + (d & ~0xfffu) - e->mem_pa);
+			last_dte = dte_idx;
 		}
-		pt = (uint32_t *)(e->mem + (dte[a >> 22] & ~0xfffu) - e->mem_pa);
 		pt[(a >> 12) & 0x3ff] = pa | VM_CACHED;
 		if (a == 0xfffff000)
 			break;
@@ -245,6 +255,8 @@ int mali_init(const struct mali_env *e)
 	wr(g + M_L2 + L2_ENABLE, 3);		/* ACCESS | READ_ALLOCATE */
 	wr(g + M_L2 + L2_MAX_READS, 0x1c);
 
+	for (i = 0; i < (W_PT_NUM + 31) / 32; i++)
+		mali_pt_used[i] = 0;
 	for (i = 0; i < W_STREAM / 4; i++)
 		w[i] = 0;
 	if ((err = map(e, e->mem_pa, MALI_MEM_SIZE)))

@@ -33,11 +33,16 @@ typedef int (*tc_enter_delayed_int_t)(void *, uint32_t, uint32_t, uint32_t,
 #define tc_enter_delayed_int ((tc_enter_delayed_int_t)0x800465e9)
 #define tc_enter_delayed(tc, dl) \
     tc_enter_delayed_int((tc), 0u, 0u, 0u, (uint32_t)(dl), (uint32_t)((dl) >> 32), 0u, 0u, 1u)
+#define tc_enter_delayed_idle(tc, dl) \
+    tc_enter_delayed_int((tc), 0u, 0u, 0u, (uint32_t)(dl), (uint32_t)((dl) >> 32), 0u, 0u, 0u)
 #define clk_int_deadline ((void (*)(uint32_t, uint32_t, uint64_t *))0x8001edbd)
 
 #define FIMD0_PA        0x11c00000
 #define FIMD_VIDCON0    0x000u
 #define FIMD_VIDCON1    0x004u
+#define FIMD_VIDTCON0   0x010u
+#define FIMD_VIDTCON1   0x014u
+#define FIMD_VIDTCON2   0x018u
 #define FIMD_SHADOWCON  0x034u
 #define SHADOWCON_C0_EN (1u << 0)
 #define SHADOWCON_W0_PR (1u << 10)
@@ -52,8 +57,8 @@ typedef int (*tc_enter_delayed_int_t)(void *, uint32_t, uint32_t, uint32_t,
 #define CMU_TOP_LCD_PA  0x1003c000u
 #define CMU_GATE_IP_LCD 0x934u
 
-#define DISP_FB_PA      0x60400000  /* ping-pong blit FB #0 (separate from boot console 0x60000000) */
-#define DISP_FB2_PA     0x60800000  /* ping-pong blit FB #1 (in 0x60400000..0x60c00000 carveout) */
+#define DISP_FB_PA      0x5f400000  /* ping-pong blit FB #0 (in unused 0x5f400000..0x5fc00000, clear of GPU FB 0x60000000..0x60800000) */
+#define DISP_FB2_PA     0x5f800000  /* ping-pong blit FB #1 (in unused 0x5f400000..0x5fc00000 carveout) */
 #define DISP_W          720
 #define DISP_H          1280
 #define DISP_STRIDE     (DISP_W * 4)
@@ -91,10 +96,12 @@ static uint8_t *disp_fb_vas[2];
 static const uint32_t disp_fb_pas[2] = { DISP_FB_PA, DISP_FB2_PA };
 static uint32_t disp_fb_idx;
 
-extern uintptr_t mct;
+extern uintptr_t mct, exy_pl310;
 extern void exy_clean_line(const void *p);
-extern struct exy_direct_fb { uint32_t surf_pa, fb_pa, gen, stride; } exy_direct_fbs[24];
+extern struct exy_direct_fb { uint32_t surf_pa, fb_pa, gen, stride, pp_seq; } exy_direct_fbs[24];
 extern uint32_t exy_direct_fb_gen;
+extern void exy_mali_wait_seq(uint32_t target_seq);
+extern void exy_mali_wait_idle(void);
 
 static void disp_clean(const void *p)
 {
@@ -135,9 +142,9 @@ extern void exy_putc(char c);
 
 static void *vsync_tc;
 static uint64_t vsync_next_dl, vsync_step;
-static volatile uint32_t swap_vc1, swap_mct, swap_fb_changed, swap_target_pa;
+static volatile uint32_t swap_vc1, swap_mct, swap_fb_changed, swap_target_pa, vsync_idle_mode;
 static int fimd_has_shd;   /* 1 if SHD_VIDW00ADD0B0 (+0x40a0) tracks live scanout PA */
-static uint32_t fimd_frame_us = 16615u; /* measured live hardware frame period in us (Exynos4412 s6e8aa0) */
+static uint32_t fimd_frame_us = 16670u; /* exact Exynos4412 s6e8aa0 frame period (952560 / (400MHz/7) = 16669.80 us) */
 
 /* Exynos 4412 FIMD0 VIDCON1.LINECNT counts UP 0..1279 during ACTIVE (verified on hardware: 349->505 in 2ms). */
 static inline int32_t fimd_scan_pos(uint32_t vc1)
@@ -147,6 +154,25 @@ static inline int32_t fimd_scan_pos(uint32_t vc1)
     return ln;
 }
 
+static uint64_t next_vsync_deadline(uint64_t now, uint32_t vc1, int after_next_vsync)
+{
+    uint32_t vstatus = (vc1 >> 13) & 3u;
+    uint32_t linecnt = (vc1 >> 16) & 0x7ffu;
+    if (fimd_va && (vc1 & 0x07ffe000u) != 0u && linecnt <= 1280u) {
+        int32_t cur_pos = (vstatus == 2u) ? fimd_scan_pos(vc1) : 1288;
+        int32_t rem_lines;
+        if (after_next_vsync) {
+            /* A swap was just programmed: always target line 24 AFTER the next VSYNC edge. */
+            rem_lines = 1296 + 24 - cur_pos;
+        } else {
+            rem_lines = (vstatus == 2u && cur_pos < 24) ? (24 - cur_pos) : (1296 + 24 - cur_pos);
+            if (rem_lines < 12) rem_lines = 12;
+        }
+        return now + (uint64_t)rem_lines * 308ull;
+    }
+    return now + (vsync_step ? vsync_step : (uint64_t)fimd_frame_us * 24ull);
+}
+
 /* IOMobileFramebuffer VSYNC delivery to the 0x92c subscriber list; Apple ABI packs the u64s
  * (vbl count, timestamp, delta) unaligned, so pass them as 32-bit halves. */
 typedef void (*iomfb_vbl_clients_t)(void *self, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
@@ -154,96 +180,20 @@ typedef void (*iomfb_vbl_clients_t)(void *self, uint32_t, uint32_t, uint32_t, ui
 
 void exy_clcd_swap_begin(uint8_t *self);
 
-/* Mirrors AppleCLCD's VBL interrupt (0x80d51d8a, 0x80d515ae): complete pending swap, kick next queued, notify clients. */
+/* Mirrors AppleCLCD's VBL interrupt (0x80d51d8a, 0x80d515ae): verify shadow latch under IOCommandGate,
+ * complete pending swap, notify VBL clients first, then kick any next queued swap. */
 static int vbl_gated_action(void *owner, void *a0, void *a1, void *a2, void *a3)
 {
     (void)a2; (void)a3;
     uint32_t *s = (uint32_t *)owner;
     void *pend = *(void **)((uint8_t *)owner + 0x918);
-    if (pend && (uintptr_t)a1) {
-        swap_fb_changed = 0u;
-        iomfb_swap_complete(owner, 1);
-        if (*(void **)((uint8_t *)owner + 0x91c))
-            exy_clcd_swap_begin((uint8_t *)owner);
-    }
-    iomfb_vbl_notify(owner, (uint32_t)(uintptr_t)a0);
-    if (s[0x92c / 4])
-        iomfb_vbl_clients(owner, s[0x58 / 4], s[0x5c / 4], s[0x60 / 4], s[0x64 / 4], s[0x68 / 4], s[0x6c / 4]);
-    return 0;
-}
-
-static void exy_vsync_tick(void *p0, void *p1)
-{
-    (void)p1;
-    uint8_t *self = (uint8_t *)p0;
-    uint32_t vc1 = fimd_va ? *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1) : 0u;
-    if (vsync_tc) {
-        uint64_t now = 0;
-        clk_int_deadline(0, 1000, &now);
-        if (!vsync_step) {
-            vsync_step = (uint64_t)fimd_frame_us * 24ull; /* XNU ARMv7 timebase = 24MHz MCT */
-        }
-        /* Phase-lock software VSYNC tick to real Exynos 4412 FIMD0 hardware VSYNC.
-         * Subtract thread_call wakeup latency (now - vsync_next_dl) from LINECNT so 1-frame CPU
-         * scheduling delays NEVER yank vsync_next_dl backward before hardware VSYNC.
-         * Target sched_pos=35 (~0.45ms into ACTIVE, safely after SHD_VIDW00ADD0B0 latches at pos=0). */
-        int32_t adj_us = 0;
-        uint32_t vstatus = (vc1 >> 13) & 3u;
-        uint32_t linecnt = (vc1 >> 16) & 0x7ffu;
-        if (fimd_va && (vc1 & 0x07ffe000u) != 0u && linecnt <= 1280u) {
-            uint64_t lat_ticks = (vsync_next_dl && now > vsync_next_dl) ? (now - vsync_next_dl) : 0ull;
-            int32_t lat_lines = (int32_t)(lat_ticks / 308ull); /* 12.82 us/line * 24 ticks/us */
-            if (lat_lines <= 250) {
-                int32_t cur_pos = (vstatus == 2u) ? fimd_scan_pos(vc1) : 1288;
-                int32_t sched_pos = cur_pos - lat_lines;
-                while (sched_pos < 0) sched_pos += 1296;
-
-                if (sched_pos >= 640) {
-                    /* Scheduled before hardware VSYNC: push forward past VSYNC to pos=18. */
-                    adj_us = (1314 - sched_pos) * 10;
-                    if (adj_us > 3500) adj_us = 3500;
-                } else if (sched_pos < 12) {
-                    /* Too close to VSYNC edge: nudge later so shadow latch always finishes first. */
-                    adj_us = (18 - sched_pos) * 8;
-                } else if (sched_pos > 45) {
-                    /* Scheduled late after VSYNC: pull back toward pos=18. */
-                    adj_us = -((sched_pos - 18) * 6);
-                    if (adj_us < -2000) adj_us = -2000;
-                } else {
-                    /* Locked in [12..45]: gentle micro-trim keeps sched_pos pinned at 18. */
-                    adj_us = -((sched_pos - 18) * 3);
-                }
-            }
-            exy_disp_log.last_len = vc1;
-        }
-        vsync_next_dl += vsync_step;
-        if (adj_us) {
-            vsync_next_dl = (uint64_t)((int64_t)vsync_next_dl + (int64_t)adj_us * 24ll);
-        }
-        if (vsync_next_dl <= now || (vsync_next_dl - now) > vsync_step * 4ull)
-            vsync_next_dl = now + vsync_step;
-        tc_enter_delayed(vsync_tc, vsync_next_dl);
-    }
-    exy_disp_log.ticks++;
-    if (!self)
-        return;
-    void *gate = *(void **)(self + 0x970);
-    if (!gate) {
-        exy_disp_log.no_gate++;
-        return;
-    }
-    if (*(void **)(self + 0x92c))
-        exy_disp_log.clients++;
-    typedef int (*run_action_t)(void *g, int (*fn)(void *, void *, void *, void *, void *),
-                                void *a0, void *a1, void *a2, void *a3);
-    void **gvt = *(void ***)gate;
-    /* Hardware Zero-Tear Shadow Latch Guard: never release the previous scanout buffer until
-     * FIMD0 has genuinely latched swap_target_pa onto the active scanout pipeline.
-     * Primary: live SHD_VIDW00ADD0B0 (+0x40a0) == swap_target_pa.
-     * Secondary: hardware VIDINTCON1.INTFRMPEND (bit 1), cleared right after fimd_set_fb().
-     * If we woke up right before VSYNC, spin briefly (<=1.8ms) so we latch on this tick without dropping to 30 FPS. */
+    uint32_t vsync_entry_mct = (uint32_t)(uintptr_t)a1;
     uint32_t can_complete = 1u;
-    if (swap_fb_changed && fimd_va) {
+    /* Only gate completion on swaps that were already programmed BEFORE this VSync tick arrived.
+     * If exy_clcd_swap_begin finished a GPU wait AFTER vsync_entry_mct while holding IOCommandGate,
+     * complete normally (matching triple-buffered orig_backup semantics) instead of defer-looping. */
+    int pre_vsync_swap = (!mct || (int32_t)(vsync_entry_mct - swap_mct) >= 0);
+    if (pend && swap_fb_changed && fimd_va && pre_vsync_swap) {
         if (!fimd_has_shd && swap_target_pa) {
             uint32_t s0_now = *(volatile uint32_t *)(fimd_va + 0x40a0u);
             if (s0_now == swap_target_pa)
@@ -255,11 +205,13 @@ static void exy_vsync_tick(void *p0, void *p1)
             ? (*(volatile uint32_t *)(fimd_va + 0x40a0u) == swap_target_pa)
             : ((*(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON1) & VIDINTCON1_FRMPEND) != 0u);
         if (!latched && mct && dt_mct < 24000u * 35u) {
-            uint32_t cvs = (vc1 >> 13) & 3u;
-            int32_t cpos = fimd_scan_pos(vc1);
-            if (cvs != 2u || cpos >= 1150 || dt_mct >= 24000u * 14u) {
+            uint32_t vc1_now = *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1);
+            uint32_t cvs = (vc1_now >> 13) & 3u;
+            int32_t cpos = fimd_scan_pos(vc1_now);
+            /* Cap spin strictly to <=450 us (covers full 205 us VBlank + margin; 4x below old 1800 us). */
+            if (cvs != 2u || cpos >= 1230 || dt_mct >= 24000u * 14u) {
                 uint32_t w0 = *(volatile uint32_t *)(mct + 0x100u);
-                while (*(volatile uint32_t *)(mct + 0x100u) - w0 < 24000u * 1800u / 1000u) {
+                while (*(volatile uint32_t *)(mct + 0x100u) - w0 < 24u * 450u) {
                     if (fimd_has_shd) {
                         if (*(volatile uint32_t *)(fimd_va + 0x40a0u) == swap_target_pa) {
                             latched = 1;
@@ -277,7 +229,114 @@ static void exy_vsync_tick(void *p0, void *p1)
             exy_disp_log.swap_defers++;
         }
     }
-    ((run_action_t)gvt[0x70 / 4])(gate, vbl_gated_action, (void *)(uintptr_t)(fimd_frame_us * 1000u), (void *)(uintptr_t)can_complete, 0, 0);
+    if (pend && can_complete) {
+        swap_fb_changed = 0u;
+        iomfb_swap_complete(owner, 1);
+    }
+    /* Deliver VBL notifications BEFORE kicking next queued swap so GPU wait never delays CADisplayLink. */
+    iomfb_vbl_notify(owner, (uint32_t)(uintptr_t)a0);
+    if (s[0x92c / 4])
+        iomfb_vbl_clients(owner, s[0x58 / 4], s[0x5c / 4], s[0x60 / 4], s[0x64 / 4], s[0x68 / 4], s[0x6c / 4]);
+    if (!*(void **)((uint8_t *)owner + 0x918) && *(void **)((uint8_t *)owner + 0x91c))
+        exy_clcd_swap_begin((uint8_t *)owner);
+    return 0;
+}
+
+static void exy_vsync_tick(void *p0, void *p1)
+{
+    (void)p1;
+    uint8_t *self = (uint8_t *)p0;
+    uint32_t vc1 = fimd_va ? *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1) : 0u;
+    uint32_t entry_mct = mct ? *(volatile uint32_t *)(mct + 0x100u) : 0u;
+    uint64_t now = 0;
+    if (vsync_tc) {
+        clk_int_deadline(0, 1000, &now);
+        if (!vsync_step)
+            vsync_step = (uint64_t)fimd_frame_us * 24ull; /* XNU ARMv7 timebase = 24MHz MCT */
+    }
+    exy_disp_log.ticks++;
+    if (!self) {
+        if (vsync_tc) {
+            vsync_next_dl = now + vsync_step * 2ull;
+            tc_enter_delayed_idle(vsync_tc, vsync_next_dl);
+        }
+        return;
+    }
+
+    /* Idle VSync backoff: keep locked 60 Hz during boot (swaps < 100), while any VBL client or swap
+     * is active, and for 2,000 ms after the last swap. Only when truly idle (>2s untouched), skip
+     * IOCommandGate + disp_clean and relax to 30 Hz coalesced timer (re-armed immediately on swap). */
+    if (exy_disp_log.swaps >= 100u && mct &&
+        (entry_mct - exy_last_disp_mct) >= 24000u * 2000u &&
+        !*(void *volatile *)(self + 0x918) && !*(void *volatile *)(self + 0x91c) &&
+        !*(void *volatile *)(self + 0x92c) && !swap_fb_changed) {
+        vsync_idle_mode = 1u;
+        if (vsync_tc) {
+            vsync_next_dl = now + vsync_step * 2ull;
+            tc_enter_delayed_idle(vsync_tc, vsync_next_dl);
+        }
+        return;
+    }
+
+    if (vsync_tc) {
+        if (vsync_idle_mode) {
+            vsync_idle_mode = 0u;
+            vsync_next_dl = next_vsync_deadline(now, vc1, 0);
+            tc_enter_delayed(vsync_tc, vsync_next_dl);
+        } else {
+            /* Phase-lock software VSYNC tick to real Exynos 4412 FIMD0 hardware VSYNC.
+             * Subtract thread_call wakeup latency (now - vsync_next_dl) from LINECNT so 1-frame CPU
+             * scheduling delays NEVER yank vsync_next_dl backward before hardware VSYNC.
+             * Target sched_pos=24 (~0.31ms into ACTIVE, safely after SHD_VIDW00ADD0B0 latches at pos=0). */
+            int32_t adj_us = 0;
+            uint32_t vstatus = (vc1 >> 13) & 3u;
+            uint32_t linecnt = (vc1 >> 16) & 0x7ffu;
+            if (fimd_va && (vc1 & 0x07ffe000u) != 0u && linecnt <= 1280u) {
+                uint64_t lat_ticks = (vsync_next_dl && now > vsync_next_dl) ? (now - vsync_next_dl) : 0ull;
+                int32_t lat_lines = (int32_t)(lat_ticks / 308ull); /* 12.82 us/line * 24 ticks/us */
+                if (lat_lines <= 250) {
+                    int32_t cur_pos = (vstatus == 2u) ? fimd_scan_pos(vc1) : 1288;
+                    int32_t sched_pos = cur_pos - lat_lines;
+                    while (sched_pos < 0) sched_pos += 1296;
+
+                    if (sched_pos >= 640) {
+                        /* Scheduled before hardware VSYNC: push forward past VSYNC to pos=24. */
+                        adj_us = (1320 - sched_pos) * 10;
+                        if (adj_us > 3500) adj_us = 3500;
+                    } else if (sched_pos < 16) {
+                        /* Too close to VSYNC edge: nudge later so shadow latch always finishes first. */
+                        adj_us = (24 - sched_pos) * 8;
+                    } else if (sched_pos > 52) {
+                        /* Scheduled late after VSYNC: pull back toward pos=24. */
+                        adj_us = -((sched_pos - 24) * 6);
+                        if (adj_us < -2000) adj_us = -2000;
+                    } else {
+                        /* Locked in [16..52]: gentle micro-trim keeps sched_pos pinned at 24. */
+                        adj_us = -((sched_pos - 24) * 3);
+                    }
+                }
+                exy_disp_log.last_len = vc1;
+            }
+            vsync_next_dl += vsync_step;
+            if (adj_us)
+                vsync_next_dl = (uint64_t)((int64_t)vsync_next_dl + (int64_t)adj_us * 24ll);
+            if (vsync_next_dl <= now || (vsync_next_dl - now) > vsync_step * 4ull)
+                vsync_next_dl = now + vsync_step;
+            tc_enter_delayed(vsync_tc, vsync_next_dl);
+        }
+    }
+    void *gate = *(void **)(self + 0x970);
+    if (!gate) {
+        exy_disp_log.no_gate++;
+        return;
+    }
+    if (*(void **)(self + 0x92c))
+        exy_disp_log.clients++;
+    typedef int (*run_action_t)(void *g, int (*fn)(void *, void *, void *, void *, void *),
+                                void *a0, void *a1, void *a2, void *a3);
+    void **gvt = *(void ***)gate;
+    ((run_action_t)gvt[0x70 / 4])(gate, vbl_gated_action, (void *)(uintptr_t)(fimd_frame_us * 1000u),
+                                  (void *)(uintptr_t)entry_mct, 0, 0);
     exy_disp_log.pad++;
     if (mct)
         exy_disp_log.last_vsync_ms = *(volatile uint32_t *)(mct + 0x100u) / 24000u;
@@ -349,30 +408,20 @@ int exy_clcd_start_hardware(uint8_t *self, void *provider)
         *(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON0) = VIDINTCON0_VSYNC_EN;
         *(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON1) = VIDINTCON1_FRMPEND;
         fimd_has_shd = (a0 != 0u && s0 == a0) ? 1 : 0;
-        if (mct) {
-            /* Measure exact hardware frame period via two consecutive INTFRMPEND VSYNC edges (24MHz MCT). */
-            uint32_t ta = 0, tb = 0;
-            uint32_t w0 = *(volatile uint32_t *)(mct + 0x100u);
-            while (*(volatile uint32_t *)(mct + 0x100u) - w0 < 24000u * 30u) {
-                if (*(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON1) & VIDINTCON1_FRMPEND) {
-                    *(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON1) = VIDINTCON1_FRMPEND;
-                    ta = *(volatile uint32_t *)(mct + 0x100u);
-                    break;
-                }
-            }
-            w0 = *(volatile uint32_t *)(mct + 0x100u);
-            while (ta && *(volatile uint32_t *)(mct + 0x100u) - w0 < 24000u * 30u) {
-                if (*(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON1) & VIDINTCON1_FRMPEND) {
-                    *(volatile uint32_t *)(fimd_va + FIMD_VIDINTCON1) = VIDINTCON1_FRMPEND;
-                    tb = *(volatile uint32_t *)(mct + 0x100u);
-                    break;
-                }
-            }
-            if (ta && tb) {
-                uint32_t fus = (tb - ta) / 24u;
-                if (fus >= 15000u && fus <= 18500u)
-                    fimd_frame_us = fus;
-            }
+        /* Compute exact hardware frame period deterministically from FIMD0 VIDCON0/VIDTCON0..2
+         * (SCLK_FIMD0 = MPLL 800 MHz / 2 = 400 MHz), avoiding any preemptible boot busy-wait. */
+        uint32_t vt0 = *(volatile uint32_t *)(fimd_va + FIMD_VIDTCON0);
+        uint32_t vt1 = *(volatile uint32_t *)(fimd_va + FIMD_VIDTCON1);
+        uint32_t vt2 = *(volatile uint32_t *)(fimd_va + FIMD_VIDTCON2);
+        uint32_t clkdiv = ((vc0 >> 6) & 0xffu) + 1u;
+        uint32_t vtot = ((vt0 >> 16) & 0xffu) + 1u + ((vt0 >> 8) & 0xffu) + 1u +
+                        (vt0 & 0xffu) + 1u + ((vt2 >> 11) & 0x7ffu) + 1u;
+        uint32_t htot = ((vt1 >> 16) & 0xffu) + 1u + ((vt1 >> 8) & 0xffu) + 1u +
+                        (vt1 & 0xffu) + 1u + (vt2 & 0x7ffu) + 1u;
+        if (htot >= 640u && htot <= 2048u && vtot >= 1024u && vtot <= 2048u && clkdiv >= 1u && clkdiv <= 64u) {
+            uint32_t fus = (htot * vtot * clkdiv + 200u) / 400u;
+            if (fus >= 15000u && fus <= 18500u)
+                fimd_frame_us = fus;
         }
         ps_puts("FIMD PROBE shd="); ps_putx((uint32_t)fimd_has_shd);
         ps_puts(" a0=0x"); ps_putx(a0); ps_puts(" s0=0x"); ps_putx(s0);
@@ -407,6 +456,7 @@ static void copy_words_only(uint32_t *dst, const uint32_t *src, uint32_t nbytes)
         register uint32_t *r_dst __asm__("r0") = dst;
         register const uint32_t *r_src __asm__("r1") = src;
         __asm__ volatile(
+            "pld [%1, #128]\n"
             "ldmia %1!, {r2, r3, r4, r5, r6, r8, r9, r10}\n"
             "stmia %0!, {r2, r3, r4, r5, r6, r8, r9, r10}\n"
             : "+r"(r_dst), "+r"(r_src)
@@ -417,6 +467,28 @@ static void copy_words_only(uint32_t *dst, const uint32_t *src, uint32_t nbytes)
     }
     while (n--)
         *dst++ = *src++;
+}
+
+static void pl310_clean_inv_all(void)
+{
+    if (!exy_pl310)
+        return;
+    uint32_t aux = *(volatile uint32_t *)(exy_pl310 + 0x104u);
+    uint32_t ways = (aux & (1u << 16)) ? 0xffffu : 0xffu;
+    *(volatile uint32_t *)(exy_pl310 + 0x7fcu) = ways;
+    for (uint32_t i = 0; i < 200000u && (*(volatile uint32_t *)(exy_pl310 + 0x7fcu) & ways); i++)
+        ;
+    *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
+    __asm__ volatile("dsb" ::: "memory");
+}
+
+static inline void l1_clean_inv_range(uintptr_t kv, uint32_t len)
+{
+    uintptr_t a = kv & ~31u;
+    uintptr_t end = kv + len;
+    for (uintptr_t l = a; l < end; l += 32u)
+        __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" :: "r"(l) : "memory");
+    __asm__ volatile("dsb" ::: "memory");
 }
 
 static uint8_t *map_fb_wc(uint32_t pa, int *is_wc)
@@ -443,9 +515,6 @@ static uint32_t blit_surface(void *surf, uint32_t *out_pa)
     typedef void *(*get_md_t)(void *surf, uint32_t plane);
     typedef uint32_t (*get_off_t)(void *surf, uint32_t plane);
     typedef uint32_t (*get_phys_t)(void *md, uint32_t off, uint32_t *len);
-    extern void exy_mali_wait_idle(void);
-    extern void exy_dma_inv_l2_nosync(uint32_t pa, uint32_t len);
-    extern void exy_dma_inv_l2_sync(void);
 
     void **svt = *(void ***)surf;
     void *md = ((get_md_t)svt[0x64 / 4])(surf, 0);
@@ -465,7 +534,7 @@ static uint32_t blit_surface(void *surf, uint32_t *out_pa)
     if (!pa)
         return 0;
 
-    /* Ping-pong double-buffered Write-Combining FBs (0x60000000 <-> 0x60800000) for zero-tear fast blit. */
+    /* Ping-pong double-buffered Write-Combining FBs (0x5f400000 <-> 0x5f800000) for zero-tear fast blit. */
     uint32_t idx = disp_fb_idx ^ 1u;
     if (!disp_fb_vas[idx])
         disp_fb_vas[idx] = map_fb_wc(disp_fb_pas[idx], &disp_fb_is_wc);
@@ -475,45 +544,59 @@ static uint32_t blit_surface(void *surf, uint32_t *out_pa)
 
     exy_mali_wait_idle();
 
-    /* Pass 1: batch PL310 L2 invalidate across the whole IOSurface with a single CACHE_SYNC. */
-    uint32_t total_src = DISP_H * src_stride;
-    for (uint32_t off = 0; off < total_src; ) {
-        uint32_t sl = 0;
-        uint32_t p = get_phys(md, base_off + off, &sl);
-        if (!p || !sl || p < 0x40000000u || p >= 0x60000000u)
-            break;
-        uint32_t chunk = total_src - off;
-        if (sl < chunk)
-            chunk = sl;
-        exy_dma_inv_l2_nosync(p, chunk);
-        off += chunk;
-    }
-    exy_dma_inv_l2_sync();
+    /* Single whole-L2 clean+invalidate by way replaces 115,200 uncached PL310 PA MMIO writes. */
+    pl310_clean_inv_all();
 
-    /* Pass 2: L1 invalidate + single-pass 32B-burst copy into Write-Combining scanout buffer. */
+    /* Hoist get_phys + L1 clean+inv + single dsb per contiguous physical segment instead of per row. */
     uint32_t rows_done = 0;
-    for (uint32_t y = 0; y < DISP_H; y++) {
-        uint32_t row_off = base_off + y * src_stride;
-        uint32_t row_dst = y * DISP_STRIDE;
-        uint32_t x = 0;
-        while (x < DISP_STRIDE) {
+    if (src_stride == DISP_STRIDE) {
+        uint32_t off = 0;
+        while (off < DISP_FB_SIZE) {
             uint32_t sl = 0;
-            uint32_t p = get_phys(md, row_off + x, &sl);
+            uint32_t p = get_phys(md, base_off + off, &sl);
             if (!p || !sl || p < 0x40000000u || p >= 0x60000000u)
-                goto done_blit;
-            uint32_t chunk = DISP_STRIDE - x;
+                break;
+            uint32_t chunk = DISP_FB_SIZE - off;
             if (sl < chunk)
                 chunk = sl;
             uintptr_t kv = (uintptr_t)(p + PHYS_TO_KV_OFF);
-            uintptr_t a = kv & ~31u;
-            uintptr_t end = kv + chunk;
-            for (uintptr_t l = a; l < end; l += 32u)
-                __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" :: "r"(l) : "memory");
-            __asm__ volatile("dsb" ::: "memory");
-            copy_words_only((uint32_t *)(dst_va + row_dst + x), (const uint32_t *)kv, chunk);
-            x += chunk;
+            l1_clean_inv_range(kv, chunk);
+            copy_words_only((uint32_t *)(dst_va + off), (const uint32_t *)kv, chunk);
+            off += chunk;
         }
-        rows_done++;
+        rows_done = off / DISP_STRIDE;
+    } else {
+        uint32_t total_src = DISP_H * src_stride;
+        uint32_t seg_off = 0, seg_pa = 0, seg_end = 0;
+        for (uint32_t y = 0; y < DISP_H; y++) {
+            uint32_t row_off = y * src_stride;
+            uint32_t row_dst = y * DISP_STRIDE;
+            uint32_t x = 0;
+            while (x < DISP_STRIDE) {
+                uint32_t cur = row_off + x;
+                if (cur >= seg_end) {
+                    uint32_t sl = 0;
+                    uint32_t p = get_phys(md, base_off + cur, &sl);
+                    if (!p || !sl || p < 0x40000000u || p >= 0x60000000u)
+                        goto done_blit;
+                    uint32_t rem = total_src - cur;
+                    if (sl > rem)
+                        sl = rem;
+                    seg_off = cur;
+                    seg_pa = p;
+                    seg_end = cur + sl;
+                    l1_clean_inv_range((uintptr_t)(p + PHYS_TO_KV_OFF), sl);
+                }
+                uint32_t chunk = DISP_STRIDE - x;
+                uint32_t avail = seg_end - cur;
+                if (avail < chunk)
+                    chunk = avail;
+                uintptr_t kv = (uintptr_t)(seg_pa + (cur - seg_off) + PHYS_TO_KV_OFF);
+                copy_words_only((uint32_t *)(dst_va + row_dst + x), (const uint32_t *)kv, chunk);
+                x += chunk;
+            }
+            rows_done++;
+        }
     }
 done_blit:
     __asm__ volatile("dsb" ::: "memory");
@@ -674,28 +757,41 @@ void exy_clcd_swap_begin(uint8_t *self)
     void *s2 = *(void **)(req + 28);
     void *surf0 = s0 ? s0 : (s1 ? s1 : s2);
     uint32_t t0 = mct ? *(volatile uint32_t *)(mct + 0x100u) : 0u;
+    if (mct) exy_last_disp_mct = t0;
     uint32_t nz = 0;
-    static uint32_t last_fimd_pa, last_fimd_stride, last_fb_gen, same_surf_cnt;
+    static uint32_t last_fimd_pa, last_fimd_stride, last_fb_gen, last_fallback_pa, same_surf_cnt;
     static void *last_fallback_surf;
     int did_blit = 0;
     if (surf0) {
         uint32_t spa = get_surface_pa(surf0);
         exy_disp_log.last_pa = spa;
-        uint32_t direct_fb = 0, direct_gen = 0, direct_stride = DISP_STRIDE;
+        uint32_t direct_fb = 0, direct_gen = 0, direct_stride = DISP_STRIDE, direct_pp_seq = 0;
         for (int i = 0; i < 24; i++) {
-            if (spa && exy_direct_fbs[i].surf_pa == spa) {
-                direct_fb = exy_direct_fbs[i].fb_pa;
-                direct_gen = exy_direct_fbs[i].gen;
-                if (exy_direct_fbs[i].stride)
-                    direct_stride = exy_direct_fbs[i].stride;
+            uint32_t s_pa = *(volatile uint32_t *)&exy_direct_fbs[i].surf_pa;
+            if (spa && s_pa == spa) {
+                __asm__ volatile("dmb ish" ::: "memory");
+                uint32_t fb_pa = *(volatile uint32_t *)&exy_direct_fbs[i].fb_pa;
+                uint32_t gen = *(volatile uint32_t *)&exy_direct_fbs[i].gen;
+                uint32_t stride = *(volatile uint32_t *)&exy_direct_fbs[i].stride;
+                uint32_t pp_seq = *(volatile uint32_t *)&exy_direct_fbs[i].pp_seq;
+                __asm__ volatile("dmb ish" ::: "memory");
+                if (*(volatile uint32_t *)&exy_direct_fbs[i].surf_pa == spa && fb_pa) {
+                    direct_fb = fb_pa;
+                    direct_gen = gen;
+                    if (stride)
+                        direct_stride = stride;
+                    direct_pp_seq = pp_seq;
+                }
                 break;
             }
         }
         if (direct_fb) {
-            extern void exy_mali_wait_idle(void);
-            exy_mali_wait_idle();
             if (mct) exy_last_disp_mct = *(volatile uint32_t *)(mct + 0x100u);
             if (direct_fb != last_fimd_pa || direct_stride != last_fimd_stride || direct_gen != last_fb_gen) {
+                if (direct_pp_seq)
+                    exy_mali_wait_seq(direct_pp_seq);
+                else
+                    exy_mali_wait_idle();
                 fimd_set_fb(direct_fb, direct_stride);
                 if (fimd_va) swap_vc1 = *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1);
                 if (mct) { swap_mct = *(volatile uint32_t *)(mct + 0x100u); exy_last_disp_mct = swap_mct; }
@@ -710,8 +806,9 @@ void exy_clcd_swap_begin(uint8_t *self)
         } else {
             /* Fallback double-buffered WC blit for non-direct full-screen app IOSurfaces (3D CAEAGLLayer, Safari). */
             uint32_t blit_pa = 0;
-            if (exy_disp_log.swaps >= 64u || surf0 != last_fallback_surf || (++same_surf_cnt & 31u) == 1u) {
+            if (surf0 != last_fallback_surf || spa != last_fallback_pa || (++same_surf_cnt & 15u) == 1u) {
                 last_fallback_surf = surf0;
+                last_fallback_pa = spa;
                 nz = blit_surface(surf0, &blit_pa);
                 did_blit = 1;
             }
@@ -728,6 +825,17 @@ void exy_clcd_swap_begin(uint8_t *self)
         }
     }
     uint32_t t1 = mct ? *(volatile uint32_t *)(mct + 0x100u) : 0u;
+
+    /* Immediately wake 60 Hz phase-locked VSync aligned to line 24 AFTER the next VSYNC edge. */
+    __asm__ volatile("dmb ish" ::: "memory");
+    if (vsync_idle_mode && vsync_tc) {
+        vsync_idle_mode = 0u;
+        uint64_t now = 0;
+        clk_int_deadline(0, 1000, &now);
+        uint32_t vc1 = fimd_va ? *(volatile uint32_t *)(fimd_va + FIMD_VIDCON1) : 0u;
+        vsync_next_dl = next_vsync_deadline(now, vc1, 1);
+        tc_enter_delayed(vsync_tc, vsync_next_dl);
+    }
 
     exy_disp_log.swaps++;
     exy_disp_log.last_swap_ms = t0 / 24000u;

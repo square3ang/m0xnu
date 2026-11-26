@@ -376,7 +376,21 @@ int exy_pmic_write_reg(uint8_t reg, uint8_t val)
 
 static int cur_cpu_opp = -1;
 volatile uint32_t exy_last_touch_mct;
+static uint8_t cur_buck2_code = 0x2au;
 static uint8_t cur_buck4_code = 0x26u;
+
+static int cpu_set_vdd(uint8_t code)
+{
+    if (code == cur_buck2_code)
+        return 0;
+    int ok = 1;
+    for (uint8_t r = MAX77686_BUCK2DVS1; r < MAX77686_BUCK2DVS1 + 8u; r++)
+        if (pmic_write_reg(r, code) != 0)
+            ok = 0;
+    if (ok)
+        cur_buck2_code = code;
+    return ok ? 0 : -1;
+}
 
 int exy_gpu_set_vdd(uint8_t code)
 {
@@ -391,9 +405,15 @@ int exy_gpu_set_vdd(uint8_t code)
     return ok ? 0 : -1;
 }
 
-/* Runtime CPU MUX_CORE switching is unsafe across 4 active Cortex-A9 SMP cores on Exynos 4412
- * (caused freezes/LPM trips on w45/w50b). CPU runs continuously at cool 1000 MHz @ 1.125V set
- * single-core before SMP bring-up; thermal throttling scales Mali-400 GPU (440 <-> 220 MHz). */
+/* Restore full boot voltages before warm reset so U-Boot (800 MHz) never browns out. */
+void exy_cpu_prep_reboot(void)
+{
+    (void)cpu_set_vdd(0x2au);
+    (void)exy_gpu_set_vdd(0x26u);
+}
+
+/* Fixed 1000 MHz @ 1.125V set single-core before SMP bring-up (no runtime CLK_DIV_CPU0 SMP scaling);
+ * thermal/idle power management scales Mali-400 GPU (147/220/440 MHz) + idle clock-gating. */
 int exy_cpu_set_opp(int opp)
 {
     (void)opp;
@@ -415,7 +435,7 @@ static void boost_apll_1000(void)
     wr32(cmu_cpu_va + 0x504u, 0x00000505u);
     while (rd32(cmu_cpu_va + 0x604u) != 0u)
         ;
-    /* APLL = 24 MHz * 125 / 3 / 1 = 1000 MHz (M=0x7d, P=3, S=0): ~42% less heat than 1400@1.25V */
+    /* APLL = 24 MHz * 125 / 3 / 1 = 1000 MHz (M=0x7d, P=3, S=0): cool & rock-solid across 4 SMP cores */
     wr32(cmu_cpu_va + 0x100u, 0x807d0300u);
     while (!(rd32(cmu_cpu_va + 0x100u) & (1u << 29)))
         ;
@@ -424,6 +444,7 @@ static void boost_apll_1000(void)
     while (rd32(cmu_cpu_va + 0x400u) & 0x04440004u)
         ;
     cur_cpu_opp = 2;
+    cur_buck2_code = 0x2au;
     exy_touch_log.apll = rd32(cmu_cpu_va + 0x100u);
 }
 
@@ -496,7 +517,7 @@ void exy_pmic_and_touch_init(void)
             for (uint8_t r = MAX77686_BUCK4DVS1; r < MAX77686_BUCK4DVS1 + 8u; r++)
                 pmic_write_reg(r, 0x26u);
             cur_buck4_code = 0x26u;
-            /* Set VDD_ARM (BUCK2) = 1.125V (0x2a) for thermally stable 1.0 GHz Exynos 4412 */
+            /* Set VDD_ARM (BUCK2) = 1.125V (0x2a) for rock-solid 1.0 GHz Exynos 4412 */
             int ok = 1;
             for (uint8_t r = MAX77686_BUCK2DVS1; r < MAX77686_BUCK2DVS1 + 8u; r++)
                 if (pmic_write_reg(r, 0x2au) != 0)
@@ -657,7 +678,6 @@ static void poll_mms114(void)
     exy_touch_log.irqs++;
     exy_touch_log.pkt0 = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
                          ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
-    exy_clean_line(&exy_touch_log);
 
     /* MMS114/136 on i9300 always emits 6-byte finger records (including 4-finger 24-byte packets). */
     uint32_t esz = (pkt_sz % 6u == 0u) ? 6u : 8u;
@@ -712,8 +732,6 @@ void exy_touch_poll(struct exy_touch_state *out)
 {
     exy_touch_log.polls++;
     exy_touch_log.last_ms = mct_lo() / 24000u;
-    if ((exy_touch_log.polls & 127u) == 1u)
-        exy_clean_line(&exy_touch_log.polls);
     exy_drv_otg_check();
     probe_tsp_once();
     uint32_t prev_seq = cur_state.seq;
@@ -797,11 +815,16 @@ static void emmc_set_clkdiv(uint32_t div)
         ;
 }
 
+#define touch_iosleep ((void (*)(uint32_t))0x80328fd1)
+
 static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int write)
 {
     const uint32_t MSHC_SPIN = 10000000u;
     const uint32_t MSHC_ERRS = 0xbfc2u;
     uint32_t bytes = n * 512u, i, st = 0;
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr" : "=r"(cpsr));
+    int can_sleep = !(cpsr & 0x80u) && mct != 0u;
 
     if (!exy_pl310)
         exy_pl310 = ml_io_map(PL310_PA, 0x1000);
@@ -859,16 +882,30 @@ static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int writ
                        (n > 1u ? ((1u << 12) | (write ? 25u : 18u)) : (write ? 24u : 17u)));
     wr32(mshc + 0x84u, 1u);          /* PLDMND */
 
+    uint32_t t0 = mct ? mct_lo() : 0u;
+    int dto_ok = 0;
     for (i = 0; i < MSHC_SPIN; i++) {
         st = rd32(mshc + 0x44u);
         if (st & MSHC_ERRS) {
             wr32(mshc + 0x00u, rd32(mshc + 0x00u) & ~(1u << 5));
             return st;
         }
-        if (st & (1u << 3)) /* DTO */
+        if (st & (1u << 3)) { /* DTO */
+            dto_ok = 1;
             break;
+        }
+        if (can_sleep) {
+            uint32_t el = mct_lo() - t0;
+            if (el >= 24000u * 2000u)
+                break;
+            /* Fast-poll up to 4 ms (covers full 64 KiB HS reads at ~15+ MB/s without IOSleep stalls). */
+            if (el >= 24u * 4000u)
+                touch_iosleep(1u);
+            else
+                __asm__ volatile("yield" ::: "memory");
+        }
     }
-    if (i >= MSHC_SPIN) {
+    if (!dto_ok) {
         wr32(mshc + 0x00u, rd32(mshc + 0x00u) & ~(1u << 5));
         return st | (1u << 31);
     }
@@ -878,8 +915,19 @@ static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int writ
         ;
     for (; n > 1u && i < MSHC_SPIN && !(rd32(mshc + 0x44u) & (1u << 14)); i++) /* ACD */
         ;
-    for (; write && i < MSHC_SPIN && (rd32(mshc + 0x48u) & (1u << 9)); i++) /* card prog */
-        ;
+    if (write && i < MSHC_SPIN) {
+        uint32_t tw = mct ? mct_lo() : 0u;
+        for (; i < MSHC_SPIN && (rd32(mshc + 0x48u) & (1u << 9)); i++) { /* card prog */
+            if (can_sleep) {
+                uint32_t el = mct_lo() - tw;
+                if (el >= 24000u * 2000u) { i = MSHC_SPIN; break; }
+                if (el >= 24u * 1500u)
+                    touch_iosleep(1u);
+                else
+                    __asm__ volatile("yield" ::: "memory");
+            }
+        }
+    }
 
     wr32(mshc + 0x8cu, 0xffffffffu);
     wr32(mshc + 0x00u, rd32(mshc + 0x00u) & ~(1u << 5));

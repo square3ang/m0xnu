@@ -355,6 +355,10 @@ int exy_halt_restart(unsigned type)
             __asm__ volatile("dsb" ::: "memory");
         }
     }
+    /* Restore full boot voltages before warm reset so U-Boot (800 MHz) never browns out. */
+    extern void exy_cpu_prep_reboot(void) __attribute__((weak));
+    if (exy_cpu_prep_reboot)
+        exy_cpu_prep_reboot();
     /* Flush recent console/panic log lines from L1/L2 to DRAM before WDT reset. */
     extern void exy_log_flush(void);
     exy_log_flush();
@@ -494,6 +498,13 @@ static void md1_add(void)
 }
 
 /* Replaces mdevbdevsw.d_strategy. */
+#define shim_iolock_alloc   ((void *(*)(void))0x8032969d)
+#define shim_iolock_mach    ((void *(*)(void *))0x80329749)
+#define shim_lck_mtx_lock   ((void (*)(void *))0x800c2ae9)
+#define shim_lck_mtx_unlock ((void (*)(void *))0x800c2b79)
+static void *emmc_mtx;
+volatile uint32_t exy_last_emmc_mct;
+
 __attribute__((section(".drv.text")))
 void exy_md_strategy(buf_t bp)
 {
@@ -519,24 +530,39 @@ void exy_md_strategy(buf_t bp)
         err = 22;  /* EINVAL: never touch sectors outside the partition */
     else if (count && (map_err = buf_map(bp, &va)) == 0) {
         uint32_t lba = base + (uint32_t)(off >> 9), st, sum = 0;
+        /* Use an XNU mutex so IRQ/FIQ (VSYNC, scheduler, IPIs) stay unmasked across eMMC I/O. */
+        if (!emmc_mtx) {
+            void *l = shim_iolock_alloc();
+            void *m = l ? shim_iolock_mach(l) : 0;
+            if (m)
+                (void)__sync_val_compare_and_swap(&emmc_mtx, (void *)0, m);
+        }
+        uint32_t cpsr = 0;
+        int used_mtx = (emmc_mtx != 0);
+        if (used_mtx) {
+            shim_lck_mtx_lock(emmc_mtx);
+        } else {
+            __asm__ volatile("mrs %0, cpsr\ncpsid if" : "=r"(cpsr) :: "memory");
+            spin_lock(&emmc_lock);
+        }
         uint32_t t0 = rd(mct + G_CNT_L);
-        /* Mask IRQ/FIQ on this CPU while holding emmc_lock so preemptive SMP timer FIQ
-         * can never context-switch away from the lock holder and self-deadlock on the same CPU. */
-        uint32_t cpsr;
-        __asm__ volatile("mrs %0, cpsr\ncpsid if" : "=r"(cpsr) :: "memory");
-        spin_lock(&emmc_lock);
+        exy_last_emmc_mct = t0;
         if ((st = exy_emmc_idma_xfer(lba, count >> 9, va, write)) &&
             (st = emmc_xfer(lba, count >> 9, va, write))) {
             exy_emmc_log.errors++;
             err = 5;  /* EIO */
         }
-        exy_emmc_log.pad[0] += rd(mct + G_CNT_L) - t0; /* total MCT ticks (24 MHz) spent in emmc_xfer */
+        exy_emmc_log.pad[0] += rd(mct + G_CNT_L) - t0; /* hardware transfer ticks (excluding mutex wait) */
         exy_emmc_log.pad[1] += count;                  /* total bytes transferred */
         uint32_t idx = exy_emmc_log.reads++;
         uint32_t *r = exy_emmc_log.ring[idx % 64];
         r[0] = lba; r[1] = count | (uint32_t)write << 31; r[2] = sum; r[3] = st;
-        spin_unlock(&emmc_lock);
-        __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+        if (used_mtx) {
+            shim_lck_mtx_unlock(emmc_mtx);
+        } else {
+            spin_unlock(&emmc_lock);
+            __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+        }
         buf_unmap(bp);
     } else if (count) {
         err = 5;
@@ -602,6 +628,8 @@ static uint32_t aic_bits(uint32_t w, uint32_t v)
     return v;
 }
 
+extern int exy_mali_try_irq(uint32_t gic_id) __attribute__((weak));
+
 static uint32_t aic_iack(void)
 {
     uint32_t me = cur_cpu_id();
@@ -620,6 +648,10 @@ static uint32_t aic_iack(void)
             return AIC_IACK_IPI | AIC_IACK_OTHER;
         }
         if (id < 32) {
+            wr(my_gicc + GICC_EOIR, iar);
+            continue;
+        }
+        if (id >= 155u && id <= 159u && exy_mali_try_irq && exy_mali_try_irq(id)) {
             wr(my_gicc + GICC_EOIR, iar);
             continue;
         }
@@ -815,12 +847,6 @@ void exy_putc(char c)
     }
     if (c == '\n') {
         line_start = p + 1u;
-        static uint32_t nl_cnt;
-        if ((++nl_cnt & 15u) == 0u) {
-            clean_line(slot);
-            clean_line(&exy_log);
-            __asm__ volatile("dsb" ::: "memory");
-        }
     }
 }
 
@@ -876,7 +902,17 @@ void exy_set_decrementer(uint32_t v, uint32_t b, uint32_t c, uint8_t *cpu)
             wr(wdt + WTCNT, rd(wdt + WTDAT));
     }
 
+    uint32_t lr = (uint32_t)(uintptr_t)__builtin_return_address(0);
     exy_dbg.sets++;
+    exy_dbg.v = v;
+    exy_dbg.deadline = lr;
+    if (lr == 0x800bd4cdu) exy_dbg.cnt++;   /* machine_idle exit */
+    if (lr == 0x800cbe33u) exy_dbg.comp++;  /* idle_timeout entry */
+    exy_dbg.pad[id]++;
+    if (v <= 2400u) {
+        exy_dbg.pad[4]++;
+        exy_dbg.pad[5] = lr;
+    }
 }
 
 /* Patched into AMFI init (0x807650da) in place of storing NULL to loaded_trust_caches. */

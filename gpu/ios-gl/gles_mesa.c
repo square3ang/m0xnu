@@ -18,8 +18,13 @@
 
 extern uint32_t mali_iokit_conn;
 extern void mali_wait_idle(void);
+extern void mali_wait_seq(uint32_t target_seq);
+extern uint32_t mali_get_last_enq_seq(void);
 extern void mali_zero_wc(void *dst, size_t n);
 extern __thread int lima_force_linear;
+extern __thread uint32_t lima_external_va;
+extern __thread int lima_skip_bo_zero;
+extern uint32_t lima_next_bo_gen(void);
 extern int IOConnectCallScalarMethod(uint32_t connection, uint32_t selector,
                                      const uint64_t *input, uint32_t inputCnt,
                                      uint64_t *output, uint32_t *outputCnt);
@@ -67,9 +72,15 @@ void mali_log(const char *fmt, ...)
 #include "state_tracker/st_context.h"
 #include "util/u_inlines.h"
 struct lima_context;
+struct lima_screen;
 #include "lima_resource.h"
 #include "lima_bo.h"
 extern void lima_flush_job_accessing_bo(struct lima_context *ctx, struct lima_bo *bo, bool write);
+extern struct lima_bo *lima_bo_create_external(struct lima_screen *screen, uint32_t va, uint32_t size);
+#define MALI_LIMA_GEM_WAIT_WRITE 0x02u
+#define MALI_ZC_MAX_BYTES        0x00500000u
+
+static uint32_t map_iosurf_zc_va(void *surf, uint32_t w, uint32_t h, uint32_t *out_bpr);
 #include "dispatch.h"
 
 /* ObjC runtime (libobjc.A.dylib) */
@@ -292,7 +303,6 @@ static int is_backboardd_proc(void);
 static void *g_fast_gli = NULL;
 static struct mali_gles_ctx *g_fast_ctx = NULL;
 static uintptr_t g_fast_tid = 0;
-static int g_ctx_active = 0;
 static void *g_tramp_targets[GLD_DISP_COUNT];
 extern struct {
     void *gli;
@@ -320,55 +330,63 @@ static void mali_ensure_current_by_gli(void *gli_ctx)
         return;
     pthread_mutex_lock(&gles_mtx);
     struct mali_gles_ctx *c = find_ctx_locked(gli_ctx);
-    int single = (g_ctx_active == 1);
+    if (c && !g_tramp_fast.targets) {
+        int bb_ne = is_backboardd_proc();
+        for (uint32_t i = 0; i < GLD_DISP_COUNT; i++) {
+            void *fn = gld_disp_entries[i].target;
+            if (bb_ne) {
+                if (fn == (void *)_mesa_Viewport) fn = (void *)_mesa_Viewport_no_error;
+                else if (fn == (void *)_mesa_ActiveTexture) fn = (void *)_mesa_ActiveTexture_no_error;
+                else if (fn == (void *)_mesa_BlendFunc) fn = (void *)_mesa_BlendFunc_no_error;
+                else if (fn == (void *)_mesa_BlendFuncSeparate) fn = (void *)_mesa_BlendFuncSeparate_no_error;
+                else if (fn == (void *)_mesa_BlendEquationSeparate) fn = (void *)_mesa_BlendEquationSeparate_no_error;
+                else if (fn == (void *)_mesa_BindBuffer) fn = (void *)_mesa_BindBuffer_no_error;
+                else if (fn == (void *)_mesa_BufferData) fn = (void *)_mesa_BufferData_no_error;
+                else if (fn == (void *)_mesa_BufferSubData) fn = (void *)_mesa_BufferSubData_no_error;
+                else if (fn == (void *)_mesa_UseProgram) fn = (void *)_mesa_UseProgram_no_error;
+                else if (fn == (void *)_mesa_VertexAttribPointer) fn = (void *)_mesa_VertexAttribPointer_no_error;
+                else if (fn == (void *)_mesa_EnableVertexAttribArray) fn = (void *)_mesa_EnableVertexAttribArray_no_error;
+                else if (fn == (void *)_mesa_DisableVertexAttribArray) fn = (void *)_mesa_DisableVertexAttribArray_no_error;
+                else if (fn == (void *)_mesa_CullFace) fn = (void *)_mesa_CullFace_no_error;
+                else if (fn == (void *)_mesa_FrontFace) fn = (void *)_mesa_FrontFace_no_error;
+                else if (fn == (void *)_mesa_StencilFunc) fn = (void *)_mesa_StencilFunc_no_error;
+                else if (fn == (void *)_mesa_StencilOp) fn = (void *)_mesa_StencilOp_no_error;
+                else if (fn == (void *)_mesa_StencilFuncSeparate) fn = (void *)_mesa_StencilFuncSeparate_no_error;
+                else if (fn == (void *)_mesa_StencilOpSeparate) fn = (void *)_mesa_StencilOpSeparate_no_error;
+                else if (fn == (void *)_mesa_StencilMaskSeparate) fn = (void *)_mesa_StencilMaskSeparate_no_error;
+                else if (fn == (void *)_mesa_PixelStorei) fn = (void *)_mesa_PixelStorei_no_error;
+                else if (fn == (void *)_mesa_DepthFunc) fn = (void *)_mesa_DepthFunc_no_error;
+                else if (fn == (void *)_mesa_BindVertexArray) fn = (void *)_mesa_BindVertexArray_no_error;
+                else if (fn == (void *)_mesa_BlitFramebuffer) fn = (void *)_mesa_BlitFramebuffer_no_error;
+                else if (fn == (void *)_mesa_GetUniformLocation) fn = (void *)_mesa_GetUniformLocation_no_error;
+                else if (fn == (void *)_mesa_MapBufferRange) fn = (void *)_mesa_MapBufferRange_no_error;
+                else if (fn == (void *)_mesa_UnmapBuffer) fn = (void *)_mesa_UnmapBuffer_no_error;
+            }
+            g_tramp_targets[i] = fn;
+        }
+        __asm__ volatile("dmb ish" ::: "memory");
+        g_tramp_fast.targets = g_tramp_targets;
+    }
     pthread_mutex_unlock(&gles_mtx);
     if (c && c->st) {
         st_api_make_current(c->st, NULL, NULL);
         tls_cur_gli = gli_ctx;
         tls_cur_ctx = c;
-        if (single) {
-            if (!g_tramp_fast.targets) {
-                int bb_ne = is_backboardd_proc();
-                for (uint32_t i = 0; i < GLD_DISP_COUNT; i++) {
-                    void *fn = gld_disp_entries[i].target;
-                    if (bb_ne) {
-                        if (fn == (void *)_mesa_Viewport) fn = (void *)_mesa_Viewport_no_error;
-                        else if (fn == (void *)_mesa_ActiveTexture) fn = (void *)_mesa_ActiveTexture_no_error;
-                        else if (fn == (void *)_mesa_BlendFunc) fn = (void *)_mesa_BlendFunc_no_error;
-                        else if (fn == (void *)_mesa_BlendFuncSeparate) fn = (void *)_mesa_BlendFuncSeparate_no_error;
-                        else if (fn == (void *)_mesa_BlendEquationSeparate) fn = (void *)_mesa_BlendEquationSeparate_no_error;
-                        else if (fn == (void *)_mesa_BindBuffer) fn = (void *)_mesa_BindBuffer_no_error;
-                        else if (fn == (void *)_mesa_BufferData) fn = (void *)_mesa_BufferData_no_error;
-                        else if (fn == (void *)_mesa_BufferSubData) fn = (void *)_mesa_BufferSubData_no_error;
-                        else if (fn == (void *)_mesa_UseProgram) fn = (void *)_mesa_UseProgram_no_error;
-                        else if (fn == (void *)_mesa_VertexAttribPointer) fn = (void *)_mesa_VertexAttribPointer_no_error;
-                        else if (fn == (void *)_mesa_EnableVertexAttribArray) fn = (void *)_mesa_EnableVertexAttribArray_no_error;
-                        else if (fn == (void *)_mesa_DisableVertexAttribArray) fn = (void *)_mesa_DisableVertexAttribArray_no_error;
-                        else if (fn == (void *)_mesa_CullFace) fn = (void *)_mesa_CullFace_no_error;
-                        else if (fn == (void *)_mesa_FrontFace) fn = (void *)_mesa_FrontFace_no_error;
-                        else if (fn == (void *)_mesa_StencilFunc) fn = (void *)_mesa_StencilFunc_no_error;
-                        else if (fn == (void *)_mesa_StencilOp) fn = (void *)_mesa_StencilOp_no_error;
-                        else if (fn == (void *)_mesa_StencilFuncSeparate) fn = (void *)_mesa_StencilFuncSeparate_no_error;
-                        else if (fn == (void *)_mesa_StencilOpSeparate) fn = (void *)_mesa_StencilOpSeparate_no_error;
-                        else if (fn == (void *)_mesa_StencilMaskSeparate) fn = (void *)_mesa_StencilMaskSeparate_no_error;
-                        else if (fn == (void *)_mesa_PixelStorei) fn = (void *)_mesa_PixelStorei_no_error;
-                        else if (fn == (void *)_mesa_DepthFunc) fn = (void *)_mesa_DepthFunc_no_error;
-                        else if (fn == (void *)_mesa_BindVertexArray) fn = (void *)_mesa_BindVertexArray_no_error;
-                        else if (fn == (void *)_mesa_BlitFramebuffer) fn = (void *)_mesa_BlitFramebuffer_no_error;
-                        else if (fn == (void *)_mesa_GetUniformLocation) fn = (void *)_mesa_GetUniformLocation_no_error;
-                        else if (fn == (void *)_mesa_MapBufferRange) fn = (void *)_mesa_MapBufferRange_no_error;
-                        else if (fn == (void *)_mesa_UnmapBuffer) fn = (void *)_mesa_UnmapBuffer_no_error;
-                    }
-                    g_tramp_targets[i] = fn;
-                }
-                g_tramp_fast.targets = g_tramp_targets;
-            }
-            g_fast_tid = fast_cur_tid();
-            g_fast_ctx = c;
-            g_fast_gli = gli_ctx;
-            g_tramp_fast.tid = g_fast_tid;
-            g_tramp_fast.gli = gli_ctx;
-        }
+        /* Keep MRU fast-path active even in multi-context processes (e.g. SpringBoard):
+         * clear gli and tid before updating ctx so concurrent threads never observe a torn pair. */
+        g_tramp_fast.gli = NULL;
+        g_fast_gli = NULL;
+        g_fast_tid = 0;
+        g_tramp_fast.tid = 0;
+        __asm__ volatile("dmb ish" ::: "memory");
+        uintptr_t tid = fast_cur_tid();
+        g_fast_ctx = c;
+        __asm__ volatile("dmb ish" ::: "memory");
+        g_fast_tid = tid;
+        g_tramp_fast.tid = tid;
+        __asm__ volatile("dmb ish" ::: "memory");
+        g_fast_gli = gli_ctx;
+        g_tramp_fast.gli = gli_ctx;
     }
 }
 
@@ -377,12 +395,12 @@ void *mali_prepare_call(void *gli_ctx, uint32_t idx)
     if (__builtin_expect(!gli_ctx || (gli_ctx == g_fast_gli && fast_cur_tid() == g_fast_tid), 1)) {
         if (__builtin_expect(idx >= GLD_DISP_COUNT, 0))
             return (void *)wrap_Noop;
-        return gld_disp_entries[idx].target;
+        return g_tramp_fast.targets ? g_tramp_fast.targets[idx] : gld_disp_entries[idx].target;
     }
     mali_ensure_current_by_gli(gli_ctx);
     if (idx >= GLD_DISP_COUNT)
         return (void *)wrap_Noop;
-    return gld_disp_entries[idx].target;
+    return g_tramp_fast.targets ? g_tramp_fast.targets[idx] : gld_disp_entries[idx].target;
 }
 
 static int is_backboardd_proc(void);
@@ -563,14 +581,6 @@ void *mali_gles_create_context(void *gli_ctx, void *shared_st)
         slot->st = st;
         slot->sw = -1;
         slot->sh = -1;
-        g_ctx_active++;
-        if (g_ctx_active != 1) {
-            g_fast_gli = NULL;
-            g_fast_ctx = NULL;
-            g_fast_tid = 0;
-            g_tramp_fast.gli = NULL;
-            g_tramp_fast.tid = 0;
-        }
     }
     pthread_mutex_unlock(&gles_mtx);
     return st;
@@ -578,25 +588,29 @@ void *mali_gles_create_context(void *gli_ctx, void *shared_st)
 
 void mali_gles_destroy_context(void *gli_ctx)
 {
+    struct st_context *old_st = NULL;
     pthread_mutex_lock(&gles_mtx);
     struct mali_gles_ctx *c = find_ctx_locked(gli_ctx);
     if (c) {
+        g_tramp_fast.gli = NULL;
         g_fast_gli = NULL;
+        __asm__ volatile("dmb ish" ::: "memory");
         g_fast_ctx = NULL;
         g_fast_tid = 0;
-        g_tramp_fast.gli = NULL;
         g_tramp_fast.tid = 0;
-        if (g_ctx_active > 0)
-            g_ctx_active--;
+        old_st = c->st;
         if (tls_cur_gli == gli_ctx) {
             st_api_make_current(NULL, NULL, NULL);
             tls_cur_gli = NULL;
             tls_cur_ctx = NULL;
         }
-        /* shortcut: leak st_context on teardown to avoid shared-group destroy race during boot. */
         memset(c, 0, sizeof(*c));
     }
     pthread_mutex_unlock(&gles_mtx);
+    if (old_st) {
+        mali_wait_idle();
+        st_destroy_context(old_st);
+    }
 }
 
 void mali_gles_install_dispatch(void *eagl_priv)
@@ -767,7 +781,10 @@ static struct pipe_resource *ensure_scanout_res(struct pipe_screen *scr, uint32_
     tmpl.depth0 = 1;
     tmpl.array_size = 1;
     tmpl.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
+    /* Zero-pool-byte external BO pointing directly at double-buffered FIMD0 scanout (0x03000000/0x03400000). */
+    lima_external_va = 0x03000000u + idx * 0x00400000u;
     struct pipe_resource *r = scr->resource_create(scr, &tmpl);
+    lima_external_va = 0u;
     if (!r)
         return NULL;
     struct lima_resource *lres = lima_resource(r);
@@ -775,7 +792,6 @@ static struct pipe_resource *ensure_scanout_res(struct pipe_screen *scr, uint32_
         pipe_resource_reference(&r, NULL);
         return NULL;
     }
-    /* Redirect BO VA to the double-buffered 4 MiB FIMD0 scanout buffers mapped at 0x03000000/0x03400000. */
     lres->bo->va = 0x03000000u + idx * 0x00400000u;
     lres->tiled = false;
     lres->levels[0].stride = 720u * 4u;
@@ -819,7 +835,9 @@ static struct pipe_resource *ensure_zc_blit_res(struct pipe_screen *scr, uint32_
         tmpl.depth0 = 1;
         tmpl.array_size = 1;
         tmpl.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
+        lima_external_va = zc_va;
         struct pipe_resource *r = scr->resource_create(scr, &tmpl);
+        lima_external_va = 0u;
         if (!r)
             return NULL;
         struct lima_resource *lr = lima_resource(r);
@@ -842,7 +860,7 @@ static struct pipe_resource *ensure_zc_blit_res(struct pipe_screen *scr, uint32_
 }
 
 static uint32_t g_bb_bindfbs, g_bb_clears;
-static uint32_t g_sc_log = 0, g_fl_log = 0;
+static uint32_t g_sc_log = 0, g_fl_log = 0, g_fl_checks = 0;
 
 static int flush_current_fbo_iosurf(char tag)
 {
@@ -898,7 +916,7 @@ static int flush_current_fbo_iosurf(char tag)
 
     for (int k = 0; k < nsnaps; k++) {
         struct dirty_snap *s = &snaps[k];
-        uint32_t t0 = (g_sc_log < 24u || g_fl_log < 16u) ? now_ms() : 0u;
+        uint32_t t0 = (g_sc_log < 24u || (g_fl_log < 16u && g_fl_checks < 64u)) ? now_ms() : 0u;
 
         /* Fast Path A: backboardd 720x1280 display swapchain -> zero-copy direct FIMD0 scanout. */
         if (is_bb && s->w == 720u && s->h == 1280u && s->pt && c->st->pipe && mali_iokit_conn) {
@@ -1127,10 +1145,12 @@ static int flush_current_fbo_iosurf(char tag)
         int copied_direct = 0;
         if (s->pt) {
             struct lima_resource *lres = lima_resource(s->pt);
-            if (lres && !lres->tiled && lres->bo) {
-                uint8_t *src_base = (uint8_t *)lima_bo_map(lres->bo);
+            if (lres && !lres->tiled && lres->bo && !(lres->bo->handle & 0x80000000u)) {
                 uint32_t src_stride = lres->levels[0].stride;
                 uint32_t src_off = lres->levels[0].offset;
+                uint8_t *src_base = ((size_t)src_off + (size_t)s->h * src_stride <= lres->bo->size)
+                    ? (uint8_t *)lima_bo_map(lres->bo)
+                    : NULL;
                 int is_bgra = (s->pt->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
                                s->pt->format == PIPE_FORMAT_B8G8R8X8_UNORM);
                 int is_1bpp = (s->pt->format == PIPE_FORMAT_A8_UNORM ||
@@ -1212,7 +1232,8 @@ static int flush_current_fbo_iosurf(char tag)
             }
             pthread_mutex_unlock(&gles_mtx);
         }
-        if (g_fl_log < 16u) {
+        if (g_fl_log < 16u && g_fl_checks < 64u) {
+            g_fl_checks++;
             uint32_t t2 = now_ms();
             if ((t2 - t0) >= 15u) {
                 uint32_t mid_px = 0;
@@ -1447,6 +1468,70 @@ void wrap_FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLui
         set_fbo_color0(c->bound_fbo, 0, tex);
     if (is_backboardd_proc()) _mesa_FramebufferTexture2D_no_error(target, att, textarget, tex, level);
     else _mesa_FramebufferTexture2D(target, att, textarget, tex, level);
+
+    /* Promote non-backboardd GL_TEXTURE_2D IOSurface FBO color targets (e.g. SpringBoard 720x1280/744x1392)
+     * to zero-copy zc_va so Mali PP renders directly into IOSurface RAM instead of WC CPU readback. */
+    if (!is_backboardd_proc() && c && c->st && c->st->ctx && att == GL_COLOR_ATTACHMENT0 &&
+        level == 0 && tex != 0 && mali_iokit_conn) {
+        void *surf = NULL;
+        uint32_t w = 0, h = 0, invert = 0;
+        pthread_mutex_lock(&gles_mtx);
+        struct iosurf_binding *b = find_iosurf_locked(0, tex);
+        if (b && b->surf && !b->zc_va && b->fmt == 0x80e1u && b->type == GL_UNSIGNED_BYTE &&
+            (uint64_t)b->w * (uint64_t)b->h >= 65536ull) {
+            surf = b->surf;
+            w = b->w;
+            h = b->h;
+            invert = b->invert;
+            CFRetain(surf);
+        }
+        pthread_mutex_unlock(&gles_mtx);
+        if (surf) {
+            uint32_t zc_bpr = 0u;
+            uint32_t zc_va = map_iosurf_zc_va(surf, w, h, &zc_bpr);
+            if (zc_va) {
+                struct pipe_resource *pt = NULL;
+                if (c->st->ctx->DrawBuffer) {
+                    struct gl_renderbuffer *rb = c->st->ctx->DrawBuffer->Attachment[BUFFER_COLOR0].Renderbuffer;
+                    if (rb) pt = rb->texture;
+                }
+                struct lima_resource *lres = pt ? lima_resource(pt) : NULL;
+                if (!invert && lres && !lres->tiled && lres->bo) {
+                    if (!(lres->bo->handle & 0x80000000u)) {
+                        lima_flush_job_accessing_bo((struct lima_context *)c->st->pipe, lres->bo, true);
+                        struct lima_bo *ext = lima_bo_create_external((struct lima_screen *)pt->screen,
+                                                                      zc_va, lres->bo->size);
+                        if (ext) {
+                            lima_bo_unreference(lres->bo);
+                            lres->bo = ext;
+                            lres->levels[0].stride = zc_bpr;
+                            lres->levels[0].offset = 0u;
+                            lres->bo_gen = lima_next_bo_gen();
+                        } else {
+                            zc_va = 0u;
+                        }
+                    } else {
+                        lres->bo->va = zc_va;
+                        lres->levels[0].stride = zc_bpr;
+                        lres->levels[0].offset = 0u;
+                        lres->bo_gen = lima_next_bo_gen();
+                    }
+                }
+                if (zc_va) {
+                    pthread_mutex_lock(&gles_mtx);
+                    struct iosurf_binding *b2 = find_iosurf_locked(0, tex);
+                    if (b2 && b2->surf == surf) {
+                        b2->zc_va = zc_va;
+                        b2->zc_bpr = zc_bpr;
+                        if (pt && pt != b2->pt)
+                            pipe_resource_reference(&b2->pt, pt);
+                    }
+                    pthread_mutex_unlock(&gles_mtx);
+                }
+            }
+            CFRelease(surf);
+        }
+    }
 }
 
 void wrap_DeleteFramebuffers(GLsizei n, const GLuint *fbs)
@@ -2000,32 +2085,16 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
 
         uint32_t zc_va = 0u, zc_bpr = 0u;
         struct pipe_resource *rb_pt = NULL;
-        size_t nplanes = IOSurfaceGetPlaneCount(surf);
-        int can_zc = (!is_backboardd_proc() && (uint64_t)w * (uint64_t)h >= 65536ull &&
-                      mali_iokit_conn && glctx && nplanes == 0);
-        if (can_zc && IOSurfaceLock(surf, 0, NULL) == 0) {
-            uintptr_t ubase = (uintptr_t)IOSurfaceGetBaseAddress(surf);
-            size_t bpr = IOSurfaceGetBytesPerRow(surf);
-            size_t sz = ((size_t)h * bpr + 0xfffu) & ~0xfffu;
-            if (ubase && (ubase & 0xfffu) == 0u && bpr >= (size_t)w * 4u &&
-                (bpr & 7u) == 0u && sz > 0u && sz <= 0x00400000u) {
-                for (size_t off = 0; off < sz; off += 4096u)
-                    ((volatile uint8_t *)ubase)[off] = ((volatile uint8_t *)ubase)[off];
-                uint64_t in[3] = { (uint64_t)ubase, (uint64_t)sz, 1u };
-                uint64_t gva = 0;
-                uint32_t cnt = 1;
-                if (IOConnectCallScalarMethod(mali_iokit_conn, 10u, in, 3, &gva, &cnt) == 0 && gva) {
-                    zc_va = (uint32_t)gva;
-                    zc_bpr = (uint32_t)bpr;
-                }
-            }
-            IOSurfaceUnlock(surf, 0, NULL);
-        }
+        if (!is_backboardd_proc() && glctx)
+            zc_va = map_iosurf_zc_va(surf, w, h, &zc_bpr);
         /* For invert==1 + zc_va, keep app RB tiled for faster Mali-400 3D rendering and HW Y-flip blit to zc_va.
-         * For invert==0 + zc_va (direct scanout) or CPU fallback, allocate linear RB. */
+         * For invert==0 + zc_va, allocate 0-pool-byte external BO pointing directly at zc_va. */
         int prev_lin = lima_force_linear;
         lima_force_linear = (zc_va && invert) ? 0 : 1;
+        if (zc_va && !invert)
+            lima_external_va = zc_va;
         _mesa_RenderbufferStorage(GL_RENDERBUFFER, 0x93a1 /* GL_BGRA8_EXT */, (GLsizei)w, (GLsizei)h);
+        lima_external_va = 0u;
         lima_force_linear = prev_lin;
         if (zc_va && glctx) {
             struct gl_renderbuffer *rb = glctx->CurrentRenderbuffer;
@@ -2099,16 +2168,17 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
             size_t row_bytes = (size_t)w * bpp;
             if (base && bpr >= row_bytes) {
                 int uploaded_direct = 0;
-                /* Zero-copy lookup ONLY for surfaces created as pure-GPU GL_RENDERBUFFER (never CPU-drawn GL_TEXTURE_2D). */
+                /* Zero-copy lookup ONLY for large surfaces created as GPU ZC (>=65536 px, <=5 MiB). */
                 uint64_t zc_tex_va = 0;
                 if (is_backboardd_proc() && !invert && nplanes == 0 && m_fmt == 0x80e1u &&
-                    m_type == GL_UNSIGNED_BYTE && ((uintptr_t)base & 0xfffu) == 0u &&
-                    (bpr & 7u) == 0u && mali_iokit_conn) {
-                    size_t sz = ((size_t)h * bpr + 0xfffu) & ~0xfffu;
-                    if (sz > 0u && sz <= 0x00400000u) {
+                    m_type == GL_UNSIGNED_BYTE && (uint64_t)w * (uint64_t)h >= 65536ull &&
+                    ((uintptr_t)base & 0xfffu) == 0u && (bpr & 7u) == 0u && mali_iokit_conn) {
+                    size_t img_bytes = (size_t)h * bpr;
+                    size_t sz = (img_bytes + 0xfffu) & ~0xfffu;
+                    if (img_bytes > 0u && sz > 0u && sz <= MALI_ZC_MAX_BYTES) {
                         (void)((volatile const uint8_t *)base)[0];
                         (void)((volatile const uint8_t *)base)[(sz >> 1) & ~0xfffu];
-                        (void)((volatile const uint8_t *)base)[sz - 1u];
+                        (void)((volatile const uint8_t *)base)[img_bytes - 1u];
                         uint64_t in[3] = { (uint64_t)(uintptr_t)base, (uint64_t)sz, 0u };
                         uint32_t cnt = 1;
                         (void)IOConnectCallScalarMethod(mali_iokit_conn, 10u, in, 3, &zc_tex_va, &cnt);
@@ -2119,13 +2189,34 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                      m_fmt == GL_LUMINANCE || m_fmt == 0x1903u)) {
                     struct gl_texture_image *timg = texObj->Image[0][0];
                     struct pipe_resource *pt = (timg && timg->pt) ? timg->pt : texObj->pt;
-                    int pt_was_zc = (pt && lima_resource(pt)->bo && lima_resource(pt)->bo->va >= 0x80000000u);
+                    int pt_was_zc = (pt && lima_resource(pt)->bo &&
+                                     ((lima_resource(pt)->bo->handle & 0x80000000u) ||
+                                      lima_resource(pt)->bo->va >= 0x80000000u));
+                    int force_realloc = (pt && (lima_resource(pt)->tiled || (!zc_tex_va && pt_was_zc)));
                     if (!pt || pt->width0 != w || pt->height0 != h || pt->last_level != 0 ||
-                        !timg || timg->pt != pt || !iosurf_pipe_fmt_ok(pt->format, m_ifmt, m_fmt, m_type) ||
-                        (!zc_tex_va && pt_was_zc)) {
+                        !timg || timg->pt != pt || force_realloc ||
+                        !iosurf_pipe_fmt_ok(pt->format, m_ifmt, m_fmt, m_type)) {
+                        if (force_realloc) {
+                            /* st_AllocTextureImageBuffer reuses texObj->pt when dims/format match;
+                             * drop stale external/tiled pt first so Mesa allocates a fresh linear BO. */
+                            struct lima_resource *old_lres = lima_resource(pt);
+                            if (old_lres && old_lres->bo)
+                                lima_flush_job_accessing_bo((struct lima_context *)tls_cur_ctx->st->pipe,
+                                                            old_lres->bo, false);
+                            pipe_resource_reference(&texObj->pt, NULL);
+                            if (timg)
+                                pipe_resource_reference(&timg->pt, NULL);
+                        }
                         int prev_lin = lima_force_linear;
+                        int prev_sz = lima_skip_bo_zero;
                         lima_force_linear = 1;
+                        if (zc_tex_va)
+                            lima_external_va = (uint32_t)zc_tex_va;
+                        else
+                            lima_skip_bo_zero = 1;
                         _mesa_TexImage2D(GL_TEXTURE_2D, 0, m_ifmt, (GLsizei)w, (GLsizei)h, 0, m_fmt, m_type, NULL);
+                        lima_external_va = 0u;
+                        lima_skip_bo_zero = prev_sz;
                         lima_force_linear = prev_lin;
                         timg = texObj->Image[0][0];
                         pt = (timg && timg->pt) ? timg->pt : texObj->pt;
@@ -2134,18 +2225,43 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                         iosurf_pipe_fmt_ok(pt->format, m_ifmt, m_fmt, m_type)) {
                         struct lima_resource *lres = lima_resource(pt);
                         if (zc_tex_va && lres && !lres->tiled && lres->bo) {
-                            if (lres->bo->va != (uint32_t)zc_tex_va)
+                            if (lres->bo->va != (uint32_t)zc_tex_va || !(lres->bo->handle & 0x80000000u)) {
                                 lima_flush_job_accessing_bo((struct lima_context *)tls_cur_ctx->st->pipe, lres->bo, false);
-                            lres->bo->va = (uint32_t)zc_tex_va;
+                                if (!(lres->bo->handle & 0x80000000u)) {
+                                    struct lima_bo *ext = lima_bo_create_external((struct lima_screen *)pt->screen,
+                                                                                  (uint32_t)zc_tex_va, lres->bo->size);
+                                    if (ext) {
+                                        lima_bo_unreference(lres->bo);
+                                        lres->bo = ext;
+                                    }
+                                }
+                                lres->bo->va = (uint32_t)zc_tex_va;
+                                lres->bo_gen = lima_next_bo_gen();
+                            }
                             lres->bo->cacheable = false;
                             lres->levels[0].stride = (uint32_t)bpr;
                             lres->levels[0].offset = 0u;
                             tex_pt = pt;
                             uploaded_direct = 1;
-                        } else if (lres && !lres->tiled && lres->bo && lres->levels[0].stride >= row_bytes) {
+                        } else if (lres && !lres->tiled && lres->bo &&
+                                   !(lres->bo->handle & 0x80000000u) &&
+                                   lres->levels[0].stride >= row_bytes &&
+                                   (size_t)lres->levels[0].offset + (size_t)h * lres->levels[0].stride <= lres->bo->size) {
                             lima_flush_job_accessing_bo((struct lima_context *)tls_cur_ctx->st->pipe,
                                                         lres->bo, true);
-                            mali_wait_idle();
+                            if (!lima_bo_wait(lres->bo, MALI_LIMA_GEM_WAIT_WRITE, 0)) {
+                                struct lima_bo *new_bo = lres->bo->cacheable
+                                    ? lima_bo_create((struct lima_screen *)pt->screen,
+                                                     lres->bo->size, lres->bo->flags | 0x80000000u)
+                                    : NULL;
+                                if (new_bo) {
+                                    lima_bo_unreference(lres->bo);
+                                    lres->bo = new_bo;
+                                    lres->bo_gen = lima_next_bo_gen();
+                                } else {
+                                    lima_bo_wait(lres->bo, MALI_LIMA_GEM_WAIT_WRITE, UINT64_MAX);
+                                }
+                            }
                             uint8_t *dst_base = (uint8_t *)lima_bo_map(lres->bo);
                             if (dst_base) {
                                 uint32_t dst_stride = lres->levels[0].stride;
@@ -2223,6 +2339,7 @@ struct nw_bind {
     struct eagl_native_window *win;
     uint32_t w, h;
     int need_begin;
+    uint32_t prev_seq;
 };
 static struct nw_bind g_nw_binds[MAX_NW_BINDS];
 
@@ -2233,18 +2350,18 @@ static int  nw_cb3(void *d, uint32_t a, uint32_t b, uint32_t c) { (void)d; (void
 static uint32_t map_iosurf_zc_va(void *surf, uint32_t w, uint32_t h, uint32_t *out_bpr)
 {
     uint32_t zc_va = 0u, zc_bpr = 0u;
-    if (!surf || !mali_iokit_conn || (uint64_t)w * (uint64_t)h < 65536ull || IOSurfaceGetPlaneCount(surf) != 0)
+    if (!surf || !mali_iokit_conn || (uint64_t)w * (uint64_t)h < 65536ull || IOSurfaceGetPlaneCount(surf) != 0) {
+        if (out_bpr) *out_bpr = 0u;
         return 0u;
-    if (IOSurfaceLock(surf, 1 /* kIOSurfaceLockReadOnly */, NULL) == 0) {
+    }
+    if (IOSurfaceLock(surf, 0, NULL) == 0) {
         uintptr_t ubase = (uintptr_t)IOSurfaceGetBaseAddress(surf);
         size_t bpr = IOSurfaceGetBytesPerRow(surf);
         size_t sz = ((size_t)h * bpr + 0xfffu) & ~0xfffu;
         if (ubase && (ubase & 0xfffu) == 0u && bpr >= (size_t)w * 4u &&
-            (bpr & 7u) == 0u && sz > 0u && sz <= 0x00400000u) {
-            volatile uint8_t sink = 0;
+            (bpr & 7u) == 0u && sz > 0u && sz <= MALI_ZC_MAX_BYTES) {
             for (size_t off = 0; off < sz; off += 4096u)
-                sink ^= ((volatile const uint8_t *)ubase)[off];
-            (void)sink;
+                ((volatile uint8_t *)ubase)[off] = ((volatile uint8_t *)ubase)[off];
             uint64_t in[3] = { (uint64_t)ubase, (uint64_t)sz, 1u };
             uint64_t gva = 0;
             uint32_t cnt = 1;
@@ -2253,7 +2370,7 @@ static uint32_t map_iosurf_zc_va(void *surf, uint32_t w, uint32_t h, uint32_t *o
                 zc_bpr = (uint32_t)bpr;
             }
         }
-        IOSurfaceUnlock(surf, 1, NULL);
+        IOSurfaceUnlock(surf, 0, NULL);
     }
     if (out_bpr) *out_bpr = zc_bpr;
     return zc_va;
@@ -2286,12 +2403,14 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
             }
             pthread_mutex_unlock(&gles_mtx);
         }
+        static uint32_t g_nws_log = 0;
+        int want_log = (g_nws_log < 12u);
         uint32_t beg_ms = 0;
         void *beg_surf = NULL;
         if (nb && nb->win && nb->need_begin && nb->win->begin) {
-            uint32_t tb0 = now_ms();
+            uint32_t tb0 = want_log ? now_ms() : 0u;
             void *rs = nb->win->begin(nb->win);
-            beg_ms = now_ms() - tb0;
+            if (want_log) beg_ms = now_ms() - tb0;
             beg_surf = rs;
             if (rs) {
                 nb->need_begin = 0;
@@ -2319,35 +2438,48 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
         }
         flush_current_fbo_iosurf('P');
         if (nb && nb->win) {
-            uint32_t ts0 = now_ms();
-            mali_wait_idle();
-            uint32_t ts1 = now_ms();
-            /* Bump IOSurface seed cleanly (zero CPU writes) so backboardd always sees the new GPU frame. */
+            uint32_t ts0 = want_log ? now_ms() : 0u;
+            uint32_t cur_seq = mali_get_last_enq_seq();
             void *cur_surf = NULL;
+            int has_zc = 0;
             pthread_mutex_lock(&gles_mtx);
             struct iosurf_binding *cb = find_iosurf_locked(1, nb->rb_id);
             if (cb && cb->surf) {
                 cur_surf = cb->surf;
+                has_zc = (cb->zc_va != 0u);
                 CFRetain(cur_surf);
             }
             pthread_mutex_unlock(&gles_mtx);
+            /* Pipeline zero-copy CAEAGLLayer swaps with 1 frame in flight (FIFO mali_q + disp.c wait_seq);
+             * keep full current-frame wait when !has_zc (CPU readback / fallback blit). */
+            if (has_zc) {
+                if (nb->prev_seq)
+                    mali_wait_seq(nb->prev_seq);
+                nb->prev_seq = cur_seq;
+            } else {
+                mali_wait_seq(cur_seq);
+                nb->prev_seq = 0u;
+            }
+            uint32_t ts1 = want_log ? now_ms() : 0u;
+            /* Bump IOSurface seed cleanly (zero CPU writes) so backboardd always sees the new GPU frame. */
             unsigned iu = 9u;
             if (cur_surf) {
                 if (IOSurfaceLock(cur_surf, 0, NULL) == 0)
                     IOSurfaceUnlock(cur_surf, 0, NULL);
             }
             int swap_rc = (!nb->need_begin && nb->win->swap) ? nb->win->swap(nb->win, 1u) : -1;
-            uint32_t ts2 = now_ms();
+            uint32_t ts2 = want_log ? now_ms() : 0u;
             if (cur_surf) {
-                static uint8_t (*fn_inuse)(void *);
-                if (!fn_inuse) fn_inuse = (uint8_t (*)(void *))dlsym(RTLD_DEFAULT, "IOSurfaceIsInUse");
-                if (fn_inuse) iu = (unsigned)fn_inuse(cur_surf);
+                if (want_log) {
+                    static uint8_t (*fn_inuse)(void *);
+                    if (!fn_inuse) fn_inuse = (uint8_t (*)(void *))dlsym(RTLD_DEFAULT, "IOSurfaceIsInUse");
+                    if (fn_inuse) iu = (unsigned)fn_inuse(cur_surf);
+                }
                 CFRelease(cur_surf);
             }
             if (swap_rc == 1)
                 nb->need_begin = 1;
-            static uint32_t g_nws_log = 0;
-            if (g_nws_log < 12u) {
+            if (want_log) {
                 g_nws_log++;
                 uint32_t sh0 = 0, sh12 = 0, sh16 = 0, st0 = 0, st1 = 0, st2 = 0, ty0 = 0, ty1 = 0, ty2 = 0;
                 uint8_t *w8 = (uint8_t *)nb->win;
@@ -2406,6 +2538,7 @@ static uint8_t swiz_renderbufferStorageFromDrawable(void *self, void *cmd, uint3
             pthread_mutex_lock(&gles_mtx);
             g_nw_binds[slot].used = 0;
             g_nw_binds[slot].win = NULL;
+            g_nw_binds[slot].prev_seq = 0u;
             pthread_mutex_unlock(&gles_mtx);
         }
         return 1;
@@ -2449,6 +2582,7 @@ static uint8_t swiz_renderbufferStorageFromDrawable(void *self, void *cmd, uint3
         g_nw_binds[slot].w = w;
         g_nw_binds[slot].h = h;
         g_nw_binds[slot].need_begin = 0;
+        g_nw_binds[slot].prev_seq = 0u;
         pthread_mutex_unlock(&gles_mtx);
     }
     {

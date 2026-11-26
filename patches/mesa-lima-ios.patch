@@ -123,40 +123,161 @@ index 03916bf..a399aa0 100644
     lima_job_add_bo(job, LIMA_PIPE_PP, src_res->bo, LIMA_SUBMIT_BO_READ);
     _mesa_hash_table_insert(ctx->write_jobs, &dst_res->base, job);
 diff --git a/src/gallium/drivers/lima/lima_bo.c b/src/gallium/drivers/lima/lima_bo.c
-index 4b1a78d..5f96192 100644
+index 4b1a78d..a3bc1f6 100644
 --- a/src/gallium/drivers/lima/lima_bo.c
 +++ b/src/gallium/drivers/lima/lima_bo.c
-@@ -216,12 +216,23 @@ lima_bo_cache_put(struct lima_bo *bo)
+@@ -75,11 +75,16 @@ void lima_bo_table_fini(struct lima_screen *screen)
+    _mesa_hash_table_destroy(screen->bo_flink_names, NULL);
+ }
+ 
++#define LIMA_BO_CACHE_MAX_BYTES (16u * 1024u * 1024u)
++static uint32_t bo_cache_bytes = 0;
++static int ext_bo_seq = 0;
++
+ static void
+ lima_bo_cache_remove(struct lima_bo *bo)
+ {
+    list_del(&bo->size_list);
+    list_del(&bo->time_list);
++   bo_cache_bytes = (bo_cache_bytes >= bo->size) ? (bo_cache_bytes - bo->size) : 0u;
+ }
+ 
+ static void lima_close_kms_handle(struct lima_screen *screen, uint32_t handle)
+@@ -96,6 +101,11 @@ lima_bo_free(struct lima_bo *bo)
+ {
+    struct lima_screen *screen = bo->screen;
+ 
++   if (bo->handle & 0x80000000u) {
++      free(bo);
++      return;
++   }
++
+    if (lima_debug & LIMA_DEBUG_BO_CACHE)
+       fprintf(stderr, "%s: %p (size=%d)\n", __func__,
+               bo, bo->size);
+@@ -162,24 +172,6 @@ lima_bo_cache_get_bucket(struct lima_screen *screen, unsigned size)
+    return &screen->bo_cache_buckets[lima_bucket_index(size)];
+ }
+ 
+-static void
+-lima_bo_cache_free_stale_bos(struct lima_screen *screen, time_t time)
+-{
+-   unsigned cnt = 0;
+-   list_for_each_entry_safe(struct lima_bo, entry,
+-                            &screen->bo_cache_time, time_list) {
+-      /* Free BOs that are sitting idle for longer than 5 seconds */
+-      if (time - entry->free_time > 6) {
+-         lima_bo_cache_remove(entry);
+-         lima_bo_free(entry);
+-         cnt++;
+-      } else
+-         break;
+-   }
+-   if ((lima_debug & LIMA_DEBUG_BO_CACHE) && cnt)
+-      fprintf(stderr, "%s: freed %d stale BOs\n", __func__, cnt);
+-}
+-
+ static void
+ lima_bo_cache_print_stats(struct lima_screen *screen)
+ {
+@@ -200,6 +192,36 @@ lima_bo_cache_print_stats(struct lima_screen *screen)
+    fprintf(stderr, "Total size: %u\n", total_size);
+ }
+ 
++static void
++lima_bo_cache_free_list(struct list_head *to_free)
++{
++   list_for_each_entry_safe(struct lima_bo, entry, to_free, time_list) {
++      list_del(&entry->time_list);
++      lima_bo_free(entry);
++   }
++}
++
++static bool
++lima_bo_cache_evict_all(struct lima_screen *screen)
++{
++   struct list_head to_free;
++   list_inithead(&to_free);
++   bool any = false;
++
++   mtx_lock(&screen->bo_cache_lock);
++   list_for_each_entry_safe(struct lima_bo, entry,
++                            &screen->bo_cache_time, time_list) {
++      lima_bo_cache_remove(entry);
++      list_addtail(&entry->time_list, &to_free);
++      any = true;
++   }
++   mtx_unlock(&screen->bo_cache_lock);
++
++   if (any)
++      lima_bo_cache_free_list(&to_free);
++   return any;
++}
++
+ static bool
+ lima_bo_cache_put(struct lima_bo *bo)
+ {
+@@ -207,6 +229,8 @@ lima_bo_cache_put(struct lima_bo *bo)
+       return false;
+ 
+    struct lima_screen *screen = bo->screen;
++   struct list_head to_free;
++   list_inithead(&to_free);
+ 
+    mtx_lock(&screen->bo_cache_lock);
+    struct list_head *bucket = lima_bo_cache_get_bucket(screen, bo->size);
+@@ -216,18 +240,46 @@ lima_bo_cache_put(struct lima_bo *bo)
        return false;
     }
  
 -   struct timespec time;
 -   clock_gettime(CLOCK_MONOTONIC, &time);
 -   bo->free_time = time.tv_sec;
--   list_addtail(&bo->size_list, bucket);
--   list_addtail(&bo->time_list, &screen->bo_cache_time);
--   lima_bo_cache_free_stale_bos(screen, time.tv_sec);
 +   static uint32_t put_cnt = 0;
 +   static time_t last_sec = 0;
-+   if (!last_sec || (++put_cnt & 31u) == 0u) {
++   bool check_stale = (!last_sec || (++put_cnt & 31u) == 0u);
++   if (check_stale) {
 +      struct timespec time;
 +      clock_gettime(CLOCK_MONOTONIC, &time);
 +      last_sec = time.tv_sec;
-+      bo->clean = false;
-+      bo->free_time = last_sec;
-+      list_addtail(&bo->size_list, bucket);
-+      list_addtail(&bo->time_list, &screen->bo_cache_time);
-+      lima_bo_cache_free_stale_bos(screen, last_sec);
-+   } else {
-+      bo->clean = false;
-+      bo->free_time = last_sec;
-+      list_addtail(&bo->size_list, bucket);
-+      list_addtail(&bo->time_list, &screen->bo_cache_time);
++   }
++   bo->clean = false;
++   bo->free_time = last_sec;
+    list_addtail(&bo->size_list, bucket);
+    list_addtail(&bo->time_list, &screen->bo_cache_time);
+-   lima_bo_cache_free_stale_bos(screen, time.tv_sec);
++   bo_cache_bytes += bo->size;
++
++   if (check_stale) {
++      list_for_each_entry_safe(struct lima_bo, entry,
++                               &screen->bo_cache_time, time_list) {
++         if (last_sec - entry->free_time > 6) {
++            lima_bo_cache_remove(entry);
++            list_addtail(&entry->time_list, &to_free);
++         } else
++            break;
++      }
++   }
++   while (bo_cache_bytes > LIMA_BO_CACHE_MAX_BYTES &&
++          !list_is_empty(&screen->bo_cache_time)) {
++      struct lima_bo *entry = list_first_entry(&screen->bo_cache_time,
++                                               struct lima_bo, time_list);
++      lima_bo_cache_remove(entry);
++      list_addtail(&entry->time_list, &to_free);
 +   }
     if (lima_debug & LIMA_DEBUG_BO_CACHE) {
        fprintf(stderr, "%s: put BO: %p (size=%d)\n", __func__, bo, bo->size);
        lima_bo_cache_print_stats(screen);
-@@ -255,7 +266,7 @@ lima_bo_cache_get(struct lima_screen *screen, uint32_t size, uint32_t flags)
+    }
+    mtx_unlock(&screen->bo_cache_lock);
+ 
++   if (!list_is_empty(&to_free))
++      lima_bo_cache_free_list(&to_free);
++
+    return true;
+ }
+ 
+@@ -255,7 +307,7 @@ lima_bo_cache_get(struct lima_screen *screen, uint32_t size, uint32_t flags)
                 fprintf(stderr, "%s: found BO %p but it's busy\n", __func__,
                         entry);
              }
@@ -165,7 +286,59 @@ index 4b1a78d..5f96192 100644
           }
  
           lima_bo_cache_remove(entry);
-@@ -308,6 +319,7 @@ struct lima_bo *lima_bo_create(struct lima_screen *screen,
+@@ -276,6 +328,27 @@ lima_bo_cache_get(struct lima_screen *screen, uint32_t size, uint32_t flags)
+    return bo;
+ }
+ 
++struct lima_bo *lima_bo_create_external(struct lima_screen *screen,
++                                        uint32_t va, uint32_t size);
++struct lima_bo *lima_bo_create_external(struct lima_screen *screen,
++                                        uint32_t va, uint32_t size)
++{
++   struct lima_bo *bo = calloc(1, sizeof(*bo));
++   if (!bo)
++      return NULL;
++
++   list_inithead(&bo->time_list);
++   list_inithead(&bo->size_list);
++   bo->screen = screen;
++   bo->size = align(size, LIMA_PAGE_SIZE);
++   bo->handle = 0x80000000u | ((uint32_t)p_atomic_inc_return(&ext_bo_seq) & 0x7fffffffu);
++   bo->va = va;
++   bo->cacheable = false;
++   bo->clean = true;
++   p_atomic_set(&bo->refcnt, 1);
++   return bo;
++}
++
+ struct lima_bo *lima_bo_create(struct lima_screen *screen,
+                                uint32_t size, uint32_t flags)
+ {
+@@ -284,7 +357,7 @@ struct lima_bo *lima_bo_create(struct lima_screen *screen,
+    size = align(size, LIMA_PAGE_SIZE);
+ 
+    /* Try to get bo from cache first */
+-   bo = lima_bo_cache_get(screen, size, flags);
++   bo = lima_bo_cache_get(screen, size, flags & ~0x80000000u);
+    if (bo)
+       return bo;
+ 
+@@ -299,15 +372,19 @@ struct lima_bo *lima_bo_create(struct lima_screen *screen,
+    list_inithead(&bo->time_list);
+    list_inithead(&bo->size_list);
+ 
+-   if (drmIoctl(screen->fd, DRM_IOCTL_LIMA_GEM_CREATE, &req))
+-      goto err_out0;
++   if (drmIoctl(screen->fd, DRM_IOCTL_LIMA_GEM_CREATE, &req)) {
++      if (!lima_bo_cache_evict_all(screen) ||
++          drmIoctl(screen->fd, DRM_IOCTL_LIMA_GEM_CREATE, &req))
++         goto err_out0;
++   }
+ 
+    bo->screen = screen;
+    bo->size = req.size;
+-   bo->flags = req.flags;
++   bo->flags = req.flags & ~0x80000000u;
     bo->handle = req.handle;
     bo->cacheable = !(lima_debug & LIMA_DEBUG_NO_BO_CACHE ||
                       flags & LIMA_BO_FLAG_HEAP);
@@ -343,7 +516,7 @@ index 4c6164e..534ed25 100644
     struct lima_context *ctx, struct pipe_resource *prsc);
  
 diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
-index 176726a..cc0d6ec 100644
+index 176726a..e54a0de 100644
 --- a/src/gallium/drivers/lima/lima_draw.c
 +++ b/src/gallium/drivers/lima/lima_draw.c
 @@ -124,6 +124,8 @@ static void
@@ -355,16 +528,22 @@ index 176726a..cc0d6ec 100644
     struct lima_context_framebuffer *fb = &ctx->framebuffer;
  
     /* add to job when the buffer is dirty and resolve is clear (not added before) */
-@@ -147,6 +149,8 @@ lima_update_job_wb(struct lima_context *ctx, unsigned buffers)
+@@ -147,6 +149,14 @@ lima_update_job_wb(struct lima_context *ctx, unsigned buffers)
     job->resolve |= buffers;
  }
  
 +static uint32_t g_lima_bo_gen = 1;
 +
++uint32_t lima_next_bo_gen(void);
++uint32_t lima_next_bo_gen(void)
++{
++   return ++g_lima_bo_gen;
++}
++
  static void
  lima_clear(struct pipe_context *pctx, unsigned buffers,
             uint32_t color_clear_mask, uint8_t stencil_clear_mask,
-@@ -163,6 +167,25 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
+@@ -163,6 +173,25 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
        job = lima_job_get(ctx);
     }
  
@@ -390,7 +569,7 @@ index 176726a..cc0d6ec 100644
     lima_update_job_wb(ctx, buffers);
  
     /* no need to reload if cleared */
-@@ -203,6 +226,7 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
+@@ -203,6 +232,7 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
  
     ctx->dirty |= LIMA_CONTEXT_DIRTY_CLEAR;
  
@@ -398,7 +577,7 @@ index 176726a..cc0d6ec 100644
     lima_damage_rect_union(&job->damage_rect,
                            0, ctx->framebuffer.base.width,
                            0, ctx->framebuffer.base.height);
-@@ -344,10 +368,22 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -344,10 +374,22 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
     struct lima_job *job = lima_job_get(ctx);
     PLBU_CMD_BEGIN(&job->plbu_cmd_array, 32);
  
@@ -425,7 +604,7 @@ index 176726a..cc0d6ec 100644
  
     if (!info->index_size)
        PLBU_CMD_ARRAYS_SEMAPHORE_BEGIN();
-@@ -376,7 +412,7 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -376,7 +418,7 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
  
     PLBU_CMD_RSW_VERTEX_ARRAY(
        lima_ctx_buff_va(ctx, lima_ctx_buff_pp_plb_rsw),
@@ -434,7 +613,7 @@ index 176726a..cc0d6ec 100644
  
     /* TODO
      * - we should set it only for the first draw that enabled the scissor and for
-@@ -384,15 +420,29 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -384,15 +426,29 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
      */
  
     assert(cscissor->minx < cscissor->maxx && cscissor->miny < cscissor->maxy);
@@ -467,7 +646,7 @@ index 176726a..cc0d6ec 100644
  
     if ((info->mode == MESA_PRIM_POINTS && ctx->vs->state.point_size_idx == -1) ||
         ((info->mode >= MESA_PRIM_LINES) && (info->mode < MESA_PRIM_TRIANGLES)))
-@@ -403,9 +453,9 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -403,9 +459,9 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
     }
  
     if (info->index_size) {
@@ -479,7 +658,7 @@ index 176726a..cc0d6ec 100644
  
        PLBU_CMD_INDICES(ctx->index_res->bo->va + draw->start * info->index_size + ctx->index_offset);
     }
-@@ -633,7 +683,43 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+@@ -633,7 +689,43 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
        lima_ctx_buff_alloc(ctx, lima_ctx_buff_pp_plb_rsw,
                            LIMA_RENDER_STATE_LENGTH);
  
@@ -524,7 +703,7 @@ index 176726a..cc0d6ec 100644
        state.blend_color_b = ctx->blend_color.color[2];
        state.blend_color_g = ctx->blend_color.color[1];
        state.blend_color_r = ctx->blend_color.color[0];
-@@ -730,7 +816,7 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+@@ -730,7 +822,7 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
        }
  
        state.shader_address = ctx->fs->bo->va;
@@ -533,7 +712,7 @@ index 176726a..cc0d6ec 100644
  
        state.varying_stride = ctx->vs->state.varying_stride;
  
-@@ -781,41 +867,45 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+@@ -781,41 +873,45 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
           state.frag_color_1_register = fs->state.frag_color1_reg;
  
        if (ctx->vs->state.num_varyings) {
@@ -607,7 +786,7 @@ index 176726a..cc0d6ec 100644
     struct lima_job *job = lima_job_get(ctx);
  
     lima_dump_command_stream_print(
-@@ -840,7 +930,19 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
+@@ -840,7 +936,19 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
        lima_ctx_buff_alloc(ctx, lima_ctx_buff_gp_attribute_info,
                            MAX2(1, ve->num_elements) * 8);
  
@@ -627,7 +806,7 @@ index 176726a..cc0d6ec 100644
     for (int i = 0; i < ve->num_elements; i++) {
        struct pipe_vertex_element *pve = ve->pipe + i;
  
-@@ -852,13 +954,12 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
+@@ -852,13 +960,12 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
  
        lima_job_add_bo(job, LIMA_PIPE_GP, res->bo, LIMA_SUBMIT_BO_READ);
  
@@ -645,7 +824,7 @@ index 176726a..cc0d6ec 100644
  
     lima_dump_command_stream_print(
        job->dump, attribute, n * 4, false, "update attribute info at va %x\n",
-@@ -873,25 +974,54 @@ lima_update_gp_uniform(struct lima_context *ctx)
+@@ -873,25 +980,54 @@ lima_update_gp_uniform(struct lima_context *ctx)
     struct lima_vs_compiled_shader *vs = ctx->vs;
     int uniform_size = MIN2(vs->state.uniform_size, ccb->size);
  
@@ -718,7 +897,7 @@ index 176726a..cc0d6ec 100644
  
     if (lima_debug & LIMA_DEBUG_GP) {
        float *vs_const_buff_f = vs_const_buff;
-@@ -916,24 +1046,49 @@ static void
+@@ -916,24 +1052,49 @@ static void
  lima_update_pp_uniform(struct lima_context *ctx)
  {
     const float *const_buff = ctx->const_buffer[MESA_SHADER_FRAGMENT].buffer;
@@ -781,7 +960,7 @@ index 176726a..cc0d6ec 100644
  
     lima_dump_command_stream_print(
        job->dump, fp16_const_buff, const_buff_size * 2,
-@@ -958,28 +1113,28 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -958,28 +1119,28 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
        lima_ctx_buff_alloc(ctx, lima_ctx_buff_gp_varying_info,
                            vs->state.num_outputs * 8);
     int n = 0;
@@ -791,23 +970,23 @@ index 176726a..cc0d6ec 100644
 +         struct lima_varying_info *v = vs->state.varying + i;
  
 -   int offset = 0;
+-
+-   for (int i = 0; i < vs->state.num_outputs; i++) {
+-      struct lima_varying_info *v = vs->state.varying + i;
 +         if (i == vs->state.gl_pos_idx ||
 +             i == vs->state.point_size_idx)
 +            continue;
  
--   for (int i = 0; i < vs->state.num_outputs; i++) {
--      struct lima_varying_info *v = vs->state.varying + i;
-+         int size = v->component_size * 4;
- 
 -      if (i == vs->state.gl_pos_idx ||
 -          i == vs->state.point_size_idx)
 -         continue;
++         int size = v->component_size * 4;
+ 
+-      int size = v->component_size * 4;
 +         /* does component_size == 2 need to be 16 aligned? */
 +         if (v->component_size == 4)
 +            offset = align(offset, 16);
  
--      int size = v->component_size * 4;
--
 -      /* does component_size == 2 need to be 16 aligned? */
 -      if (v->component_size == 4)
 -         offset = align(offset, 16);
@@ -825,7 +1004,7 @@ index 176726a..cc0d6ec 100644
     /* gl_Position is always present, allocate space for it */
     gp_output_size = align(4 * 4 * num, 0x40);
  
-@@ -995,33 +1150,52 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -995,33 +1156,52 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
        gp_output_size += 4 * num;
     }
  
@@ -892,7 +1071,7 @@ index 176726a..cc0d6ec 100644
  
     lima_dump_command_stream_print(
        job->dump, varying, n * 4, false, "update varying info at va %x\n",
-@@ -1114,7 +1288,59 @@ lima_draw_vbo_indexed(struct pipe_context *pctx,
+@@ -1114,7 +1294,59 @@ lima_draw_vbo_indexed(struct pipe_context *pctx,
     }
  
     if (needs_indices) {
@@ -953,7 +1132,7 @@ index 176726a..cc0d6ec 100644
        if (!info->has_user_indices)
           pan_minmax_cache_add(ctx->index_res->index_cache, info->index_size,
                                draw->start, draw->count,
-@@ -1183,7 +1409,10 @@ lima_draw_vbo(struct pipe_context *pctx,
+@@ -1183,7 +1415,10 @@ lima_draw_vbo(struct pipe_context *pctx,
        return;
     }
  
@@ -965,7 +1144,7 @@ index 176726a..cc0d6ec 100644
     if (lima_is_scissor_zero(ctx))
        return;
  
-@@ -1195,8 +1424,175 @@ lima_draw_vbo(struct pipe_context *pctx,
+@@ -1195,8 +1430,175 @@ lima_draw_vbo(struct pipe_context *pctx,
        return;
  
     struct lima_job *job = lima_job_get(ctx);
@@ -1029,7 +1208,7 @@ index 176726a..cc0d6ec 100644
 +          fabsf(vs_u[15] - 1.0f) < 1e-4f &&
 +          (info->mode == MESA_PRIM_TRIANGLES || info->mode == MESA_PRIM_TRIANGLE_STRIP ||
 +           info->mode == MESA_PRIM_TRIANGLE_FAN) &&
-+          draws[0].count > 0 && draws[0].count <= 256 &&
++          draws[0].count > 0 && draws[0].count <= 32 &&
 +          ctx->vertex_elements && ctx->vertex_elements->num_elements > 0) {
 +         struct pipe_vertex_element *ve0 = &ctx->vertex_elements->pipe[0];
 +         bool is_vec4 = (ve0->src_format == PIPE_FORMAT_R32G32B32A32_FLOAT);
@@ -1626,15 +1805,44 @@ index 6399c6a..8213176 100644
     ralloc_free(so);
  }
 diff --git a/src/gallium/drivers/lima/lima_resource.c b/src/gallium/drivers/lima/lima_resource.c
-index bb1a314..a9f040f 100644
+index bb1a314..7fc3c13 100644
 --- a/src/gallium/drivers/lima/lima_resource.c
 +++ b/src/gallium/drivers/lima/lima_resource.c
-@@ -186,10 +186,20 @@ lima_resource_create_bo(struct pipe_screen *pscreen,
+@@ -158,6 +158,10 @@ setup_miptree(struct lima_resource *res,
+    return size;
+ }
+ 
++__thread uint32_t lima_external_va = 0;
++__thread int lima_skip_bo_zero = 0;
++extern struct lima_bo *lima_bo_create_external(struct lima_screen *screen, uint32_t va, uint32_t size);
++
+ static struct pipe_resource *
+ lima_resource_create_bo(struct pipe_screen *pscreen,
+                         const struct pipe_resource *templat,
+@@ -181,15 +185,37 @@ lima_resource_create_bo(struct pipe_screen *pscreen,
+    uint32_t size = setup_miptree(res, width, height, align_to_tile);
+    size = align(size, LIMA_PAGE_SIZE);
+ 
+-   res->bo = lima_bo_create(screen, size, 0);
++   if (lima_external_va) {
++      uint32_t ext_va = lima_external_va;
++      lima_external_va = 0;
++      res->bo = lima_bo_create_external(screen, ext_va, size);
++      if (!res->bo) {
++         FREE(res);
++         return NULL;
++      }
++      return pres;
++   }
++
++   uint32_t bo_flags = (templat->target == PIPE_BUFFER || lima_skip_bo_zero) ? 0x80000000u : 0u;
++   res->bo = lima_bo_create(screen, size, bo_flags);
+    if (!res->bo) {
        FREE(res);
        return NULL;
     }
 +   /* Zero recycled bo_cache textures/renderbuffers so glyph atlases and reloaded FBOs never read stale VRAM. */
-+   if (templat->target != PIPE_BUFFER && !res->bo->clean) {
++   if (templat->target != PIPE_BUFFER && !lima_skip_bo_zero && !res->bo->clean) {
 +      extern void mali_zero_wc(void *dst, size_t n);
 +      void *m = lima_bo_map(res->bo);
 +      if (m)
@@ -1650,7 +1858,7 @@ index bb1a314..a9f040f 100644
  static struct pipe_resource *
  _lima_resource_create_with_modifiers(struct pipe_screen *pscreen,
                                       const struct pipe_resource *templat,
-@@ -197,7 +207,10 @@ _lima_resource_create_with_modifiers(struct pipe_screen *pscreen,
+@@ -197,7 +223,10 @@ _lima_resource_create_with_modifiers(struct pipe_screen *pscreen,
                                       int count)
  {
     struct lima_screen *screen = lima_screen(pscreen);
@@ -2165,3 +2373,145 @@ index 4759c34..7a4cfaf 100644
  
        cb.buffer = NULL;
        cb.user_buffer = NULL;
+diff --git a/src/panfrost/shared/pan_tiling.c b/src/panfrost/shared/pan_tiling.c
+index 9165270..cf289b3 100644
+--- a/src/panfrost/shared/pan_tiling.c
++++ b/src/panfrost/shared/pan_tiling.c
+@@ -139,6 +139,43 @@ pan_get_interleave_zs(enum pipe_format format, bool depth, bool stencil)
+  * be unrolled), calculating the index within the tile and writing.
+  */
+ 
++static ALWAYS_INLINE void
++pan_access_image_pixel_unaligned(void *dst, void *src, const unsigned pixel_size,
++                                 enum pan_interleave_zs interleave, bool is_store)
++{
++   switch (interleave) {
++      case PAN_INTERLEAVE_NONE:
++         if (is_store)
++            memcpy(dst, src, pixel_size);
++         else
++            memcpy(src, dst, pixel_size);
++         break;
++      case PAN_INTERLEAVE_DEPTH: {
++         assert(pixel_size == 4);
++         if (is_store) {
++            uint32_t src_pixel;
++            memcpy(&src_pixel, src, 4);
++            uint16_t lo = src_pixel & 0xffff;
++            memcpy(dst, &lo, 2);
++            *((uint8_t *)dst + 2) = (src_pixel >> 16) & 0xff;
++         } else {
++            uint32_t dst_pixel;
++            memcpy(&dst_pixel, dst, 4);
++            uint32_t out = dst_pixel & 0xffffff;
++            memcpy(src, &out, 4);
++         }
++         break;
++      }
++      case PAN_INTERLEAVE_STENCIL:
++         assert(pixel_size == 4);
++         if (is_store)
++            *((uint8_t *)dst + 3) = *(uint8_t *)src;
++         else
++            *(uint8_t *)src = *((uint8_t *)dst + 3);
++         break;
++   }
++}
++
+ static ALWAYS_INLINE void
+ pan_access_tiled_image_aligned(
+    void *dst, void *src,
+@@ -150,18 +187,70 @@ pan_access_tiled_image_aligned(
+    enum pan_interleave_zs interleave,
+    bool is_store)
+ {
+-   uint8_t *dest_start = dst + ((sx >> 4) * PIXELS_PER_TILE * dst_pixel_size);
+-   for (int y = sy, src_y = 0; src_y < h; ++y, ++src_y) {
+-      uint8_t *dest = (uint8_t *)(dest_start + ((y >> 4) * dst_stride));
+-      void *source = src + (src_y * src_stride);
+-      void *source_end = source + w * src_pixel_size;
+-      unsigned expanded_y = bit_duplication[y & 0xF] << shift;
+-      for (; source < source_end; dest += (PIXELS_PER_TILE << shift)) {
+-         for (uint8_t i = 0; i < 16; ++i) {
+-            unsigned index = expanded_y ^ (space_4[i] << shift);
+-            pan_access_image_pixel(dest + index, source, dst_pixel_size,
+-                                   interleave, is_store);
+-            source += src_pixel_size;
++   /* Stage <=32bpp 16x16 tiles through L1-cached RAM (1 KiB stack) so WC VRAM sees contiguous bursts.
++    * Stage each linear 16-pixel row through 16-byte-aligned row_buf via memcpy so Clang never emits
++    * ARMv7 ldrd/strd/ldm/stm on potentially 1-byte-unaligned caller linear buffers (which SIGBUS). */
++   const unsigned tile_bytes = PIXELS_PER_TILE << shift;
++   uint8_t *dest_start = (uint8_t *)dst + ((sx >> 4) * tile_bytes);
++
++   if (shift > 2) {
++      for (int y = sy, src_y = 0; src_y < h; ++y, ++src_y) {
++         uint8_t *dest = dest_start + ((y >> 4) * dst_stride);
++         uint8_t *source = (uint8_t *)src + (src_y * src_stride);
++         uint8_t *source_end = source + w * src_pixel_size;
++         unsigned expanded_y = bit_duplication[y & 0xF] << shift;
++         for (; source < source_end; dest += tile_bytes) {
++            for (uint8_t i = 0; i < 16; ++i) {
++               unsigned index = expanded_y ^ (space_4[i] << shift);
++               pan_access_image_pixel_unaligned(dest + index, source, dst_pixel_size,
++                                                interleave, is_store);
++               source += src_pixel_size;
++            }
++         }
++      }
++      return;
++   }
++
++   const unsigned row_bytes = TILE_WIDTH * src_pixel_size;
++   uint8_t tile_buf[1024] __attribute__((aligned(16)));
++   uint8_t row_buf[64] __attribute__((aligned(16)));
++
++   for (unsigned ty = 0; ty < h; ty += TILE_HEIGHT) {
++      uint8_t *tile_row = dest_start + (((sy + ty) >> 4) * dst_stride);
++      uint8_t *src_row_base = (uint8_t *)src + ty * src_stride;
++
++      for (unsigned tx = 0; tx < w; tx += TILE_WIDTH) {
++         uint8_t *tile_ptr = tile_row + ((tx >> 4) * tile_bytes);
++         uint8_t *lin_base = src_row_base + tx * src_pixel_size;
++
++         if (is_store) {
++            if (interleave != PAN_INTERLEAVE_NONE)
++               memcpy(tile_buf, tile_ptr, tile_bytes);
++            for (unsigned ly = 0; ly < TILE_HEIGHT; ++ly) {
++               unsigned expanded_y = bit_duplication[ly] << shift;
++               memcpy(row_buf, lin_base + ly * src_stride, row_bytes);
++               uint8_t *s = row_buf;
++               for (uint8_t i = 0; i < TILE_WIDTH; ++i) {
++                  unsigned index = expanded_y ^ (space_4[i] << shift);
++                  pan_access_image_pixel(tile_buf + index, s, dst_pixel_size,
++                                         interleave, true);
++                  s += src_pixel_size;
++               }
++            }
++            memcpy(tile_ptr, tile_buf, tile_bytes);
++         } else {
++            memcpy(tile_buf, tile_ptr, tile_bytes);
++            for (unsigned ly = 0; ly < TILE_HEIGHT; ++ly) {
++               unsigned expanded_y = bit_duplication[ly] << shift;
++               uint8_t *s = row_buf;
++               for (uint8_t i = 0; i < TILE_WIDTH; ++i) {
++                  unsigned index = expanded_y ^ (space_4[i] << shift);
++                  pan_access_image_pixel(tile_buf + index, s, dst_pixel_size,
++                                         interleave, false);
++                  s += src_pixel_size;
++               }
++               memcpy(lin_base + ly * src_stride, row_buf, row_bytes);
++            }
+          }
+       }
+    }
+@@ -190,8 +279,8 @@ pan_access_tiled_image_unaligned(
+          uint8_t *source = src + source_start + src_pixel_size * src_x;
+          uint8_t *dest =
+             dst + block_start_s + dst_pixel_size * (block_x_s + index);
+-         pan_access_image_pixel(dest, source, dst_pixel_size, interleave,
+-                                is_store);
++         pan_access_image_pixel_unaligned(dest, source, dst_pixel_size,
++                                          interleave, is_store);
+       }
+    }
+ }

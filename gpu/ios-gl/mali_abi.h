@@ -10,6 +10,7 @@
 #define MALI_CMD_SUBMIT_PP    4 /* struct_in: struct mali_pp_submit */
 #define MALI_CMD_SUBMIT_GP_PP 8 /* struct_in: struct mali_gp_pp_submit */
 #define MALI_CMD_WAIT_IDLE    9 /* scalar: wait for in-flight async PP */
+#define MALI_CMD_WAIT_SEQ    20 /* scalar_in[0]=target_seq: wait until pp_done_seq >= target_seq */
 
 struct mali_pp_submit {
     uint32_t num_pp;

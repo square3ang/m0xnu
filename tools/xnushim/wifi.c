@@ -194,8 +194,14 @@ static void w_udelay(uint32_t us)
 
 static void w_lock(void)
 {
-    while (__sync_lock_test_and_set(&w_busy, 1))
-        w_udelay(20);
+    for (uint32_t spins = 0u; __sync_lock_test_and_set(&w_busy, 1); ) {
+        if (spins < 25u) {
+            spins++;
+            w_udelay(20);
+        } else {
+            k_iosleep(1u);
+        }
+    }
 }
 
 static void w_unlock(void)
@@ -751,7 +757,7 @@ static int bcm_cdc_cmd(uint32_t cmd, int is_set, uint8_t *buf, uint32_t len, uin
     if (rc == 0) {
         for (int tries = 0; tries < 250 && !w_ctl_got; tries++) {
             (void)sdpcm_poll_rx_once();
-            if (!w_ctl_got) w_udelay(2000);
+            if (!w_ctl_got) k_iosleep(2u);
         }
     }
     int got = w_ctl_got;
@@ -1831,19 +1837,24 @@ static void wifi_en0_detach(void *ifp) { (void)ifp; }
 static void wifi_rx_thread(void *param, int wait_res)
 {
     (void)param; (void)wait_res;
+    uint32_t idle_cnt = 0u;
+    uint32_t prev_tx = 0u;
     for (;;) {
         if (!w_st.f2_ready) {
+            idle_cnt = 0u;
             k_iosleep(100u);
             continue;
         }
         if (w_assoc_pending) {
             w_assoc_pending = 0u;
+            idle_cnt = 0u;
             k_iosleep(30u); /* let wifid arm its async ASSOC_DONE waiter after ioctl(20) returns */
             (void)wifi_do_associate(w_assoc_buf, w_assoc_len);
             continue;
         }
         if (w_scan_pending) {
             w_scan_pending = 0u;
+            idle_cnt = 0u;
             k_iosleep(30u); /* let wifid arm its RunLoop/KEV scan waiter after ioctl(10) returns */
             (void)wifi_do_scan(1);
             continue;
@@ -1854,8 +1865,18 @@ static void wifi_rx_thread(void *param, int wait_res)
         w_unlock();
         if (w_wpa_eapol_len)
             wifi_process_eapol();
-        if (!got)
-            k_iosleep(w_st.link_up ? 5u : 20u);
+        uint32_t cur_tx = w_st.tx_pkts;
+        if (got || cur_tx != prev_tx) {
+            prev_tx = cur_tx;
+            idle_cnt = 0u;
+        } else {
+            if (idle_cnt < 40u)
+                idle_cnt++;
+            if (w_st.link_up)
+                k_iosleep(idle_cnt >= 40u ? 30u : 5u);
+            else
+                k_iosleep(idle_cnt >= 40u ? 50u : 20u);
+        }
     }
 }
 
@@ -2249,11 +2270,11 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
                 for (int i = 0; i < 6; i++) w_putx(w_st.mac[i]);
             }
             w_puts("\n");
-            /* Disable MPC & power-save, enable event_msgs, bring radio up, pre-populate scan cache */
-            uint8_t mpc[8] = { 'm', 'p', 'c', 0u, 0u, 0u, 0u, 0u };
+            /* Enable MPC & PM_FAST power-save, enable event_msgs, bring radio up, pre-populate scan cache */
+            uint8_t mpc[8] = { 'm', 'p', 'c', 0u, 1u, 0u, 0u, 0u };
             uint32_t ml = 8u;
             (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, mpc, 8u, &ml);
-            uint8_t pm[4] = { 0u, 0u, 0u, 0u };
+            uint8_t pm[4] = { 2u, 0u, 0u, 0u }; /* PM_FAST */
             uint32_t pml = 4u;
             (void)bcm_cdc_cmd(86u /* WLC_SET_PM */, 1, pm, 4u, &pml);
             {

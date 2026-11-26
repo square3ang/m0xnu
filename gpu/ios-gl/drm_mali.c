@@ -222,8 +222,10 @@ static void pool_free(uint32_t off, uint32_t sz)
 
 static struct mali_bo_slot *find_bo(uint32_t h)
 {
+    if (!h || (h & 0x80000000u))
+        return NULL;
     uint32_t idx = h & (MAX_BOS - 1u);
-    if (h && bos[idx].handle == h)
+    if (bos[idx].handle == h)
         return &bos[idx];
     return NULL;
 }
@@ -273,8 +275,22 @@ void drmFreeDevice(drmDevicePtr *device)
 
 static __thread int tls_has_gp = 0;
 static __thread uint32_t tls_gp[6];
-static __thread uint32_t tls_gp_bos[64];
+static __thread uint32_t tls_gp_bos[256];
 static __thread uint32_t tls_gp_nr_bos = 0;
+static __thread int tls_gp_bos_overflow = 0;
+
+static int bo_in_pending_gp(uint32_t handle)
+{
+    if (!tls_has_gp || !handle)
+        return 0;
+    if (tls_gp_bos_overflow)
+        return 1;
+    for (uint32_t i = 0; i < tls_gp_nr_bos; i++) {
+        if (tls_gp_bos[i] == handle)
+            return 1;
+    }
+    return 0;
+}
 
 static uint32_t g_last_enq_seq = 0;
 static uint32_t g_last_done_seq = 0;
@@ -331,9 +347,13 @@ static int flush_pending_gp(void)
 {
     if (!tls_has_gp || !mali_iokit_conn) {
         tls_has_gp = 0;
+        tls_gp_nr_bos = 0;
+        tls_gp_bos_overflow = 0;
         return 0;
     }
     tls_has_gp = 0;
+    tls_gp_nr_bos = 0;
+    tls_gp_bos_overflow = 0;
     size_t out_sz = 0;
     int kr = IOConnectCallStructMethod(mali_iokit_conn, MALI_CMD_SUBMIT_GP,
                                        tls_gp, sizeof(tls_gp), NULL, &out_sz);
@@ -345,6 +365,37 @@ static int flush_pending_gp(void)
         return -EIO;
     }
     return 0;
+}
+
+uint32_t mali_get_last_enq_seq(void)
+{
+    pthread_mutex_lock(&bo_mtx);
+    uint32_t seq = g_last_enq_seq;
+    pthread_mutex_unlock(&bo_mtx);
+    return seq;
+}
+
+void mali_wait_seq(uint32_t target_seq)
+{
+    if (!target_seq || !mali_iokit_conn)
+        return;
+    pthread_mutex_lock(&bo_mtx);
+    refresh_done_seq_locked();
+    int busy = seq_is_busy_locked(target_seq);
+    pthread_mutex_unlock(&bo_mtx);
+    if (!busy)
+        return;
+    uint64_t in[1] = { (uint64_t)target_seq };
+    uint32_t z = 0;
+    if (IOConnectCallScalarMethod(mali_iokit_conn, MALI_CMD_WAIT_SEQ, in, 1, NULL, &z) != 0)
+        IOConnectCallScalarMethod(mali_iokit_conn, MALI_CMD_WAIT_IDLE, NULL, 0, NULL, &z);
+    pthread_mutex_lock(&bo_mtx);
+    refresh_done_seq_locked();
+    if ((int32_t)(target_seq - g_last_done_seq) > 0)
+        g_last_done_seq = target_seq;
+    if (g_any_inflight && (int32_t)(g_last_enq_seq - g_last_done_seq) <= 0)
+        g_any_inflight = 0;
+    pthread_mutex_unlock(&bo_mtx);
 }
 
 void mali_wait_idle(void)
@@ -412,14 +463,18 @@ int drmIoctl(int fd, unsigned long request, void *arg)
                 uint32_t off = 0;
                 if (pool_alloc(sz, &off) != 0)
                     break;
-                bos[i].handle = ((++next_handle) << 12) | (uint32_t)i;
+                next_handle = (next_handle + 1u) & 0x7ffffu;
+                if (!next_handle)
+                    next_handle = 1u;
+                bos[i].handle = (next_handle << 12) | (uint32_t)i;
                 bos[i].size = sz;
                 bos[i].va = va_base + off;
                 bos[i].pa = mali_work_pa + off;
                 bos[i].mmap_off = bos[i].pa;
                 bos[i].last_seq = 0;
                 uintptr_t wbase = mali_ensure_work_map();
-                if (wbase && off + sz <= mali_work_mapped_sz)
+                if (wbase && off + sz <= mali_work_mapped_sz &&
+                    !(c->flags & (LIMA_BO_FLAG_HEAP | 0x80000000u)))
                     mali_zero_wc((void *)(wbase + off), sz);
                 if (!pool_va_mapped && mali_iokit_conn) {
                     uint64_t in[3] = { bos[i].va, bos[i].pa, sz };
@@ -451,11 +506,24 @@ int drmIoctl(int fd, unsigned long request, void *arg)
 
     case DRM_IOCTL_GEM_CLOSE: {
         struct drm_gem_close *cl = (struct drm_gem_close *)arg;
+        if (cl->handle & 0x80000000u)
+            return 0;
+        if (bo_in_pending_gp(cl->handle))
+            flush_pending_gp();
         pthread_mutex_lock(&bo_mtx);
-        int busy = bo_is_inflight_locked(cl->handle);
+        uint32_t seq = 0u;
+        int busy = 0;
+        if (g_any_inflight) {
+            refresh_done_seq_locked();
+            struct mali_bo_slot *b0 = find_bo(cl->handle);
+            if (b0 && seq_is_busy_locked(b0->last_seq)) {
+                seq = b0->last_seq;
+                busy = 1;
+            }
+        }
         pthread_mutex_unlock(&bo_mtx);
         if (busy)
-            mali_wait_idle();
+            mali_wait_seq(seq);
         pthread_mutex_lock(&bo_mtx);
         struct mali_bo_slot *b = find_bo(cl->handle);
         if (b) {
@@ -477,21 +545,50 @@ int drmIoctl(int fd, unsigned long request, void *arg)
 
     case DRM_IOCTL_LIMA_GEM_WAIT: {
         struct drm_lima_gem_wait *gw = (struct drm_lima_gem_wait *)arg;
-        if (!tls_has_gp && !g_any_inflight)
+        if (gw && gw->timeout_ns == 0) {
+            /* Non-blocking poll (e.g. bo_cache_get mid-job): NEVER flush pending GP! */
+            if (bo_in_pending_gp(gw->handle)) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+            if (!g_any_inflight)
+                return 0;
+            pthread_mutex_lock(&bo_mtx);
+            int busy = bo_is_inflight_locked(gw->handle);
+            pthread_mutex_unlock(&bo_mtx);
+            if (busy) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
             return 0;
-        int r = flush_pending_gp();
-        if (r != 0)
-            return r;
+        }
+        if (tls_has_gp && (!gw || tls_gp_nr_bos >= 256u || bo_in_pending_gp(gw->handle))) {
+            int r = flush_pending_gp();
+            if (r != 0)
+                return r;
+        }
+        if (!g_any_inflight)
+            return 0;
         pthread_mutex_lock(&bo_mtx);
-        int busy = gw ? bo_is_inflight_locked(gw->handle) : g_any_inflight;
+        refresh_done_seq_locked();
+        uint32_t seq = 0u;
+        int busy = 0;
+        if (g_any_inflight) {
+            if (gw) {
+                struct mali_bo_slot *b = find_bo(gw->handle);
+                if (b && seq_is_busy_locked(b->last_seq)) {
+                    seq = b->last_seq;
+                    busy = 1;
+                }
+            } else {
+                seq = g_last_enq_seq;
+                busy = seq_is_busy_locked(seq);
+            }
+        }
         pthread_mutex_unlock(&bo_mtx);
         if (!busy)
             return 0;
-        if (gw && gw->timeout_ns == 0) {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-        mali_wait_idle();
+        mali_wait_seq(seq);
         return 0;
     }
 
@@ -509,7 +606,10 @@ int drmIoctl(int fd, unsigned long request, void *arg)
                     return r;
             }
             memcpy(tls_gp, gf->frame, sizeof(tls_gp));
-            uint32_t n = (gbos && sub->nr_bos <= 64u) ? sub->nr_bos : 0u;
+            uint32_t n = gbos ? sub->nr_bos : 0u;
+            tls_gp_bos_overflow = (n > 256u);
+            if (n > 256u)
+                n = 256u;
             for (uint32_t i = 0; i < n; i++)
                 tls_gp_bos[i] = gbos[i].handle;
             tls_gp_nr_bos = n;
@@ -529,11 +629,14 @@ int drmIoctl(int fd, unsigned long request, void *arg)
             memcpy(gpp.pp.wb, pf->wb, sizeof(gpp.pp.wb));
             uint32_t out_seqs[2] = { 0, 0 };
             uint32_t gp_nr = 0;
+            int gp_overflow = 0;
             int kr;
             if (tls_has_gp) {
                 memcpy(gpp.gp, tls_gp, sizeof(gpp.gp));
                 gp_nr = tls_gp_nr_bos;
+                gp_overflow = tls_gp_bos_overflow;
                 tls_gp_nr_bos = 0;
+                tls_gp_bos_overflow = 0;
                 tls_has_gp = 0;
                 kr = mali_submit_gpp_timed(MALI_CMD_SUBMIT_GP_PP, &gpp, sizeof(gpp), out_seqs);
             } else {
@@ -548,16 +651,23 @@ int drmIoctl(int fd, unsigned long request, void *arg)
                 if ((int32_t)(seq - g_last_enq_seq) > 0)
                     g_last_enq_seq = seq;
                 g_any_inflight = ((int32_t)(g_last_enq_seq - g_last_done_seq) > 0);
-                for (uint32_t i = 0; i < gp_nr; i++) {
-                    struct mali_bo_slot *b = find_bo(tls_gp_bos[i]);
-                    if (b)
-                        b->last_seq = seq;
-                }
-                if (sbos && sub->nr_bos > 0) {
-                    for (uint32_t i = 0; i < sub->nr_bos; i++) {
-                        struct mali_bo_slot *b = find_bo(sbos[i].handle);
+                if (gp_overflow) {
+                    for (int i = 0; i < MAX_BOS; i++) {
+                        if (bos[i].handle)
+                            bos[i].last_seq = seq;
+                    }
+                } else {
+                    for (uint32_t i = 0; i < gp_nr; i++) {
+                        struct mali_bo_slot *b = find_bo(tls_gp_bos[i]);
                         if (b)
                             b->last_seq = seq;
+                    }
+                    if (sbos && sub->nr_bos > 0) {
+                        for (uint32_t i = 0; i < sub->nr_bos; i++) {
+                            struct mali_bo_slot *b = find_bo(sbos[i].handle);
+                            if (b)
+                                b->last_seq = seq;
+                        }
                     }
                 }
             }

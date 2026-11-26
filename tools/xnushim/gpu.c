@@ -22,6 +22,7 @@ typedef uintptr_t (*ml_io_map_t)(uintptr_t pa, uint32_t size);
 #define FB_PA      0x60000000  /* mkxnu FB_PA: the video console */
 
 extern uintptr_t mct;  /* shim.c, mapped by exy_timer_init */
+extern uintptr_t gicd, exy_pl310;
 extern void exy_clean_line(const void *p);
 extern void exy_putc(char c);
 struct exy_touch_state;
@@ -38,7 +39,7 @@ extern void exy_drv_power_sync(void);
 extern int exy_drv_set_volume(uint8_t vol);
 extern int exy_drv_audio_tone(uint16_t hz, uint16_t ms);
 extern int exy_drv_set_torch(uint8_t level);
-extern void exy_dma_clean_inv_pa(uint32_t pa, uint32_t len);
+extern void exy_dma_inv_l2_sync(void);
 extern int exy_halt_restart(unsigned type);
 
 /* debug: magic, init status, job status, last INT_RAWSTAT, MCT ticks, pad[3], cumulative GP/PP us */
@@ -65,43 +66,49 @@ static void gpu_flush(void *p, uint32_t len)
 static struct mali_env mali_env;
 static int mali_ready;
 static int cur_gpu_opp = 2;
+static volatile int want_gpu_opp = 2;
+static volatile int mali_clk_gated;
 volatile uint32_t exy_last_gpu_mct;
 extern int exy_gpu_set_vdd(uint8_t code);
 
+/* Exynos 4412 G3D GIC interrupt IDs (SPI 123..127 -> GIC IDs 155..159). */
+#define MALI_GIC_PP0       155u
+#define MALI_GIC_GP        159u
+
+/* Keep CMU_GATE_IP_G3D enabled to avoid Exynos 4412 APB bus lockups on idle boundaries;
+ * idle GPU power is reduced via 3-tier DVFS (147 MHz @ 0.95V) applied strictly when GPU is idle. */
+static inline void mali_clk_on(void) { }
+static inline void mali_clk_off(void) { }
+
 /* Glitch-free Exynos 4412 Mali-400 DVFS via CMU_DIV_G3D + BUCK4 (VPLL locked at 440 MHz):
- *   opp 0/1: 220 MHz @ 1.000V (BUCK4=0x20, DIV=/2) - idle / warm
- *   opp 2:   440 MHz @ 1.075V (BUCK4=0x26, DIV=/1) - active 3D/UI burst */
-static void mali_lock(void);
-static void mali_unlock(void);
-int exy_gpu_set_opp(int opp)
+ *   opp 0/1: 220 MHz @ 1.000V (BUCK4=0x20, DIV=/2) - idle / warm (proven stable across 41k+ jobs)
+ *   opp 2:   440 MHz @ 1.075V (BUCK4=0x26, DIV=/1) - active 3D/UI burst
+ * Always invoked exclusively when GPU hardware is 100% idle (!pp_in_flight). */
+static void mali_apply_opp_hw(int target)
 {
-    if (!mali_ready || !mali_env.cmu)
-        return -1;
-    int target = (opp >= 2) ? 2 : 1;
-    if (target == cur_gpu_opp)
-        return 0;
-    uint8_t buck = (target == 2) ? 0x26u : 0x20u;
-    uint32_t div = (target == 2) ? 0u : 1u;
+    if (!mali_ready || !mali_env.cmu || target == cur_gpu_opp)
+        return;
+    uint8_t buck = (target >= 2) ? 0x26u : 0x20u;
+    uint32_t div = (target >= 2) ? 0u : 1u;
     if (target > cur_gpu_opp) {
         if (exy_gpu_set_vdd(buck) != 0)
-            return -1;
-        gpu_udelay(500);
-        mali_lock();
+            return;
+        gpu_udelay(300);
         wr(mali_env.cmu + CMU_DIV_G3D, (rd(mali_env.cmu + CMU_DIV_G3D) & ~0xfu) | div);
         (void)poll(&mali_env, mali_env.cmu + CMU_DIV_STAT_G3D, 1, 0, 1000);
         cur_gpu_opp = target;
-        mali_unlock();
     } else {
-        mali_lock();
         wr(mali_env.cmu + CMU_DIV_G3D, (rd(mali_env.cmu + CMU_DIV_G3D) & ~0xfu) | div);
         (void)poll(&mali_env, mali_env.cmu + CMU_DIV_STAT_G3D, 1, 0, 1000);
         cur_gpu_opp = target;
-        mali_unlock();
         (void)exy_gpu_set_vdd(buck);
     }
-    return 0;
 }
 static volatile uint32_t *mali_status_va;
+
+/* G3D GIC SPIs are intentionally left disabled: Exynos 4412 GICC AckCtl=1 races Group-1 SPIs
+ * against Group-0 MCT FIQs in fiq.S/aic_iack (root cause of Bisect Run 2A hang). */
+static inline void mali_irq_init(void) { }
 
 static int mali_ensure_init(void)
 {
@@ -128,7 +135,9 @@ static int mali_ensure_init(void)
                 wr(mali_env.gpu + M_MMU(i) + MMU_COMMAND, MMU_CMD_ZAP_CACHE);
             l2_flush(&mali_env);
         }
+        mali_clk_gated = 0;
         mali_ready = 1;
+        mali_irq_init();
     }
     exy_clean_line(&exy_gpu_log);
     return (int)exy_gpu_log.init;
@@ -173,9 +182,70 @@ struct exy_direct_fb {
     uint32_t fb_pa;
     uint32_t gen;
     uint32_t stride;
+    uint32_t pp_seq;
 };
 struct exy_direct_fb exy_direct_fbs[EXY_DIRECT_FB_SLOTS];
 uint32_t exy_direct_fb_gen;
+
+#define MALI_ZC_SLOTS       12u
+#define MALI_ZC_BASE        0x80000000u
+#define MALI_ZC_SLOT_STRIDE 0x00800000u /* 8 MiB VA stride per slot (fits 5 MiB ZC surfaces) */
+#define MALI_ZC_MAX_SIZE    0x00500000u /* 5 MiB ZC cap (covers SpringBoard 744x1392) */
+#define MALI_ZC_DIRECT_PA   0x60c00000u /* 5x4 MiB contiguous app scanout slots (0x60c00000..0x62000000) */
+#define MALI_ZC_DIRECT_CNT  5u
+static struct { uint32_t pa0, pam, pae, sz, direct_pa, lru; } zc_slots[MALI_ZC_SLOTS];
+static uint32_t zc_lru_clock, zc_direct_next;
+
+static void direct_fb_clear_locked(uint32_t i)
+{
+    exy_direct_fbs[i].surf_pa = 0u;
+    __asm__ volatile("dmb ish" ::: "memory");
+    exy_direct_fbs[i].fb_pa = 0u;
+    exy_direct_fbs[i].pp_seq = 0u;
+}
+
+static void direct_fb_publish_locked(int slot, uint32_t spa, uint32_t fpa,
+                                     uint32_t gen, uint32_t stride, uint32_t pp_seq)
+{
+    exy_direct_fbs[slot].surf_pa = 0u;
+    __asm__ volatile("dmb ish" ::: "memory");
+    exy_direct_fbs[slot].fb_pa = fpa;
+    exy_direct_fbs[slot].gen = gen;
+    exy_direct_fbs[slot].stride = stride;
+    exy_direct_fbs[slot].pp_seq = pp_seq;
+    __asm__ volatile("dmb ish" ::: "memory");
+    exy_direct_fbs[slot].surf_pa = spa;
+}
+
+static uint32_t mali_wb_va_to_pa(uint32_t va)
+{
+    if (va >= 0x04000000u && va < 0x20000000u)
+        return 0x62000000u + (va - 0x04000000u);
+    if (va >= 0x03000000u && va < 0x03800000u)
+        return FB_PA + (va - 0x03000000u);
+    if (va >= MALI_ZC_BASE && va < MALI_ZC_BASE + MALI_ZC_SLOTS * MALI_ZC_SLOT_STRIDE) {
+        uint32_t rel = va - MALI_ZC_BASE;
+        uint32_t slot = rel / MALI_ZC_SLOT_STRIDE;
+        uint32_t off = rel % MALI_ZC_SLOT_STRIDE;
+        if (zc_slots[slot].direct_pa && off < zc_slots[slot].sz)
+            return zc_slots[slot].direct_pa + off;
+    }
+    return 0u;
+}
+
+static void gpu_clean_inv_page_nosync(uint32_t pa)
+{
+    if (pa < 0x40000000u || pa >= 0x60000000u)
+        return;
+    uintptr_t va = (uintptr_t)(pa + 0x40000000u);
+    for (uintptr_t x = va; x < va + 0x1000u; x += 32u)
+        __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" :: "r"(x) : "memory");
+    __asm__ volatile("dsb" ::: "memory");
+    if (exy_pl310) {
+        for (uint32_t p = pa; p < pa + 0x1000u; p += 32u)
+            *(volatile uint32_t *)(exy_pl310 + 0x7f0u) = p;
+    }
+}
 
 #define KIO_DIR_INOUT       3u          /* kIODirectionInOut */
 /* kIOMapWriteCombineCache: Normal non-cacheable, so GPU-coherent like kIOMapInhibitCache, but
@@ -332,6 +402,21 @@ int exy_mali_uc_start(void *self, void *provider)
 }
 
 static int gp_reset_pending;
+volatile uint32_t exy_mali_irq_cnt;
+static unsigned pp_in_flight_n;
+
+int exy_mali_try_irq(uint32_t gic_id)
+{
+    (void)gic_id;
+    return 0;
+}
+
+static inline void mali_poll_pause(void)
+{
+    /* Pace APB/AXI MMIO reads (~64 cycles) to avoid hammering the bus while polling RAWSTAT. */
+    for (unsigned d = 0; d < 64u; d++)
+        __asm__ volatile("nop");
+}
 
 static int mali_submit_gp(const uint32_t gp_regs[6])
 {
@@ -341,6 +426,7 @@ static int mali_submit_gp(const uint32_t gp_regs[6])
     if (gp_regs[2] != gp_regs[3]) { cmd |= GP_CMD_START_PLBU; want |= GP_IRQ_PLBU_END; }
     if (!cmd)
         return MALI_OK;
+    mali_clk_on();
     __asm__ volatile("dsb" ::: "memory"); /* drain CPU WCOMB store buffer before GP DMA */
     wr(gp + M_L2 + L2_COMMAND, 1); /* start L2 clear in parallel with GP soft reset */
     if (!gp_reset_pending) {
@@ -358,34 +444,39 @@ static int mali_submit_gp(const uint32_t gp_regs[6])
         __asm__ volatile("yield");
     }
     gp_reset_pending = 0;
+    wr(gp + GP_INT_MASK, 0);
     wr(gp + GP_INT_CLEAR, GP_IRQ_ALL);
     for (unsigned i = 0; i < 6; i++)
         wr(gp + GP_FRAME + 4 * i, gp_regs[i]);
     wr(gp + GP_CMD, GP_CMD_UPDATE_ALLOC);
     wr(gp + GP_CMD, cmd);
     uint32_t t0 = ticks();
+    int err = MALI_OK;
     for (unsigned sleeps = 0;;) {
         uint32_t s = rd(gp + GP_INT_RAWSTAT);
         mali_last_status = s;
         if (s & GP_IRQ_ERROR) {
             exy_gpu_log.ticks = rd(gp + M_MMU(0) + 0x10);
-            return MALI_ERR_JOB;
+            err = MALI_ERR_JOB;
+            break;
         }
         if ((s & want) == want)
             break;
-        /* Tight spin up to 8ms with yield to eliminate IOSleep(1) overshoot without burning CPU/heat. */
         if (ticks() - t0 < 24u * 8000u) {
-            __asm__ volatile("yield");
+            mali_poll_pause();
             continue;
         }
         if (++sleeps > 2000u) {
             exy_gpu_log.ticks = rd(gp + M_MMU(0) + 0x10);
-            return MALI_ERR_TIMEOUT;
+            err = MALI_ERR_TIMEOUT;
+            break;
         }
         iosleep_fn(1);
     }
-    exy_gpu_log.gp_us += (ticks() - t0) / 24u;
     wr(gp + GP_INT_CLEAR, GP_IRQ_ALL);
+    if (err != MALI_OK)
+        return err;
+    exy_gpu_log.gp_us += (ticks() - t0) / 24u;
     /* Start async GP soft reset now so it completes while PP + CPU run next. */
     wr(gp + GP_CMD, GP_CMD_SOFT_RESET);
     gp_reset_pending = 1;
@@ -466,11 +557,31 @@ static int pp_soft_reset_parallel(unsigned n)
 }
 
 static int pp_in_flight;
-static unsigned pp_in_flight_n;
 static uint32_t pp_in_flight_t0;
 static int pp_needs_hard_reset = 1;
 volatile uint32_t exy_mali_pp_seq;
 volatile uint32_t exy_mali_pp_done_seq;
+
+static uint32_t pp_poll_once(unsigned n, uint32_t done, int *out_err, unsigned *out_err_pp)
+{
+    for (unsigned i = 0; i < n; i++) {
+        if (done & (1u << i))
+            continue;
+        uintptr_t pp = mali_env.gpu + M_PP(i);
+        uint32_t s = rd(pp + PP_INT_RAWSTAT);
+        mali_last_status = s;
+        if (s & PP_IRQ_ERROR) {
+            *out_err = MALI_ERR_JOB;
+            *out_err_pp = i;
+            return done;
+        }
+        if (s & PP_IRQ_END_OF_FRAME) {
+            wr(pp + PP_INT_CLEAR, PP_IRQ_ALL);
+            done |= (1u << i);
+        }
+    }
+    return done;
+}
 
 static int mali_wait_pp_locked(void)
 {
@@ -483,26 +594,11 @@ static int mali_wait_pp_locked(void)
     unsigned err_pp = 0;
     uint32_t t0 = pp_in_flight_t0;
     for (unsigned sleeps = 0;;) {
-        for (unsigned i = 0; i < n; i++) {
-            if (done & (1u << i))
-                continue;
-            uintptr_t pp = mali_env.gpu + M_PP(i);
-            uint32_t s = rd(pp + PP_INT_RAWSTAT);
-            mali_last_status = s;
-            if (s & PP_IRQ_ERROR) {
-                err = MALI_ERR_JOB;
-                err_pp = i;
-                break;
-            }
-            if (s & PP_IRQ_END_OF_FRAME) {
-                wr(pp + PP_INT_CLEAR, PP_IRQ_ALL);
-                done |= (1u << i);
-            }
-        }
+        done = pp_poll_once(n, done, &err, &err_pp);
         if (err != MALI_OK || done == want)
             break;
         if (ticks() - t0 < 24u * 8000u) {
-            __asm__ volatile("yield");
+            mali_poll_pause();
             continue;
         }
         if (++sleeps > 2000u) {
@@ -515,7 +611,6 @@ static int mali_wait_pp_locked(void)
     }
     exy_gpu_log.pp_us += (ticks() - t0) / 24u;
     pp_in_flight = 0;
-    exy_mali_pp_done_seq = exy_mali_pp_seq;
     if (err != MALI_OK) {
         pp_needs_hard_reset = 1;
         uintptr_t mmu = mali_env.gpu + M_MMU(1 + err_pp);
@@ -545,12 +640,43 @@ struct mali_q_entry {
 static struct mali_q_entry mali_q[MALI_Q_SIZE];
 static volatile uint32_t mali_q_head, mali_q_tail;
 static volatile uint32_t mali_q_busy;
-static volatile uint32_t mali_q_waiters, mali_idle_waiters;
+static volatile uint32_t mali_q_waiters, mali_idle_waiters, mali_seq_waiters;
 static volatile uint32_t mali_enq_seq, mali_pp_cur_seq;
 static int mali_worker_started;
 static int mali_last_err;
 
 static int mali_start_pp_locked(const struct mali_pp_submit *req, int need_l2_flush, int pp_reset_started);
+
+static void mali_tag_direct_fb_seq_locked(const struct mali_pp_submit *pp, uint32_t seq)
+{
+    if (!pp->wb[0])
+        return;
+    uint32_t pa = mali_wb_va_to_pa(pp->wb[1]);
+    if (!pa)
+        return;
+    for (unsigned i = 0; i < EXY_DIRECT_FB_SLOTS; i++) {
+        if (exy_direct_fbs[i].surf_pa && exy_direct_fbs[i].fb_pa == pa) {
+            exy_direct_fbs[i].pp_seq = seq;
+            __asm__ volatile("dmb ish" ::: "memory");
+            break;
+        }
+    }
+}
+
+static void mali_publish_done_locked(uint32_t seq)
+{
+    if (!seq)
+        return;
+    if ((int32_t)(seq - exy_mali_pp_done_seq) > 0) {
+        exy_mali_pp_done_seq = seq;
+        if (mali_status_va)
+            mali_status_va[0] = seq;
+        if (mali_seq_waiters) {
+            mali_seq_waiters = 0;
+            thread_wakeup_prim_fn((void *)&exy_mali_pp_done_seq, 0, 0);
+        }
+    }
+}
 
 static inline void gpu_copy_words(void *dst, const void *src, uint32_t bytes)
 {
@@ -575,16 +701,20 @@ static void mali_worker_fn(void *arg, int wait_result)
                     thread_wakeup_prim_fn((void *)&mali_q_tail, 0, 0);
                 }
                 mali_q_busy = 1;
+                mali_clk_on();
                 mali_unlock();
 
                 /* Run hardware GP+PP unlocked so CPU0 enqueues never block on mali_mtx. */
                 (void)mali_wait_pp_locked();
                 if (mali_pp_cur_seq) {
-                    exy_mali_pp_done_seq = mali_pp_cur_seq;
-                    if (mali_status_va)
-                        mali_status_va[0] = mali_pp_cur_seq;
+                    uint32_t done_seq = mali_pp_cur_seq;
                     mali_pp_cur_seq = 0;
+                    mali_lock();
+                    mali_publish_done_locked(done_seq);
+                    mali_unlock();
                 }
+                if (want_gpu_opp != cur_gpu_opp)
+                    mali_apply_opp_hw(want_gpu_opp);
                 int err = MALI_OK;
                 if (ent.is_gpp) {
                     int pp_pre_reset = (!pp_needs_hard_reset &&
@@ -601,13 +731,6 @@ static void mali_worker_fn(void *arg, int wait_result)
                     err = mali_start_pp_locked(&ent.req.pp, 1, 0);
                     exy_gpu_log.pad[2]++;
                 }
-                if (err == MALI_OK) {
-                    mali_pp_cur_seq = ent.seq;
-                } else {
-                    exy_mali_pp_done_seq = ent.seq;
-                    if (mali_status_va)
-                        mali_status_va[0] = ent.seq;
-                }
                 mali_last_err = err;
                 exy_gpu_log.job = (uint32_t)err;
                 exy_gpu_log.rawstat = mali_last_status;
@@ -617,18 +740,29 @@ static void mali_worker_fn(void *arg, int wait_result)
                 }
 
                 mali_lock();
+                if (err == MALI_OK)
+                    mali_pp_cur_seq = ent.seq;
+                else
+                    mali_publish_done_locked(ent.seq);
                 continue;
             }
             if (pp_in_flight) {
                 /* Wait for final in-flight PP unlocked so newly arriving submits don't stall. */
                 mali_unlock();
                 (void)mali_wait_pp_locked();
+                mali_lock();
                 if (mali_pp_cur_seq) {
-                    exy_mali_pp_done_seq = mali_pp_cur_seq;
-                    if (mali_status_va)
-                        mali_status_va[0] = mali_pp_cur_seq;
+                    uint32_t done_seq = mali_pp_cur_seq;
                     mali_pp_cur_seq = 0;
+                    mali_publish_done_locked(done_seq);
                 }
+                continue;
+            }
+            if (want_gpu_opp != cur_gpu_opp) {
+                int target = want_gpu_opp;
+                mali_q_busy = 1;
+                mali_unlock();
+                mali_apply_opp_hw(target);
                 mali_lock();
                 continue;
             }
@@ -637,9 +771,35 @@ static void mali_worker_fn(void *arg, int wait_result)
                 mali_idle_waiters = 0;
                 thread_wakeup_prim_fn((void *)&mali_q_busy, 0, 0);
             }
+            if (mali_seq_waiters) {
+                mali_seq_waiters = 0;
+                thread_wakeup_prim_fn((void *)&exy_mali_pp_done_seq, 0, 0);
+            }
+            mali_clk_off();
             lck_mtx_sleep_fn(mali_mtx, 0u, (void *)&mali_q_head, 0u);
         }
     }
+}
+
+int exy_gpu_set_opp(int opp)
+{
+    if (!mali_ready || !mali_env.cmu)
+        return -1;
+    int target = (opp >= 2) ? 2 : 1;
+    want_gpu_opp = target;
+    if (target == cur_gpu_opp)
+        return 0;
+    mali_lock();
+    if (mali_worker_started) {
+        if (!mali_q_busy) {
+            mali_q_busy = 1;
+            thread_wakeup_prim_fn((void *)&mali_q_head, 1, 0);
+        }
+    } else if (!pp_in_flight) {
+        mali_apply_opp_hw(target);
+    }
+    mali_unlock();
+    return 0;
 }
 
 static void mali_ensure_worker_locked(void)
@@ -672,12 +832,29 @@ void exy_mali_wait_idle(void)
     mali_unlock();
 }
 
+void exy_mali_wait_seq(uint32_t target_seq)
+{
+    if (!mali_ready || !target_seq)
+        return;
+    if ((int32_t)(exy_mali_pp_done_seq - target_seq) >= 0)
+        return;
+    mali_lock();
+    while ((int32_t)(exy_mali_pp_done_seq - target_seq) < 0) {
+        if (!mali_q_busy && mali_q_head == mali_q_tail && !pp_in_flight)
+            break;
+        mali_seq_waiters = 1;
+        lck_mtx_sleep_fn(mali_mtx, 0u, (void *)&exy_mali_pp_done_seq, 0u);
+    }
+    mali_unlock();
+}
+
 static int mali_start_pp_locked(const struct mali_pp_submit *req, int need_l2_flush, int pp_reset_started)
 {
     uint32_t f[MALI_PP_FRAME_REGS];
     unsigned n = req->num_pp;
     if (!n || n > 4)
         return MALI_ERR_MAP;
+    mali_clk_on();
     (void)mali_wait_pp_locked();
     if (need_l2_flush) {
         __asm__ volatile("dsb" ::: "memory"); /* drain CPU WCOMB store buffer before PP DMA */
@@ -693,14 +870,16 @@ static int mali_start_pp_locked(const struct mali_pp_submit *req, int need_l2_fl
     if (rerr != MALI_OK)
         return MALI_ERR_RESET;
     pp_needs_hard_reset = 0;
+    pp_in_flight_n = n;
     for (unsigned i = 0; i < n; i++) {
+        uintptr_t pp = mali_env.gpu + M_PP(i);
         f[0] = req->plbu[i];
         f[12] = req->stack[i];
-        pp_start(mali_env.gpu + M_PP(i), f, req->wb);
+        wr(pp + PP_INT_MASK, 0);
+        pp_start(pp, f, req->wb);
     }
     pp_in_flight_t0 = ticks();
     exy_last_gpu_mct = pp_in_flight_t0;
-    pp_in_flight_n = n;
     exy_mali_pp_seq++;
     pp_in_flight = 1;
     return MALI_OK;
@@ -740,9 +919,12 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
         };
         mali_lock();
         (void)mali_drain_idle_locked();
+        mali_clk_on();
         int err = mali_pp_clear(&mali_env, &fb, (uint32_t)args->scalar_in[4]);
         exy_gpu_log.job = (uint32_t)err;
         exy_gpu_log.rawstat = mali_last_status;
+        if (!mali_q_busy && mali_q_head == mali_q_tail && !pp_in_flight)
+            mali_clk_off();
         mali_unlock();
         return err == MALI_OK ? KIORETURN_SUCCESS : KIORETURN_IO_ERROR;
     }
@@ -758,9 +940,12 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
             mali_unlock();
             return KIORETURN_IO_ERROR;
         }
+        mali_clk_on();
         for (unsigned i = 0; i < 5; i++)
             wr(mali_env.gpu + M_MMU(i) + MMU_COMMAND, MMU_CMD_ZAP_CACHE);
         err = l2_flush(&mali_env);
+        if (!mali_q_busy && mali_q_head == mali_q_tail && !pp_in_flight)
+            mali_clk_off();
         mali_unlock();
         return err == MALI_OK ? KIORETURN_SUCCESS : KIORETURN_IO_ERROR;
     }
@@ -771,12 +956,15 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
         {
             mali_lock();
             (void)mali_drain_idle_locked();
+            mali_clk_on();
             int err = mali_submit_gp((const uint32_t *)args->struct_in);
             exy_gpu_log.pad[1]++;
             exy_gpu_log.job = (uint32_t)err;
             exy_gpu_log.rawstat = mali_last_status;
             if (err || (exy_gpu_log.pad[1] & 63u) == 0u)
                 exy_clean_line(&exy_gpu_log);
+            if (!mali_q_busy && mali_q_head == mali_q_tail && !pp_in_flight)
+                mali_clk_off();
             mali_unlock();
             return err == MALI_OK ? KIORETURN_SUCCESS : KIORETURN_IO_ERROR;
         }
@@ -797,6 +985,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 e->is_gpp = 0;
                 e->seq = seq;
                 gpu_copy_words(&e->req.pp, args->struct_in, sizeof(e->req.pp));
+                mali_tag_direct_fb_seq_locked(&e->req.pp, seq);
                 mali_q_head++;
                 int wake = !mali_q_busy;
                 mali_q_busy = 1;
@@ -812,6 +1001,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 }
                 return KIORETURN_SUCCESS;
             }
+            mali_clk_on();
             (void)mali_wait_pp_locked();
             int err = mali_start_pp_locked((const struct mali_pp_submit *)args->struct_in, 1, 0);
             exy_gpu_log.pad[2]++;
@@ -868,10 +1058,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
             if (slot < 0 && !exy_direct_fbs[i].surf_pa) slot = i;
         }
         if (slot < 0) slot = (int)(gen % EXY_DIRECT_BB_SLOTS);
-        exy_direct_fbs[slot].surf_pa = spa;
-        exy_direct_fbs[slot].fb_pa = fpa;
-        exy_direct_fbs[slot].gen = gen;
-        exy_direct_fbs[slot].stride = 2880u;
+        direct_fb_publish_locked(slot, spa, fpa, gen, 2880u, mali_enq_seq);
         mali_unlock();
         if (args->scalar_out && args->scalar_out_cnt >= 1) {
             args->scalar_out[0] = spa;
@@ -897,6 +1084,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 e->is_gpp = 1;
                 e->seq = seq;
                 gpu_copy_words(&e->req, req, sizeof(e->req));
+                mali_tag_direct_fb_seq_locked(&e->req.pp, seq);
                 mali_q_head++;
                 int wake = !mali_q_busy;
                 mali_q_busy = 1;
@@ -912,6 +1100,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 }
                 return KIORETURN_SUCCESS;
             }
+            mali_clk_on();
             (void)mali_wait_pp_locked();
             int pp_pre_reset = (!pp_needs_hard_reset &&
                                 req->pp.num_pp >= 1u && req->pp.num_pp <= 4u);
@@ -937,13 +1126,13 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
             return err == MALI_OK ? KIORETURN_SUCCESS : KIORETURN_IO_ERROR;
         }
 
-    case 10: { /* MALI_CMD_MAP_IOSURF: (user_va, size, create) -> zero-copy Mali VA at 0x80000000+slot*4M */
+    case 10: { /* MALI_CMD_MAP_IOSURF: (user_va, size, create) -> zero-copy Mali VA at 0x80000000+slot*8M */
         if (!args->scalar_in || args->scalar_in_cnt < 3 || !args->scalar_out || args->scalar_out_cnt < 1)
             return KIORETURN_BAD_ARG;
         uint32_t uva = (uint32_t)args->scalar_in[0];
         uint32_t sz = (uint32_t)args->scalar_in[1];
         uint32_t create = (uint32_t)args->scalar_in[2];
-        if (!uva || (uva & 0xfffu) || !sz || (sz & 0xfffu) || sz > 0x00400000u)
+        if (!uva || (uva & 0xfffu) || !sz || (sz & 0xfffu) || sz > MALI_ZC_MAX_SIZE)
             return KIORETURN_BAD_ARG;
         void *task = current_task_fn();
         void *pmap = task ? get_task_pmap_fn(task) : 0;
@@ -959,25 +1148,37 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
             args->scalar_out_cnt = 1;
             return KIORETURN_SUCCESS;
         }
-        #define MALI_ZC_SLOTS 12u
-        #define MALI_ZC_BASE  0x80000000u
-        #define MALI_ZC_DIRECT_PA 0x60c00000u /* 5x4 MiB contiguous app scanout slots (0x60c00000..0x62000000) */
-        #define MALI_ZC_DIRECT_CNT 5u
-        static struct { uint32_t pa0, pam, pae, sz, direct_pa; } zc_slots[MALI_ZC_SLOTS];
-        static uint32_t zc_next, zc_direct_next;
         uint32_t gva = 0;
         mali_lock();
         for (uint32_t i = 0; i < MALI_ZC_SLOTS; i++) {
             if (zc_slots[i].sz == sz && zc_slots[i].pa0 == pa0 &&
                 zc_slots[i].pam == pam && zc_slots[i].pae == pae) {
-                gva = MALI_ZC_BASE + i * 0x00400000u;
+                zc_slots[i].lru = ++zc_lru_clock;
+                gva = MALI_ZC_BASE + i * MALI_ZC_SLOT_STRIDE;
                 break;
             }
         }
         if (!gva && create) {
             (void)mali_drain_idle_locked();
-            uint32_t slot = zc_next;
-            uint32_t base_va = MALI_ZC_BASE + slot * 0x00400000u;
+            uint32_t slot = 0u;
+            int found_empty = 0;
+            for (uint32_t i = 0; i < MALI_ZC_SLOTS; i++) {
+                if (!zc_slots[i].sz) {
+                    slot = i;
+                    found_empty = 1;
+                    break;
+                }
+            }
+            if (!found_empty) {
+                uint32_t best_lru = zc_slots[0].lru;
+                for (uint32_t i = 1; i < MALI_ZC_SLOTS; i++) {
+                    if ((int32_t)(zc_slots[i].lru - best_lru) < 0) {
+                        best_lru = zc_slots[i].lru;
+                        slot = i;
+                    }
+                }
+            }
+            uint32_t base_va = MALI_ZC_BASE + slot * MALI_ZC_SLOT_STRIDE;
             uint32_t direct_pa = 0u, direct_stride = 0u;
             if (sz == 0x003c0000u) {
                 direct_pa = MALI_ZC_DIRECT_PA + zc_direct_next * 0x00400000u;
@@ -1000,20 +1201,22 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                         ok = 0;
                         break;
                     }
-                    exy_dma_clean_inv_pa(pa, 0x1000u);
+                    gpu_clean_inv_page_nosync(pa);
                 }
+                exy_dma_inv_l2_sync();
             }
             if (ok) {
+                mali_clk_on();
                 for (unsigned i = 0; i < 5; i++)
                     wr(mali_env.gpu + M_MMU(i) + MMU_COMMAND, MMU_CMD_ZAP_CACHE);
                 l2_flush(&mali_env);
+                if (!mali_q_busy && mali_q_head == mali_q_tail && !pp_in_flight)
+                    mali_clk_off();
                 /* Clear stale app scanout/ZC entries so two surfaces never alias one direct_pa. */
                 if (zc_slots[slot].pa0) {
                     for (uint32_t i = EXY_DIRECT_BB_SLOTS; i < EXY_DIRECT_FB_SLOTS; i++) {
-                        if (exy_direct_fbs[i].surf_pa == zc_slots[slot].pa0) {
-                            exy_direct_fbs[i].surf_pa = 0u;
-                            exy_direct_fbs[i].fb_pa = 0u;
-                        }
+                        if (exy_direct_fbs[i].surf_pa == zc_slots[slot].pa0)
+                            direct_fb_clear_locked(i);
                     }
                 }
                 if (direct_pa) {
@@ -1025,10 +1228,8 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                         }
                     }
                     for (uint32_t i = EXY_DIRECT_BB_SLOTS; i < EXY_DIRECT_FB_SLOTS; i++) {
-                        if (exy_direct_fbs[i].fb_pa == direct_pa) {
-                            exy_direct_fbs[i].surf_pa = 0u;
-                            exy_direct_fbs[i].fb_pa = 0u;
-                        }
+                        if (exy_direct_fbs[i].fb_pa == direct_pa)
+                            direct_fb_clear_locked(i);
                     }
                 }
                 zc_slots[slot].pa0 = pa0;
@@ -1036,7 +1237,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                 zc_slots[slot].pae = pae;
                 zc_slots[slot].sz = sz;
                 zc_slots[slot].direct_pa = direct_pa;
-                zc_next = (slot + 1u) % MALI_ZC_SLOTS;
+                zc_slots[slot].lru = ++zc_lru_clock;
                 gva = base_va;
                 if (direct_pa) {
                     uint32_t gen = ++exy_direct_fb_gen;
@@ -1047,10 +1248,7 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
                     }
                     if (dslot < 0)
                         dslot = (int)(EXY_DIRECT_BB_SLOTS + (gen % (EXY_DIRECT_FB_SLOTS - EXY_DIRECT_BB_SLOTS)));
-                    exy_direct_fbs[dslot].surf_pa = pa0;
-                    exy_direct_fbs[dslot].fb_pa = direct_pa;
-                    exy_direct_fbs[dslot].gen = gen;
-                    exy_direct_fbs[dslot].stride = direct_stride;
+                    direct_fb_publish_locked(dslot, pa0, direct_pa, gen, direct_stride, 0u);
                 }
             }
         }
@@ -1110,6 +1308,12 @@ uint32_t exy_mali_external_method(void *self, uint32_t selector, struct io_ext_a
         if (!args->scalar_in || args->scalar_in_cnt < 1)
             return KIORETURN_BAD_ARG;
         return exy_drv_set_torch((uint8_t)args->scalar_in[0]) == 0 ? KIORETURN_SUCCESS : KIORETURN_IO_ERROR;
+
+    case 20: /* MALI_CMD_WAIT_SEQ: scalar_in[0] = target_seq (0 outputs) */
+        if (!args->scalar_in || args->scalar_in_cnt < 1)
+            return KIORETURN_BAD_ARG;
+        exy_mali_wait_seq((uint32_t)args->scalar_in[0]);
+        return KIORETURN_SUCCESS;
 
     case 22: /* MALI_CMD_WIFI_OP: BCM4334 SDIO control/firmware/CDC bridge (wifi.c) */
         if (!args->struct_in || !args->struct_out)

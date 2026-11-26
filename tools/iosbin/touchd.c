@@ -149,6 +149,7 @@ static void dlog(const char *s)
     if (klog_conn && n > 0 && n < 160) {
         size_t z = 0;
         IOConnectCallStructMethod(klog_conn, 6u, s, n + 1u, NULL, &z);
+        return;
     }
     if (log_fd < 0)
         log_fd = open("/dev/console", 1 /* O_WRONLY */);
@@ -1398,9 +1399,6 @@ int main(void)
                 st.f[i].y = 1279u;
             else if (y0 < 40u)
                 st.f[i].y = 0u;
-            snprintf(msg, sizeof(msg), "[TOUCHD] down f%u=(%u,%u)->y%u\n",
-                     i, (unsigned)st.f[i].x, (unsigned)y0, (unsigned)st.f[i].y);
-            dlog(msg);
         }
 
         if (hid_client && cur_srv)

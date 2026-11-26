@@ -599,8 +599,11 @@ extern int exy_gpu_set_opp(int opp);
 extern volatile uint32_t exy_last_touch_mct;
 extern volatile uint32_t exy_last_gpu_mct;
 extern volatile uint32_t exy_last_disp_mct;
+extern volatile uint32_t exy_last_emmc_mct;
 static void tmu_adc_poll(void);
 static uint32_t pm_tick_cnt;
+
+static int therm_tier;
 
 static void dvfs_thermal_update(void)
 {
@@ -616,17 +619,38 @@ static void dvfs_thermal_update(void)
         else                         temp_c = 48;
     }
 
-    int cpu_opp = 2, gpu_opp = 2;
-    /* Keep full stock speed (1400/440 MHz) below 80C to avoid SMP clock-mux/I2C stalls;
-     * throttle only on genuine high temperature. */
-    if (temp_c >= 88) {
-        cpu_opp = 0;
-        gpu_opp = 0;
-    } else if (temp_c >= 80) {
-        cpu_opp = 1;
-        gpu_opp = 1;
+    /* 4-tier thermal state with 3C hysteresis: <68 / 68-75 / 76-81 / >=82 */
+    if (temp_c >= 82)
+        therm_tier = 3;
+    else if (temp_c >= 76) {
+        if (therm_tier < 2 || temp_c < 79) therm_tier = 2;
+    } else if (temp_c >= 68) {
+        if (therm_tier < 1 || temp_c < 73) therm_tier = 1;
+    } else if (temp_c < 65) {
+        therm_tier = 0;
+    } else if (therm_tier > 1) {
+        therm_tier = 1;
     }
-    (void)now;
+
+    uint32_t dt_touch = exy_last_touch_mct ? (uint32_t)(now - exy_last_touch_mct) : ~0u;
+    uint32_t dt_gpu   = exy_last_gpu_mct   ? (uint32_t)(now - exy_last_gpu_mct)   : ~0u;
+    uint32_t dt_disp  = exy_last_disp_mct  ? (uint32_t)(now - exy_last_disp_mct)  : ~0u;
+    uint32_t dt_emmc  = exy_last_emmc_mct  ? (uint32_t)(now - exy_last_emmc_mct)  : ~0u;
+
+    int touch_act = dt_touch < 24000u * 1500u;
+    int gpu_act   = dt_gpu   < 24000u * 400u;
+    int disp_act  = dt_disp  < 24000u * 600u;
+    int emmc_act  = dt_emmc  < 24000u * 600u;
+    int recent    = dt_touch < 24000u * 3000u || dt_disp < 24000u * 3000u ||
+                    dt_gpu   < 24000u * 1500u || dt_emmc < 24000u * 1500u;
+
+    int cpu_opp = (touch_act || gpu_act || disp_act || emmc_act) ? 2 : (recent ? 1 : 0);
+    int gpu_opp = gpu_act ? 2 : 0;
+
+    static const int cpu_cap[4] = { 2, 2, 1, 0 }; /* 1200, 1200, 600, 400 MHz */
+    static const int gpu_cap[4] = { 2, 1, 1, 0 }; /*  440,  220, 220, 147 MHz */
+    if (cpu_opp > cpu_cap[therm_tier]) cpu_opp = cpu_cap[therm_tier];
+    if (gpu_opp > gpu_cap[therm_tier]) gpu_opp = gpu_cap[therm_tier];
 
     (void)exy_cpu_set_opp(cpu_opp);
     (void)exy_gpu_set_opp(gpu_opp);
@@ -639,13 +663,13 @@ static void pm_poll_tick(void *p0, void *p1)
     exy_usb_hb++;
     pm_tick_cnt++;
     if ((pm_tick_cnt & 3u) == 1u)
-        tmu_adc_poll(); /* every 2s */
+        tmu_adc_poll(); /* every 1s */
     dvfs_thermal_update();
-    if (pm_tick_cnt % 30u == 0u)
+    if (pm_tick_cnt % 60u == 0u)
         exy_drv_power_sync(); /* every 15s */
     if (pm_poll_tc) {
         uint64_t dl = 0;
-        clk_int_deadline(500u, 1000000u, &dl); /* 500 ms DVFS/thermal tick */
+        clk_int_deadline(250u, 1000000u, &dl); /* 250 ms DVFS/thermal tick */
         tc_enter_delayed(pm_poll_tc, dl);
     }
 }
@@ -816,27 +840,25 @@ static void sensors_init(void)
         uint32_t pud = drd(gpio_l_va + 0x0c8u);
         dwr(gpio_l_va + 0x0c8u, pud & ~0x000000f0u);
         exy_i2c_init_hw(i2c1_va);
-        /* Probe LSM330DLC Accel at 0x19 or 0x18 */
+        /* Probe LSM330DLC Accel at 0x19 or 0x18, then leave powered down (no active consumer). */
         static const uint8_t a_addrs[2] = { 0x19u, 0x18u };
         for (int i = 0; i < 2; i++) {
             uint8_t v = 0;
             if (exy_i2c_read_reg(i2c1_va, a_addrs[i], 0x20u /* CTRL_REG1_A */, &v, 1) == 0) {
                 accel_addr = a_addrs[i];
-                uint8_t c1[2] = { 0x20u, 0x47u }; /* 50 Hz, XYZ enable */
-                uint8_t c4[2] = { 0x23u, 0x88u }; /* BDU + High-Res +-2g */
+                uint8_t c1[2] = { 0x20u, 0x00u }; /* power-down */
                 exy_i2c_write(i2c1_va, accel_addr, c1, 2);
-                exy_i2c_write(i2c1_va, accel_addr, c4, 2);
                 exy_drv_log.st.probe_mask |= DRV_BIT_ACCEL;
                 break;
             }
         }
-        /* Probe LSM330DLC Gyro at 0x6b or 0x6a (WHO_AM_I 0x0F == 0xD4) */
+        /* Probe LSM330DLC Gyro at 0x6b or 0x6a (WHO_AM_I 0x0F == 0xD4), then leave powered down. */
         static const uint8_t g_addrs[2] = { 0x6bu, 0x6au };
         for (int i = 0; i < 2; i++) {
             uint8_t id = 0;
             if (exy_i2c_read_reg(i2c1_va, g_addrs[i], 0x0fu, &id, 1) == 0 && (id == 0xd4u || id == 0xd3u)) {
                 gyro_addr = g_addrs[i];
-                uint8_t c1[2] = { 0x20u, 0x0fu }; /* 95 Hz, normal, XYZ enable */
+                uint8_t c1[2] = { 0x20u, 0x00u }; /* power-down */
                 exy_i2c_write(i2c1_va, gyro_addr, c1, 2);
                 exy_drv_log.st.probe_mask |= DRV_BIT_GYRO;
                 break;
@@ -844,29 +866,27 @@ static void sensors_init(void)
         }
     }
 
-    /* AK8975C Magnetometer on GPY2[4:5] @ 0x0C */
+    /* AK8975C Magnetometer on GPY2[4:5] @ 0x0C (stays in power-down after WIA probe) */
     struct bb_i2c mag = bus_mag();
     bb_init(&mag);
     uint8_t wia = 0;
-    if (bb_read_reg(&mag, 0x0cu, 0x00u /* WIA */, &wia, 1) == 0 && wia == 0x48u) {
+    if (bb_read_reg(&mag, 0x0cu, 0x00u /* WIA */, &wia, 1) == 0 && wia == 0x48u)
         exy_drv_log.st.probe_mask |= DRV_BIT_MAG;
-        uint8_t trig[2] = { 0x0au /* CNTL */, 0x01u /* single measurement */ };
-        bb_write(&mag, 0x0cu, trig, 2);
-    }
 
-    /* CM36651 Proximity + ALS on GPF0[0:1] @ 0x18 (GPJ0[5] = LED_A 3.0V) */
+    /* CM36651 Proximity + ALS on GPF0[0:1] @ 0x18 (briefly power GPJ0[5] to probe, then shut down LED_A) */
     if (gpio_l_va)
         gpio_dir_out(gpio_l_va + 0x240u /* GPJ0 */, 5, 1);
     exy_udelay(2000);
     struct bb_i2c als = bus_als();
     bb_init(&als);
-    /* CM36651 ALS CSR @ 0x18 (write 0x00 to enable ALS), PS CSR @ 0x19 */
-    uint8_t als_on[2] = { 0x00u, 0x00u };
-    if (bb_write(&als, 0x18u, als_on, 2) == 0) {
+    uint8_t als_off[2] = { 0x00u, 0x01u }; /* ALS shutdown */
+    if (bb_write(&als, 0x18u, als_off, 2) == 0) {
         exy_drv_log.st.probe_mask |= DRV_BIT_ALS;
-        uint8_t ps_on[2] = { 0x00u, 0x30u };
-        bb_write(&als, 0x19u, ps_on, 2);
+        uint8_t ps_off[2] = { 0x00u, 0x01u }; /* PS shutdown */
+        bb_write(&als, 0x19u, ps_off, 2);
     }
+    if (gpio_l_va)
+        gpio_dir_out(gpio_l_va + 0x240u /* GPJ0 */, 5, 0); /* LED_A off */
 
     /* Cypress Capacitive Touchkeys on GPL0[2:1] @ 0x20, GPJ0[3]=INT */
     if (gpio_l_va) {
@@ -880,48 +900,8 @@ static void sensors_init(void)
         exy_drv_log.st.probe_mask |= DRV_BIT_TKEY;
 }
 
-static void sensors_poll(void)
+static void tkey_poll(void)
 {
-    if ((exy_drv_log.st.probe_mask & DRV_BIT_ACCEL) && i2c1_va && accel_addr) {
-        uint8_t b[6];
-        if (exy_i2c_read_reg(i2c1_va, accel_addr, 0xa8u /* OUT_X_L | auto-inc */, b, 6) == 0) {
-            exy_drv_log.st.accel[0] = (int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
-            exy_drv_log.st.accel[1] = (int16_t)((uint16_t)b[2] | ((uint16_t)b[3] << 8));
-            exy_drv_log.st.accel[2] = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
-        }
-    }
-    if ((exy_drv_log.st.probe_mask & DRV_BIT_GYRO) && i2c1_va && gyro_addr) {
-        uint8_t b[6];
-        if (exy_i2c_read_reg(i2c1_va, gyro_addr, 0xa8u, b, 6) == 0) {
-            exy_drv_log.st.gyro[0] = (int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
-            exy_drv_log.st.gyro[1] = (int16_t)((uint16_t)b[2] | ((uint16_t)b[3] << 8));
-            exy_drv_log.st.gyro[2] = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
-        }
-    }
-    if (exy_drv_log.st.probe_mask & DRV_BIT_MAG) {
-        struct bb_i2c mag = bus_mag();
-        uint8_t st1 = 0;
-        if (bb_read_reg(&mag, 0x0cu, 0x02u /* ST1 */, &st1, 1) == 0 && (st1 & 1u)) {
-            uint8_t b[6];
-            if (bb_read_reg(&mag, 0x0cu, 0x03u, b, 6) == 0) {
-                exy_drv_log.st.mag[0] = (int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
-                exy_drv_log.st.mag[1] = (int16_t)((uint16_t)b[2] | ((uint16_t)b[3] << 8));
-                exy_drv_log.st.mag[2] = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
-            }
-            uint8_t trig[2] = { 0x0au, 0x01u };
-            bb_write(&mag, 0x0cu, trig, 2);
-        }
-    }
-    if (exy_drv_log.st.probe_mask & DRV_BIT_ALS) {
-        struct bb_i2c als = bus_als();
-        uint8_t b[2] = { 0, 0 };
-        /* CM36651 white/clear ALS read @ 0x18 reg 0x06, proximity @ 0x19 reg 0x08 */
-        if (bb_read_reg(&als, 0x18u, 0x06u, b, 2) == 0)
-            exy_drv_log.st.als_lux = (uint16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
-        uint8_t p = 0;
-        if (bb_read_reg(&als, 0x19u, 0x08u, &p, 1) == 0)
-            exy_drv_log.st.prox_raw = p;
-    }
     if (exy_drv_log.st.probe_mask & DRV_BIT_TKEY) {
         /* Active-low GPJ0[3] = touchkey event ready */
         if (gpio_l_va && !gpio_get(gpio_l_va + 0x240u, 3)) {
@@ -1327,29 +1307,41 @@ static void tmu_adc_init(void)
         if (cmu_perir)
             dwr(cmu_perir + 0x960u, drd(cmu_perir + 0x960u) | (1u << 17));
         exy_udelay(100);
+        uint32_t orig_ctrl = drd(tmu_va + 0x20u /* TMU_CONTROL */);
+        /* Reload efuse TRIMINFO unconditionally (Exynos 4412 TRIMINFO_CON=1) */
+        dwr(tmu_va + 0x14u /* TRIMINFO_CON */, 1u);
+        exy_udelay(200);
         uint32_t trim = drd(tmu_va + 0x00u /* TRIMINFO */);
-        if ((trim & 0xffu) == 0u) {
-            dwr(tmu_va + 0x14u /* TRIMINFO_CON */, 1u);
-            exy_udelay(1000);
-            trim = drd(tmu_va + 0x00u);
-        }
         tmu_trim25 = (uint8_t)(trim & 0xffu);
-        if (tmu_trim25 < 45u || tmu_trim25 > 80u)
+        if (tmu_trim25 < 40u || tmu_trim25 > 100u)
             tmu_trim25 = 55u; /* Exynos 4412 nominal efuse fallback */
-        /* Exynos 4412 TMU_CONTROL: REF_VOLTAGE=16 (bits 28:24), BUF_SLOPE=8 (bits 11:8), CORE_EN=1 */
-        uint32_t ctrl = drd(tmu_va + 0x20u /* TMU_CONTROL */);
-        if (!(ctrl & 1u)) {
-            dwr(tmu_va + 0x20u, (16u << 24) | (8u << 8) | 1u);
-            exy_udelay(5000);
+        /* Exynos 4412 TMU_CONTROL (per U-Boot exynos-tmu.c): 0x10608802 (VREF=16, MUX=6,
+         * TRIP_MODE=4 [15:13], BUF_SLOPE=8, bit1=1), then set CORE_EN=1 (0x10608803). */
+        dwr(tmu_va + 0x50u /* THRESHOLD_TEMP_RISE */, 0xffffffffu);
+        dwr(tmu_va + 0x70u /* INTEN */, 0u);
+        dwr(tmu_va + 0x78u /* INTCLEAR */, 0x01110111u);
+        dwr(tmu_va + 0x20u /* TMU_CONTROL */, 0x10608802u);
+        exy_udelay(200);
+        dwr(tmu_va + 0x20u /* TMU_CONTROL */, 0x10608803u);
+        uint32_t raw = 0u;
+        for (uint32_t i = 0; i < 50u; i++) {
+            exy_udelay(1000);
+            raw = drd(tmu_va + 0x40u /* CURRENT_TEMP */) & 0xffu;
+            if (raw >= 25u && raw < 255u)
+                break;
         }
-        uint32_t raw = drd(tmu_va + 0x40u /* CURRENT_TEMP */) & 0xffu;
-        if (raw > 0u && raw < 255u) {
-            int32_t tc = (int32_t)raw - (int32_t)tmu_trim25 + 25;
-            if (tc >= 0 && tc <= 125) {
-                exy_drv_log.st.cpu_temp_c = (int16_t)tc;
-                exy_drv_log.st.probe_mask |= DRV_BIT_TMU;
-            }
+        uint32_t st = drd(tmu_va + 0x28u /* TMU_STATUS */);
+        int32_t tc = (int32_t)raw - (int32_t)tmu_trim25 + 25;
+        if (raw >= 25u && raw < 255u && tc >= 0 && tc <= 125) {
+            exy_drv_log.st.cpu_temp_c = (int16_t)tc;
+            exy_drv_log.st.probe_mask |= DRV_BIT_TMU;
         }
+        drv_puts("[TMU] orig="); drv_putx(orig_ctrl);
+        drv_puts(" st="); drv_putx(st);
+        drv_puts(" trim="); drv_putx(trim);
+        drv_puts(" raw="); drv_putx(raw);
+        drv_puts(" tc="); drv_putx((uint32_t)exy_drv_log.st.cpu_temp_c);
+        drv_puts("\n");
     }
     if (adc_va) {
         /* Exynos ADC ch1 (AP thermistor): 12-bit, prescaler=65, start conversion */
@@ -1370,7 +1362,7 @@ static void tmu_adc_poll(void)
 {
     if (tmu_va) {
         uint32_t raw = drd(tmu_va + 0x40u) & 0xffu;
-        if (raw > 0u && raw < 255u) {
+        if (raw >= 25u && raw < 255u) {
             int32_t tc = (int32_t)raw - (int32_t)tmu_trim25 + 25;
             if (tc >= 0 && tc <= 125) {
                 exy_drv_log.st.cpu_temp_c = (int16_t)tc;
@@ -1465,6 +1457,9 @@ static void wifi_bt_probe(void)
         } else if (drd(uart0_va + 0x00u) == 0x03u) {
             exy_drv_log.st.probe_mask |= DRV_BIT_BT;
         }
+        /* Power down unused BT radio after probe to save heat/battery */
+        gpio_dir_out(gpio_r_va + 0xc60u /* GPX3 */, 1, 0); /* BT_WAKE low */
+        gpio_dir_out(gpio_r_va + 0x0c0u /* GPL0 */, 6, 0); /* BT_EN low */
     }
 }
 
@@ -1654,7 +1649,7 @@ static void exy_usb_poll_thread(void *param, int wait_res)
             k_iosleep_drv(1u);
         } else {
             if (idle < 200u) idle++;
-            k_iosleep_drv(idle > 50u ? 20u : 2u);
+            k_iosleep_drv(idle >= 200u ? 100u : (idle > 50u ? 20u : 2u));
         }
     }
 }
@@ -1833,8 +1828,6 @@ void exy_drivers_init(void *parent_service)
     haptic_init();
     exy_drv_log.init_done = 0x10au; exy_clean_line(&exy_drv_log);
     sensors_init();
-    exy_drv_log.init_done = 0x10bu; exy_clean_line(&exy_drv_log);
-    sensors_poll();
     exy_drv_log.init_done = 0x10cu; exy_clean_line(&exy_drv_log);
     extern void exy_audio_register(void *parent_service);
     extern void exy_wifi_set_parent(void *parent_service);
@@ -1857,8 +1850,7 @@ void exy_drivers_init(void *parent_service)
 
 void exy_drv_poll(struct exy_drv_status *out)
 {
-    sensors_poll();
-    tmu_adc_poll();
+    tkey_poll();
     (void)exy_rtc_read_epoch();
     exy_drv_log.st.vpll_con0 = mali_vpll_con0;
     if (gpio_r_va) {

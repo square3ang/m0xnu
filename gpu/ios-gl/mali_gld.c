@@ -51,14 +51,17 @@ struct mali_device {
     void *lima_screen;
 };
 
+struct mali_ctx;
+
 struct mali_sharegroup {
     struct mali_device *dev;
-    void *shared_st;
+    struct mali_ctx *ctxs;
 };
 
 struct mali_ctx {
     struct mali_device *dev;
     struct mali_sharegroup *sg;
+    struct mali_ctx *sg_next;
     void *lima_ctx;
     void *gli_ctx;
     void *st_ctx;
@@ -243,9 +246,12 @@ int gldCreateContext(void *sg_p, void **out_ctx, void *pf, void *limits_p, void 
              sg, ctx->dev, ctx->gli_ctx, limits_p, state_p);
     if (ctx->dev && ctx->dev->lima_screen) {
         if (ctx->gli_ctx) {
-            ctx->st_ctx = mali_gles_create_context(ctx->gli_ctx, sg ? sg->shared_st : 0);
-            if (sg && !sg->shared_st && ctx->st_ctx)
-                sg->shared_st = ctx->st_ctx;
+            void *shared_st = (sg && sg->ctxs) ? sg->ctxs->st_ctx : 0;
+            ctx->st_ctx = mali_gles_create_context(ctx->gli_ctx, shared_st);
+            if (sg && ctx->st_ctx) {
+                ctx->sg_next = sg->ctxs;
+                sg->ctxs = ctx;
+            }
         } else {
             ctx->lima_ctx = lima_context_create(ctx->dev->lima_screen, 0, 0);
         }
@@ -277,6 +283,17 @@ void gldDestroyContext(void *p)
 {
     struct mali_ctx *ctx = (struct mali_ctx *)p;
     if (!ctx) return;
+    if (ctx->sg) {
+        struct mali_ctx **pp = &ctx->sg->ctxs;
+        while (*pp) {
+            if (*pp == ctx) {
+                *pp = ctx->sg_next;
+                break;
+            }
+            pp = &(*pp)->sg_next;
+        }
+        ctx->sg_next = 0;
+    }
     if (ctx->gli_ctx)
         mali_gles_destroy_context(ctx->gli_ctx);
     free(ctx);

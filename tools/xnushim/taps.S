@@ -21,6 +21,10 @@ exy_cons_putc:				@ replaces pe_serial serial_putc(unit, line, c), cons_ops[0]:
 	push	{r0-r3, r12, lr}	@ IOLog, panic and /dev/console output (uart never "initted")
 	mov	r0, r2
 	bl	exy_putc
+	ldr	r0, =exy_disp_log	@ Once FIMD0 display is active, skip video console glyph draw (0x800ce3c9)
+	ldr	r0, [r0, #4]		@ exy_disp_log.started
+	cmp	r0, #0
+	popne	{r0-r3, r12, pc}
 	pop	{r0-r3, r12, lr}
-	ldr	pc, =0x800ce3c9		@ and on to the video console putc, cons_ops[1] (Thumb):
-	.ltorg				@ serial=3 keeps the RAM log and still draws on --fb
+	ldr	pc, =0x800ce3c9		@ early boot only: draw on video console, cons_ops[1] (Thumb)
+	.ltorg

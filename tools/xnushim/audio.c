@@ -25,6 +25,12 @@
 #define kthread_start_fn    ((int  (*)(void (*)(void *, int), void *, void **))0x80042c15)
 #define thread_policy_set_fn ((int (*)(void *, uint32_t, const uint32_t *, uint32_t))0x8004773d)
 #define audio_selfpid       ((int  (*)(void))0x802a72c9)
+#define audio_iolock_alloc  ((void *(*)(void))0x8032969d)
+#define audio_iolock_mach   ((void *(*)(void *))0x80329749)
+#define audio_lck_mtx_lock  ((void (*)(void *))0x800c2ae9)
+#define audio_lck_mtx_unlock ((void (*)(void *))0x800c2b79)
+#define audio_lck_mtx_sleep ((int  (*)(void *, uint32_t, void *, uint32_t))0x80026db9)
+#define audio_wakeup_prim   ((int  (*)(void *, int, int))0x8002ca11)
 
 /* IOAudio2Family base methods (Thumb) */
 #define ioa2_init           ((int  (*)(void *, void *))0x80b0ed89)
@@ -63,6 +69,7 @@ static uint32_t *audio_ring;
 static struct ioa2_status *audio_status;
 static volatile int audio_running;
 static int audio_thread_started;
+static void *audio_mtx;
 static uint8_t audio_vol = 75u;
 static uint8_t audio_muted = 0u;
 static uint64_t audio_seed = 0ull;
@@ -107,6 +114,15 @@ static void dev_set_str(void *dev, const char *k, const char *s)
     if (o) { ioreg_set_prop_obj(dev, k, o); os_rel(o); }
 }
 
+static void audio_ensure_mtx(void)
+{
+    if (!audio_mtx) {
+        void *iol = audio_iolock_alloc();
+        if (iol)
+            audio_mtx = audio_iolock_mach(iol);
+    }
+}
+
 static void audio_pump_thread(void *param, int wait_res)
 {
     (void)param; (void)wait_res;
@@ -122,7 +138,14 @@ static void audio_pump_thread(void *param, int wait_res)
                 exy_i2s0_set_active(0);
                 was_running = 0;
             }
-            iosleep_fn(20u);
+            if (audio_mtx) {
+                audio_lck_mtx_lock(audio_mtx);
+                while (!audio_running || !audio_ring)
+                    audio_lck_mtx_sleep(audio_mtx, 0u, (void *)&audio_running, 0u);
+                audio_lck_mtx_unlock(audio_mtx);
+            } else {
+                iosleep_fn(200u);
+            }
             continue;
         }
         uint64_t cur_seed = audio_seed;
@@ -172,8 +195,8 @@ static void audio_pump_thread(void *param, int wait_res)
                 }
             }
         }
-        /* Wake every 400 us (~19 frames): 64-frame FIFO retains ~45 frames (0.93 ms) jitter headroom */
-        clock_delay_until_fn(mach_abs_time() + 9600ull);
+        /* Wake every 750 us (~36 frames): 64-frame FIFO retains ~28 frames (0.58 ms) jitter headroom */
+        clock_delay_until_fn(mach_abs_time() + 18000ull);
     }
 }
 
@@ -190,12 +213,13 @@ int exy_audio_start_io(void *self)
 {
     if (self != audio_dev)
         return ioa2_orig_start_io(self);
+    audio_ensure_mtx();
     if (!audio_thread_started) {
         void *th = 0;
         if (kthread_start_fn(audio_pump_thread, 0, &th) == 0) {
             if (th) {
-                /* THREAD_TIME_CONSTRAINT_POLICY (2): 400us period, 50us comp, 250us constraint */
-                uint32_t pol[4] = { 9600u, 1200u, 6000u, 1u };
+                /* THREAD_TIME_CONSTRAINT_POLICY (2): 750us period, 50us comp, 400us constraint */
+                uint32_t pol[4] = { 18000u, 1200u, 9600u, 1u };
                 (void)thread_policy_set_fn(th, 2u, pol, 4u);
             }
             audio_thread_started = 1;
@@ -214,7 +238,14 @@ int exy_audio_start_io(void *self)
         audio_status->reserved[1] = 0ull;
         __asm__ volatile("dmb" ::: "memory");
     }
-    audio_running = 1;
+    if (audio_mtx) {
+        audio_lck_mtx_lock(audio_mtx);
+        audio_running = 1;
+        audio_wakeup_prim((void *)&audio_running, 0, 0);
+        audio_lck_mtx_unlock(audio_mtx);
+    } else {
+        audio_running = 1;
+    }
     a_puts("[AUDIO] start vol=0x"); a_putx(audio_muted ? 0u : audio_vol); a_puts("\n");
     (void)exy_drv_set_volume(audio_muted ? 0u : audio_vol);
     return ioa2_orig_start_io(self);
