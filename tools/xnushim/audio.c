@@ -21,7 +21,9 @@
 #define iowl_create         ((void *(*)(void))0x8034ce61)
 #define mach_abs_time       ((uint64_t (*)(void))0x800cb655)
 #define iosleep_fn          ((void (*)(uint32_t))0x80328fd1)
+#define clock_delay_until_fn ((void (*)(uint64_t))0x8001eb95)
 #define kthread_start_fn    ((int  (*)(void (*)(void *, int), void *, void **))0x80042c15)
+#define thread_policy_set_fn ((int (*)(void *, uint32_t, const uint32_t *, uint32_t))0x8004773d)
 #define audio_selfpid       ((int  (*)(void))0x802a72c9)
 
 /* IOAudio2Family base methods (Thumb) */
@@ -35,6 +37,7 @@
 extern int      exy_drv_set_volume(uint8_t vol);
 extern void     exy_i2s0_set_active(int active);
 extern uint32_t exy_i2s0_push_frames(const uint32_t *frames, uint32_t count);
+extern uint32_t exy_i2s0_tx_count(void);
 extern void     exy_putc(char c);
 static void a_puts(const char *s);
 static void a_putx(uint32_t v);
@@ -136,15 +139,14 @@ static void audio_pump_thread(void *param, int wait_res)
         __asm__ volatile("dmb" ::: "memory");
         uint64_t now = mach_abs_time();
         uint64_t target_frames = (now >= start_host) ? ((now - start_host) / TICKS_PER_FRAME) : total_frames;
-        /* Keep up to 64 frames buffered in I2S0 TX FIFO */
-        uint64_t want = target_frames + 48ull;
+        /* Keep the entire 64-frame I2S0 TX FIFO topped up; cap only at +128 frames against CoreAudio write-ahead */
+        uint64_t want = target_frames + 128ull;
         if (total_frames + AUDIO_RING_FRAMES < want) {
-            /* Resync if thread was delayed >85ms */
+            /* Resync if thread was delayed >340ms */
             uint64_t skip = want - total_frames;
             rd_idx = (rd_idx + (uint32_t)(skip % AUDIO_RING_FRAMES)) % AUDIO_RING_FRAMES;
             total_frames = want;
         }
-        int pushed_any = 0;
         while (audio_running && total_frames < want) {
             uint32_t todo = (uint32_t)(want - total_frames);
             uint32_t contig = AUDIO_RING_FRAMES - rd_idx;
@@ -153,15 +155,16 @@ static void audio_pump_thread(void *param, int wait_res)
             uint32_t n = exy_i2s0_push_frames(&audio_ring[rd_idx], todo);
             if (!n)
                 break;
-            pushed_any = 1;
             rd_idx += n;
             total_frames += n;
             if (rd_idx >= AUDIO_RING_FRAMES) {
                 rd_idx -= AUDIO_RING_FRAMES;
                 if (audio_status) {
-                    /* Publish hardware zero-timestamp on ring wrap (lockless consistent triple) */
+                    /* Publish hardware-clocked zero-timestamp so CoreAudio PLL tracks WM1811 LRCLK with zero drift */
                     uint64_t z_sample = (total_frames / AUDIO_RING_FRAMES) * AUDIO_RING_FRAMES;
-                    uint64_t z_host   = start_host + z_sample * TICKS_PER_FRAME;
+                    uint64_t fifo_f   = (uint64_t)exy_i2s0_tx_count();
+                    uint64_t z_host   = mach_abs_time() + fifo_f * TICKS_PER_FRAME;
+                    start_host = z_host - z_sample * TICKS_PER_FRAME;
                     __asm__ volatile("dmb" ::: "memory");
                     audio_status->sample_time = z_sample;
                     audio_status->host_time   = z_host;
@@ -169,8 +172,8 @@ static void audio_pump_thread(void *param, int wait_res)
                 }
             }
         }
-        if (!pushed_any)
-            iosleep_fn(1u);
+        /* Wake every 400 us (~19 frames): 64-frame FIFO retains ~45 frames (0.93 ms) jitter headroom */
+        clock_delay_until_fn(mach_abs_time() + 9600ull);
     }
 }
 
@@ -189,8 +192,14 @@ int exy_audio_start_io(void *self)
         return ioa2_orig_start_io(self);
     if (!audio_thread_started) {
         void *th = 0;
-        if (kthread_start_fn(audio_pump_thread, 0, &th) == 0)
+        if (kthread_start_fn(audio_pump_thread, 0, &th) == 0) {
+            if (th) {
+                /* THREAD_TIME_CONSTRAINT_POLICY (2): 400us period, 50us comp, 250us constraint */
+                uint32_t pol[4] = { 9600u, 1200u, 6000u, 1u };
+                (void)thread_policy_set_fn(th, 2u, pol, 4u);
+            }
             audio_thread_started = 1;
+        }
     }
     audio_seed++;
     uint64_t t0 = mach_abs_time();
@@ -489,9 +498,9 @@ void exy_audio_register(void *parent_service)
     }
     dev_set_u32(dev, "io buffer frame size", AUDIO_RING_FRAMES);
     dev_set_u32(dev, "output latency", 256u);
-    dev_set_u32(dev, "output safety offset", 128u);
+    dev_set_u32(dev, "output safety offset", 256u);
     dev_set_u32(dev, "input latency", 256u);
-    dev_set_u32(dev, "input safety offset", 128u);
+    dev_set_u32(dev, "input safety offset", 256u);
     dev_set_u32(dev, "MaxOutputChannelCount", 2u);
     dev_set_u32(dev, "MaxInputChannelCount", 2u);
 

@@ -99,7 +99,7 @@ typedef void *buf_t;
 
 uintptr_t mct, gicd, gicc, wdt, mshc, exy_pl310, pmu_va, sysram_va, boot_magic_va;
 uint32_t exy_ncpus = 1;             /* patched by mkxnu.py from --args cpus=N (1..4) */
-uint32_t exy_wdt_sec = 86400;       /* patched by mkxnu.py to 160 when bench=1 */
+uint32_t exy_wdt_sec = 0;           /* 0=unlimited; patched by mkxnu.py to 160 when bench=1 */
 volatile uint32_t exy_usb_hb;       /* incremented by exy_usb_poll_thread; stalls stop WDT petting */
 uint64_t exy_deadline[4];           /* per-CPU deadlines read by exy_get_decrementer (fiq.S) */
 uint32_t exy_smp_boot_info[5] __attribute__((aligned(32))) = {
@@ -872,7 +872,7 @@ void exy_set_decrementer(uint32_t v, uint32_t b, uint32_t c, uint8_t *cpu)
             last_hb_mct = now;
         }
         int alive = ((now - boot_mct0) < 35ull * 24000000ull) || ((now - last_hb_mct) < 25ull * 24000000ull);
-        if (alive && (now - boot_mct0) < (uint64_t)exy_wdt_sec * 24000000ull)
+        if (alive && (!exy_wdt_sec || (now - boot_mct0) < (uint64_t)exy_wdt_sec * 24000000ull))
             wr(wdt + WTCNT, rd(wdt + WTDAT));
     }
 

@@ -634,7 +634,9 @@ static void dvfs_thermal_update(void)
 
 static void pm_poll_tick(void *p0, void *p1)
 {
+    extern volatile uint32_t exy_usb_hb;
     (void)p0; (void)p1;
+    exy_usb_hb++;
     pm_tick_cnt++;
     if ((pm_tick_cnt & 3u) == 1u)
         tmu_adc_poll(); /* every 2s */
@@ -1203,6 +1205,14 @@ uint32_t exy_i2s0_push_frames(const uint32_t *frames, uint32_t count)
     return pushed;
 }
 
+uint32_t exy_i2s0_tx_count(void)
+{
+    if (!(exy_drv_log.st.probe_mask & DRV_BIT_I2S0) || !i2s0_va)
+        return 0u;
+    uint32_t c = drd(i2s0_va + 0x08u /* I2SFIC */) & 0x7fu;
+    return (c > 64u) ? 64u : c;
+}
+
 int exy_drv_audio_tone(uint16_t hz, uint16_t ms)
 {
     (void)hz; (void)ms;
@@ -1669,20 +1679,28 @@ static void exy_usb_gadget_init(void)
     }
     uint8_t muic_usb[2] = { 0x0cu /* CONTROL1 */, 0x09u /* DN1DP2 */ };
     (void)bb_write(&m77, 0x25u, muic_usb, 2);
+    /* Wait for LDO12/15/16 + SAFEOUT1 rails to settle on cold standalone boot */
+    exy_udelay(5000);
     /* 3. Enable Exynos 4412 USB OTG PHY0 (24 MHz) */
     if (pmu_drv_va)
         dwr(pmu_drv_va + 0x704u /* USB_PHY_CTRL */, drd(pmu_drv_va + 0x704u) | 1u);
     uintptr_t phy = ml_io_map(USBPHY_PA, 0x1000u);
     if (phy) {
         dwr(phy + 0x00u /* PHYPWR */, drd(phy + 0x00u) & ~((1u << 5) | (1u << 4) | (1u << 3) | 1u));
-        dwr(phy + 0x04u /* PHYCLK */, (drd(phy + 0x04u) & ~((1u << 6) | (1u << 4) | 7u)) | 5u);
+        dwr(phy + 0x04u /* PHYCLK */, (drd(phy + 0x04u) & ~((1u << 4) | (1u << 3) | 7u)) | 5u);
         dwr(phy + 0x08u /* RSTCON */, (drd(phy + 0x08u) & ~6u) | 1u);
         exy_udelay(20);
         dwr(phy + 0x08u, drd(phy + 0x08u) & ~7u);
-        exy_udelay(20);
+        exy_udelay(1000);
     }
     /* 4. Configure Synopsys DWC2 in Slave (PIO) HS Device mode + soft-connect */
-    uint32_t id = drd(otg_va + 0x40u /* GSNPSID */);
+    uint32_t id = 0u;
+    for (int t = 0; t < 10; t++) {
+        id = drd(otg_va + 0x40u /* GSNPSID */);
+        if ((id >> 16) == 0x4f54u)
+            break;
+        exy_udelay(1000);
+    }
     exy_drv_log.st.otg_id = id;
     if ((id >> 16) != 0x4f54u)
         return;
