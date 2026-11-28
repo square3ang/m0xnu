@@ -309,17 +309,9 @@ static void dispatch_buttons(void *client, uint32_t prev, uint32_t cur)
     }
 }
 
-/* Debug (gtest=4): route touches through the HID report path (kernel IOHIDEventDriver), so
- * backboardd sees them as real digitizer-service events instead of client-injected ones. */
-static void *g_hid_dev;
-
 static void dispatch_touch(void *client, const struct exy_touch_state *prev,
                            const struct exy_touch_state *cur)
 {
-    if (g_hid_dev) {
-        (void)send_hid_touch_report(g_hid_dev, prev, cur);
-        return;
-    }
     if (!client)
         return;
     uint32_t any_down = 0, any_changed = 0, have_pos = 0;
@@ -483,11 +475,15 @@ static void inspect_procs(void)
     typedef int (*tt_t)(uint32_t, uint32_t **, uint32_t *);
     typedef int (*tgs_t)(uint32_t, int, uint32_t *, uint32_t *);
     typedef int (*vmr_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
+    typedef int (*mpd_t)(uint32_t, uint32_t);
+    typedef int (*vmd_t)(uint32_t, uint32_t, uint32_t);
     proc_name_t fn_pn = (proc_name_t)dlsym((void *)-2, "proc_name");
     tfp_t fn_tfp = (tfp_t)dlsym((void *)-2, "task_for_pid");
     tt_t fn_tt = (tt_t)dlsym((void *)-2, "task_threads");
     tgs_t fn_tgs = (tgs_t)dlsym((void *)-2, "thread_get_state");
     vmr_t fn_vmr = (vmr_t)dlsym((void *)-2, "vm_read_overwrite");
+    mpd_t fn_mpd = (mpd_t)dlsym((void *)-2, "mach_port_deallocate");
+    vmd_t fn_vmd = (vmd_t)dlsym((void *)-2, "vm_deallocate");
     if (!fn_pn) return;
     char name[64], msg[220];
     for (int pid = 1; pid < 160; pid++) {
@@ -506,27 +502,37 @@ static void inspect_procs(void)
             snprintf(msg, sizeof(msg), "[PS] pid=%d %s nthr=%u pc=0x%x lr=0x%x\n",
                      pid, name, nthr, st[15], st[14]);
             dlog(msg);
-            continue;
-        }
-        snprintf(msg, sizeof(msg), "[PS] pid=%d %s nthr=%u\n", pid, name, nthr);
-        dlog(msg);
-        uint32_t max_t = str_has(name, "backboard") ? 16u : 6u;
-        for (uint32_t ti = 0; ti < nthr && ti < max_t; ti++) {
-            uint32_t st[17] = {0}, cnt = 17, fp = 0, f[2] = {0}, outsz = 8;
-            if (fn_tgs(thrs[ti], 1, st, &cnt) != 0) continue;
-            uint32_t bt[4] = {0};
-            fp = st[7];
-            for (int k = 0; k < 4 && fn_vmr && fp > 0x10000 && (fp & 3u) == 0; k++) {
-                outsz = 8;
-                if (fn_vmr(task, fp, 8, (uint32_t)(uintptr_t)f, &outsz) != 0 || outsz < 8) break;
-                bt[k] = f[1];
-                if (f[0] <= fp) break;
-                fp = f[0];
-            }
-            snprintf(msg, sizeof(msg), "[PS]   t%u pc=0x%x lr=0x%x bt=0x%x,0x%x,0x%x,0x%x\n",
-                     ti, st[15], st[14], bt[0], bt[1], bt[2], bt[3]);
+        } else {
+            snprintf(msg, sizeof(msg), "[PS] pid=%d %s nthr=%u\n", pid, name, nthr);
             dlog(msg);
+            uint32_t max_t = str_has(name, "backboard") ? 16u : 6u;
+            for (uint32_t ti = 0; ti < nthr && ti < max_t; ti++) {
+                uint32_t st[17] = {0}, cnt = 17, fp = 0, f[2] = {0}, outsz = 8;
+                if (fn_tgs(thrs[ti], 1, st, &cnt) != 0) continue;
+                uint32_t bt[4] = {0};
+                fp = st[7];
+                for (int k = 0; k < 4 && fn_vmr && fp > 0x10000 && (fp & 3u) == 0; k++) {
+                    outsz = 8;
+                    if (fn_vmr(task, fp, 8, (uint32_t)(uintptr_t)f, &outsz) != 0 || outsz < 8) break;
+                    bt[k] = f[1];
+                    if (f[0] <= fp) break;
+                    fp = f[0];
+                }
+                snprintf(msg, sizeof(msg), "[PS]   t%u pc=0x%x lr=0x%x bt=0x%x,0x%x,0x%x,0x%x\n",
+                         ti, st[15], st[14], bt[0], bt[1], bt[2], bt[3]);
+                dlog(msg);
+            }
         }
+        if (thrs) {
+            if (fn_mpd) {
+                for (uint32_t ti = 0; ti < nthr; ti++)
+                    fn_mpd(mach_task_self_, thrs[ti]);
+            }
+            if (fn_vmd && nthr > 0)
+                fn_vmd(mach_task_self_, (uint32_t)(uintptr_t)thrs, nthr * (uint32_t)sizeof(uint32_t));
+        }
+        if (task && fn_mpd)
+            fn_mpd(mach_task_self_, task);
     }
 }
 
@@ -604,13 +610,10 @@ static void run_safari_repro(io_connect_t conn, void *client)
 }
 
 #define MALI_CMD_DRV_POLL       12u
-#define MALI_CMD_DRV_BRIGHTNESS 13u
-#define MALI_CMD_DRV_LED        14u
 #define MALI_CMD_DRV_VIBRATE    15u
 #define MALI_CMD_DRV_POWER_SYNC 16u
 #define MALI_CMD_DRV_AUDIO_VOL  17u
 #define MALI_CMD_DRV_AUDIO_TONE 18u
-#define MALI_CMD_DRV_TORCH      19u
 
 struct exy_drv_status {
     uint32_t probe_mask;
@@ -647,38 +650,19 @@ struct exy_drv_status {
 
 static uint8_t g_audio_vol = 75u;
 
-static void dispatch_sensors(io_connect_t conn, void *client, uint32_t tick)
+static void dispatch_sensors(io_connect_t conn, void *client)
 {
-    typedef CFTypeRef (*hid_vec3_t)(CFTypeRef, uint64_t, float, float, float, uint32_t);
-    typedef CFTypeRef (*hid_als_t)(CFTypeRef, uint64_t, float, uint32_t);
-    typedef CFTypeRef (*hid_prox_t)(CFTypeRef, uint64_t, uint32_t, uint32_t);
-    static int resolved = 0;
-    static hid_vec3_t fn_accel, fn_gyro, fn_compass;
-    static hid_als_t fn_als;
-    static hid_prox_t fn_prox;
     static uint8_t prev_tkey = 0;
     static uint8_t prev_jack = 0xffu;
 
     if (!client)
         return;
-    if (!resolved) {
-        resolved = 1;
-        fn_accel   = (hid_vec3_t)dlsym((void *)-2, "IOHIDEventCreateAccelerometerEvent");
-        fn_gyro    = (hid_vec3_t)dlsym((void *)-2, "IOHIDEventCreateGyroEvent");
-        fn_compass = (hid_vec3_t)dlsym((void *)-2, "IOHIDEventCreateCompassEvent");
-        fn_als     = (hid_als_t)dlsym((void *)-2, "IOHIDEventCreateAmbientLightSensorEvent");
-        fn_prox    = (hid_prox_t)dlsym((void *)-2, "IOHIDEventCreateProximtyEvent");
-    }
     struct exy_drv_status ds;
     size_t sz = sizeof(ds);
     if (IOConnectCallStructMethod(conn, MALI_CMD_DRV_POLL, NULL, 0, &ds, &sz) != 0 || sz < 64u)
         return;
 
     uint64_t ts = mach_absolute_time();
-    /* Skip injecting synthetic accel/gyro/compass/ALS/prox HID events with digitizer g_sender_id:
-     * iOS 9 IOHIDEventCreateAmbientLightSensorEvent takes 8 args (not 4) and reusing the digitizer
-     * sender ID triggers backboardd HID re-probing every ~838ms and stalls SpringBoard's Lock Screen transition. */
-    (void)fn_accel; (void)fn_gyro; (void)fn_compass; (void)fn_als; (void)fn_prox; (void)tick;
     /* Capacitive touchkeys (bit0=Menu, bit1=Back) -> haptic click + Home event */
     if ((ds.probe_mask & (1u << 9)) && ds.touchkeys != prev_tkey) {
         uint8_t rise = (uint8_t)(ds.touchkeys & ~prev_tkey);
@@ -1146,40 +1130,54 @@ static void wifi_boot_firmware(io_connect_t conn)
     fn_close(fd);
     if (!ok || off == 0u) return;
 
-    /* Load & format NVRAM text (strip comments/blank lines -> null-separated key=value pairs) */
-    int nfd = fn_open("/usr/share/firmware/wifi/brcmfmac4334-sdio.txt", 0);
-    if (nfd < 0) {
-        dlog("[WIFI] missing /usr/share/firmware/wifi/brcmfmac4334-sdio.txt\n");
-        return;
-    }
-    char raw[2048];
-    long rn = fn_read(nfd, raw, sizeof(raw) - 1u);
-    fn_close(nfd);
-    if (rn <= 0) return;
-    raw[rn] = '\0';
-
-    memset(&req, 0, sizeof(req));
+    /* Load & format NVRAM text (strip comments/blank lines -> null-separated key=value pairs)
+     * and upload in <=1024 B chunks via WIFI_OP_NVRAM_WRITE (op=5); if missing, kernel uses embedded NVRAM. */
     uint32_t nlen = 0u;
-    const char *p = raw;
-    while (*p && nlen < 1016u) {
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        if (!*p) break;
-        if (*p == '#') {
-            while (*p && *p != '\n') p++;
-            continue;
-        }
-        const char *ls = p;
-        while (*p && *p != '\n' && *p != '\r') p++;
-        uint32_t ll = (uint32_t)(p - ls);
-        if (ll > 0u && nlen + ll + 2u < 1020u) {
-            memcpy(req.data + nlen, ls, ll);
-            nlen += ll;
-            req.data[nlen++] = '\0';
+    int nfd = fn_open("/usr/share/firmware/wifi/brcmfmac4334-sdio.txt", 0);
+    if (nfd >= 0) {
+        char raw[4096];
+        long rn = fn_read(nfd, raw, sizeof(raw) - 1u);
+        fn_close(nfd);
+        if (rn > 0) {
+            raw[rn] = '\0';
+            uint8_t nvbuf[2048];
+            const char *p = raw;
+            while (*p && nlen + 2u < sizeof(nvbuf)) {
+                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+                if (!*p) break;
+                if (*p == '#') {
+                    while (*p && *p != '\n') p++;
+                    continue;
+                }
+                const char *ls = p;
+                while (*p && *p != '\n' && *p != '\r') p++;
+                uint32_t ll = (uint32_t)(p - ls);
+                if (ll > 0u && nlen + ll + 2u <= sizeof(nvbuf)) {
+                    memcpy(nvbuf + nlen, ls, ll);
+                    nlen += ll;
+                    nvbuf[nlen++] = '\0';
+                }
+            }
+            if (nlen > 0u) {
+                nvbuf[nlen++] = '\0';
+                for (uint32_t noff = 0u; noff < nlen; ) {
+                    uint32_t chunk = nlen - noff;
+                    if (chunk > sizeof(req.data))
+                        chunk = sizeof(req.data);
+                    memset(&req, 0, sizeof(req));
+                    req.op = 5u; /* WIFI_OP_NVRAM_WRITE */
+                    req.arg0 = noff;
+                    req.arg1 = chunk;
+                    memcpy(req.data, nvbuf + noff, chunk);
+                    if (wifi_call(conn, &req, &rsp) != 0 || rsp.err != 0)
+                        break;
+                    noff += chunk;
+                }
+            }
         }
     }
-    req.data[nlen++] = '\0';
-    req.op = 3u; /* NVRAM_BOOT */
-    req.arg1 = nlen;
+    memset(&req, 0, sizeof(req));
+    req.op = 3u; /* WIFI_OP_NVRAM_BOOT */
     (void)wifi_call(conn, &req, &rsp);
     req.op = 0u;
     if (wifi_call(conn, &req, &rsp) == 0 && rsp.out_len >= sizeof(wst)) {
@@ -1195,11 +1193,18 @@ static void wifi_boot_firmware(io_connect_t conn)
 static void *wifi_boot_thread(void *arg)
 {
     (void)arg;
+    typedef kern_return_t (*ioclose_t)(io_connect_t);
+    ioclose_t fn_close = (ioclose_t)dlsym((void *)-2, "IOServiceClose");
     io_service_t svc = IOServiceGetMatchingService(
         kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
     io_connect_t wconn = 0;
-    if (svc && IOServiceOpen(svc, mach_task_self_, 0, &wconn) == 0 && wconn) {
-        wifi_boot_firmware(wconn);
+    if (svc) {
+        if (IOServiceOpen(svc, mach_task_self_, 0, &wconn) == 0 && wconn) {
+            wifi_boot_firmware(wconn);
+            if (fn_close)
+                fn_close(wconn);
+        }
+        IOObjectRelease(svc);
     }
     return NULL;
 }
@@ -1216,8 +1221,13 @@ int main(void)
     for (int tries = 0; tries < 200; tries++) {
         io_service_t svc = IOServiceGetMatchingService(
             kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
-        if (svc && IOServiceOpen(svc, mach_task_self_, 0, &conn) == 0)
-            break;
+        if (svc) {
+            kern_return_t okr = IOServiceOpen(svc, mach_task_self_, 0, &conn);
+            IOObjectRelease(svc);
+            if (okr == 0 && conn)
+                break;
+            conn = 0;
+        }
         usleep(100000);
     }
     if (!conn) {
@@ -1233,10 +1243,12 @@ int main(void)
     uint32_t status_ptr = hid_client ? (uint32_t)(uintptr_t)hid_client : (uint32_t)(uintptr_t)dev;
 
     struct exy_touch_state prev, st;
+    memset(&prev, 0, sizeof(prev));
+    memset(&st, 0, sizeof(st));
     size_t sz = sizeof(st);
-    (void)IOConnectCallStructMethod(conn, MALI_CMD_POLL_TOUCH,
-                                    &status_ptr, sizeof(status_ptr), &st, &sz);
-    prev = st;
+    if (IOConnectCallStructMethod(conn, MALI_CMD_POLL_TOUCH,
+                                  &status_ptr, sizeof(status_ptr), &st, &sz) == 0)
+        prev = st;
     uint32_t init_srv = hid_client ? *(const uint32_t *)((const uint8_t *)hid_client + 8) : 0u;
     snprintf(msg, sizeof(msg), "[TOUCHD] bp=0x%x client=%p srv=0x%x dev=%p prio=(%d,0x%x)\n",
              (unsigned)bootstrap_port, hid_client, (unsigned)init_srv, dev, pr_rc, (unsigned)tp_rc);
@@ -1267,7 +1279,7 @@ int main(void)
         usleep(had_ev ? 4000u : (st.count ? 8000u : (idle_polls > 120u ? 30000u : 10000u)));
         had_ev = 0;
         uint64_t now = mach_absolute_time();
-        uint32_t el_sec = (uint32_t)((now - t_boot) >> 20) * 1000u / 22888u;
+        uint32_t el_sec = (uint32_t)((((now - t_boot) >> 8) * 45813ULL) >> 32);
         uint32_t cur_srv = hid_client ? *(const uint32_t *)((const uint8_t *)hid_client + 8) : 0u;
         if (cur_srv && !g_sender_resolved && (++client_retry % 64u == 0u))
             resolve_sender_id(hid_client);
@@ -1354,7 +1366,7 @@ int main(void)
         static uint32_t sensor_tick = 0;
         uint32_t sensor_mask = (idle_polls > 120u) ? 7u : 3u;
         if (hid_client && cur_srv && (++sensor_tick & sensor_mask) == 0u)
-            dispatch_sensors(conn, hid_client, sensor_tick >> 2);
+            dispatch_sensors(conn, hid_client);
         if (st.seq == prev.seq) {
             if (!st.count && idle_polls < 1000u)
                 idle_polls++;

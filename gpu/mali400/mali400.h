@@ -23,8 +23,10 @@ struct mali_env {
 	void (*flush)(void *p, uint32_t len);	/* make CPU writes visible to the GPU */
 };
 
-/* DTE + 8 page tables + clear stream + RSW/shader, then the job pool */
-#define MALI_MEM_SIZE		0x100000
+/* DTE + 144 page tables + clear stream + RSW/shader, then the job pool */
+#define MALI_W_PT_NUM		144
+#define MALI_W_POOL		0xa0000
+#define MALI_MEM_SIZE		0x180000
 
 struct mali_fb {
 	uint32_t pa;		/* identity-mapped for the GPU */
@@ -66,5 +68,8 @@ int mali_run_job(const struct mali_env *env, const struct mali_job *job, const s
 void mali_pp_clear_frame(uint32_t frame[MALI_PP_FRAME_REGS], uint32_t wb[3 * MALI_PP_WB_REGS],
 			 const struct mali_fb *fb, uint32_t stream_pa, uint32_t rsw_pa, uint32_t rgba);
 uint32_t mali_pp_stream(uint32_t *s, uint32_t width, uint32_t height);
+void mali_pt_reset(const struct mali_env *env);
+int mali_map_va(const struct mali_env *env, uint32_t va, uint32_t pa, uint32_t len);
+void mali_unmap_va(const struct mali_env *env, uint32_t va, uint32_t len);
 
 #endif

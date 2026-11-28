@@ -391,7 +391,7 @@ index bafd1f97..47089820 100644
  #define INFORM_MAGIC 0x12345670
  enum boot_mode {
 diff --git a/drivers/fastboot/fb_getvar.c b/drivers/fastboot/fb_getvar.c
-index 95cb4341..bcebfc5a 100644
+index 95cb4341..8f25e076 100644
 --- a/drivers/fastboot/fb_getvar.c
 +++ b/drivers/fastboot/fb_getvar.c
 @@ -30,6 +30,9 @@ static void getvar_partition_type(char *part_name, char *response);
@@ -404,7 +404,7 @@ index 95cb4341..bcebfc5a 100644
  
  static const struct {
  	const char *variable;
-@@ -80,9 +83,33 @@ static const struct {
+@@ -80,9 +83,45 @@ static const struct {
  	}, {
  		.variable = "is-userspace",
  		.dispatch = getvar_is_userspace
@@ -423,13 +423,25 @@ index 95cb4341..bcebfc5a 100644
 + */
 +static void getvar_mem(char *var_parameter, char *response)
 +{
++	char *endp;
++	ulong addr;
 +	u32 *p;
 +
-+	if (!var_parameter) {
++	if (!var_parameter || !*var_parameter) {
 +		fastboot_fail("usage: mem:<hex addr>", response);
 +		return;
 +	}
-+	p = (u32 *)(simple_strtoul(var_parameter, NULL, 16) & ~3UL);
++	addr = simple_strtoul(var_parameter, &endp, 16);
++	if (endp == var_parameter || *endp != '\0') {
++		fastboot_fail("usage: mem:<hex addr>", response);
++		return;
++	}
++	addr &= ~3UL;
++	if (addr < 0x40000000UL || addr > 0x7ffffff0UL) {
++		fastboot_fail("mem addr out of DRAM range", response);
++		return;
++	}
++	p = (u32 *)addr;
 +	fastboot_response("OKAY", response, "%08x %08x %08x %08x",
 +			  p[0], p[1], p[2], p[3]);
 +}
@@ -525,293 +537,3 @@ index 9a4c0da5..420c4fc1 100644
  #include <exynos_lcd.h>
  #else
  typedef struct vidinfo {
-diff --git a/board/samsung/midas/xnufb.c b/board/samsung/midas/xnufb.c
-new file mode 100644
-index 00000000..28d85657
---- /dev/null
-+++ b/board/samsung/midas/xnufb.c
-@@ -0,0 +1,217 @@
-+// SPDX-License-Identifier: GPL-2.0+
-+/*
-+ * xnufb: light the Galaxy S3 (midas) s6e8aa0 panel and leave FIMD0 scanning out a
-+ * framebuffer, for the XNU bring-up (the kernel gets it as its video console).
-+ *
-+ * Power, reset and timings follow Linux (exynos4412-galaxy-s3.dtsi); FIMD and DSIM
-+ * settings are Trats2's (exynos4412-trats2.dts), the same panel. DSIM and the panel
-+ * init sequence are U-Boot's legacy drivers (drivers/video/exynos, s6e8ax0.c).
-+ *
-+ * usage: xnufb <fb address> [16|32]
-+ */
-+#include <common.h>
-+#include <command.h>
-+#include <lcd.h>
-+#include <asm/io.h>
-+#include <asm/gpio.h>
-+#include <asm/arch/clk.h>
-+#include <asm/arch/clock.h>
-+#include <asm/arch/cpu.h>
-+#include <asm/arch/fb.h>
-+#include <asm/arch/mipi_dsim.h>
-+#include <asm/arch/power.h>
-+#include <asm/arch/system.h>
-+#include <power/regulator.h>
-+
-+#define FIMD0_BASE	0x11c00000
-+#define DSIM0_BASE	0x11c80000
-+#define PMU_MIPI_PHY0	0x10020710
-+
-+static vidinfo_t xnufb_panel = {
-+	/* vl_width/vl_height: the DSIM code takes them as the resolution (MDRESOL), not mm */
-+	.vl_col = 720, .vl_row = 1280, .vl_width = 720, .vl_height = 1280,
-+	.vl_freq = 60, .vl_clkp = 0, .vl_hsp = 1, .vl_vsp = 1, .vl_dp = 1,
-+	.vl_hspw = 5, .vl_hbpd = 5, .vl_hfpd = 5,	/* galaxy-s3.dtsi, 57.15 MHz pixel clock */
-+	.vl_vspw = 2, .vl_vbpd = 1, .vl_vfpd = 13, .vl_cmd_allow_len = 0xf,
-+	.interface_mode = 1, .mipi_enabled = 1,
-+};
-+
-+static struct mipi_dsim_config dsim_config = {
-+	.e_interface = DSIM_VIDEO,
-+	.e_virtual_ch = DSIM_VIRTUAL_CH_0,
-+	.e_pixel_format = DSIM_24BPP_888,
-+	.e_burst_mode = DSIM_BURST_SYNC_EVENT,
-+	.e_no_data_lane = DSIM_DATA_LANE_4,
-+	.e_byte_clk = DSIM_PLL_OUT_DIV8,
-+	/* Linux s6e8aa0 mode_flags: VIDEO | BURST | VSYNC_FLUSH | AUTO_VERT, HFP on */
-+	.auto_vertical_cnt = 1,
-+	.p = 3, .m = 125, .s = 1,	/* 24 MHz * 125 / 3 / 2 = 500 MHz (midas burst-clock) */
-+	.pll_stable_time = 500,
-+	.esc_clk = 20000000,
-+	.stop_holding_cnt = 0x7ff,
-+	.bta_timeout = 0xff,
-+	.rx_timeout = 0xffff,
-+};
-+
-+static int reg_on(const char *name, int uV)
-+{
-+	struct udevice *dev;
-+	int ret = regulator_get_by_platname(name, &dev);
-+
-+	if (!ret && uV)
-+		ret = regulator_set_value(dev, uV);
-+	if (!ret)
-+		ret = regulator_set_enable(dev, true);
-+	if (ret)
-+		printf("xnufb: regulator %s: %d\n", name, ret);
-+	return ret;
-+}
-+
-+/* exynos_mipi_dsi_init: DSIM core and I/O rails */
-+int mipi_power(void)
-+{
-+	return reg_on("VMIPI_1.0V", 0) | reg_on("VMIPI_1.8V", 0);
-+}
-+
-+/* exynos_mipi_dsi_init: panel vdd3 (GPC0[1]) and vci (LDO25), then a reset pulse */
-+static int lcd_power(void)
-+{
-+	gpio_request(EXYNOS4X12_GPIO_C01, "lcd_vdd3");
-+	gpio_direction_output(EXYNOS4X12_GPIO_C01, 1);
-+	reg_on("LCD_VCC_3.3V", 2800000);
-+	mdelay(50);
-+	gpio_request(EXYNOS4X12_GPIO_F21, "lcd_reset");
-+	gpio_direction_output(EXYNOS4X12_GPIO_F21, 0);
-+	mdelay(10);
-+	gpio_set_value(EXYNOS4X12_GPIO_F21, 1);
-+	mdelay(100);
-+	return 0;
-+}
-+
-+/* set_mipi_phy_ctrl() only handles the 4210 */
-+static void phy_enable(unsigned int index, unsigned int enable)
-+{
-+	setbits_le32(PMU_MIPI_PHY0, EXYNOS_MIPI_PHY_MRESETN | EXYNOS_MIPI_PHY_ENABLE);
-+}
-+
-+static struct exynos_platform_mipi_dsim dsim_pd = {
-+	.lcd_panel_name = "s6e8ax0",
-+	.dsim_config = &dsim_config,
-+	.lcd_panel_info = &xnufb_panel,
-+	.lcd_power = lcd_power,
-+	.mipi_power = mipi_power,
-+	.phy_enable = phy_enable,
-+};
-+
-+static struct mipi_dsim_lcd_device dsim_lcd = {
-+	.name = "s6e8ax0",
-+	.id = -1,
-+	.bus_id = 0,
-+	.reverse_panel = 1,
-+	.platform_data = &dsim_pd,
-+};
-+
-+/* RGB interface into the DSIM, window 0 from fb; see exynos_fimd_lcd_init() */
-+static void fimd_init(ulong fb, int bpp)
-+{
-+	struct exynos_fb *reg = (struct exynos_fb *)FIMD0_BASE;
-+	unsigned int off = exynos_fimd_get_base_offset(), cfg, stride = 720 * bpp / 8;
-+	ulong pclk = 60 * (5 + 5 + 5 + 720) * (2 + 13 + 1 + 1280);
-+
-+	writel(EXYNOS_VIDCON0_VIDOUT_RGB, &reg->vidcon0);
-+	clrsetbits_le32(&reg->vidcon2, EXYNOS_VIDCON2_WB_MASK | EXYNOS_VIDCON2_TVFORMATSEL_MASK |
-+			EXYNOS_VIDCON2_TVFORMATSEL_YUV_MASK, EXYNOS_VIDCON2_WB_DISABLE);
-+	writel(EXYNOS_VIDCON1_IVCLK_RISING_EDGE, (ulong)&reg->vidcon1 + off);
-+	writel(EXYNOS_VIDTCON0_VFPD(13 - 1) | EXYNOS_VIDTCON0_VBPD(1 - 1) |
-+	       EXYNOS_VIDTCON0_VSPW(2 - 1), (ulong)&reg->vidtcon0 + off);
-+	writel(EXYNOS_VIDTCON1_HFPD(5 - 1) | EXYNOS_VIDTCON1_HBPD(5 - 1) |
-+	       EXYNOS_VIDTCON1_HSPW(5 - 1), (ulong)&reg->vidtcon1 + off);
-+	writel(EXYNOS_VIDTCON2_HOZVAL(719) | EXYNOS_VIDTCON2_LINEVAL(1279) |
-+	       EXYNOS_VIDTCON2_HOZVAL_E(719) | EXYNOS_VIDTCON2_LINEVAL_E(1279),
-+	       (ulong)&reg->vidtcon2 + off);
-+
-+	cfg = EXYNOS_WINCON_DATAPATH_DMA | EXYNOS_WINCON_BURSTLEN_16WORD;
-+	cfg |= bpp == 16 ? EXYNOS_WINCON_BPPMODE_16BPP_565 | EXYNOS_WINCON_HAWSWP_ENABLE
-+			 : EXYNOS_WINCON_BPPMODE_24BPP_888 | EXYNOS_WINCON_WSWP_ENABLE;
-+	writel(cfg, &reg->wincon0);
-+	writel(EXYNOS_VIDOSD_LEFT_X(0) | EXYNOS_VIDOSD_TOP_Y(0), &reg->vidosd0a);
-+	writel(EXYNOS_VIDOSD_RIGHT_X(719) | EXYNOS_VIDOSD_BOTTOM_Y(1279) |
-+	       EXYNOS_VIDOSD_RIGHT_X_E(1) | EXYNOS_VIDOSD_BOTTOM_Y_E(0), &reg->vidosd0b);
-+	writel(EXYNOS_VIDOSD_SIZE(720 * 1280), &reg->vidosd0c);
-+	writel(fb, &reg->vidw00add0b0);
-+	writel(fb + stride * 1280, &reg->vidw00add1b0);
-+	writel(EXYNOS_VIDADDR_PAGEWIDTH(stride) | EXYNOS_VIDADDR_PAGEWIDTH_E(stride),
-+	       &reg->vidw00add2);
-+
-+	cfg = readl(&reg->vidcon0) & ~(EXYNOS_VIDCON0_CLKSEL_MASK | EXYNOS_VIDCON0_CLKVALUP_MASK |
-+		EXYNOS_VIDCON0_CLKVAL_F(0xff) | EXYNOS_VIDCON0_VCLKEN_MASK | EXYNOS_VIDCON0_CLKDIR_MASK);
-+	cfg |= EXYNOS_VIDCON0_CLKSEL_SCLK | EXYNOS_VIDCON0_CLKVALUP_ALWAYS |
-+	       EXYNOS_VIDCON0_VCLKEN_NORMAL | EXYNOS_VIDCON0_CLKDIR_DIVIDED |
-+	       EXYNOS_VIDCON0_CLKVAL_F(DIV_ROUND_CLOSEST(get_lcd_clk(), pclk) - 1);
-+	writel(cfg | EXYNOS_VIDCON0_ENVID_ENABLE | EXYNOS_VIDCON0_ENVID_F_ENABLE, &reg->vidcon0);
-+	setbits_le32(&reg->wincon0, EXYNOS_WINCON_ENWIN_ENABLE);
-+	setbits_le32(&reg->winshmap, EXYNOS_WINSHMAP_CH_ENABLE(0));
-+}
-+
-+int xnufb_start(ulong fb, int bpp)
-+{
-+	int ret;
-+
-+	if (bpp != 16 && bpp != 32)
-+		return -1;
-+	xnufb_panel.vl_bpix = bpp == 16 ? 4 : 5;
-+
-+	set_system_display_ctrl();
-+	set_lcd_clk();
-+	fimd_init(fb, bpp);
-+	exynos_mipi_dsi_register_lcd_device(&dsim_lcd);
-+	s6e8ax0_init();		/* binds to the device registered above */
-+	ret = exynos_mipi_dsi_init(&dsim_pd);
-+	printf("xnufb: %dx%d %d bpp at %#lx: %d\n", 720, 1280, bpp, fb, ret);
-+	return ret;
-+}
-+
-+static void dsim_short_dcs(u8 cmd)
-+{
-+	int i;
-+
-+	for (i = 0; i < 5000; i++) {
-+		if (readl(DSIM0_BASE + 0x44) & (1u << 22)) /* SFR_HEADER_EMPTY */
-+			break;
-+		udelay(2);
-+	}
-+	writel(0x05u | ((u32)cmd << 8), DSIM0_BASE + 0x34); /* MIPI_DSI_DCS_SHORT_WRITE */
-+}
-+
-+void xnufb_display_enable(int on)
-+{
-+	if (on) {
-+		dsim_short_dcs(0x11); /* Sleep Out */
-+		mdelay(120);
-+		dsim_short_dcs(0x29); /* Display On */
-+	} else {
-+		dsim_short_dcs(0x28); /* Display Off */
-+		mdelay(20);
-+		dsim_short_dcs(0x10); /* Sleep In */
-+		mdelay(80);
-+	}
-+}
-+
-+static int do_xnufb(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
-+{
-+	ulong fb;
-+	int bpp, ret;
-+
-+	if (argc < 2)
-+		return CMD_RET_USAGE;
-+	fb = simple_strtoul(argv[1], NULL, 16);
-+	bpp = argc > 2 ? simple_strtoul(argv[2], NULL, 10) : 32;
-+	if (bpp != 16 && bpp != 32)
-+		return CMD_RET_USAGE;
-+
-+	ret = xnufb_start(fb, bpp);
-+	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-+}
-+
-+U_BOOT_CMD(xnufb, 3, 0, do_xnufb, "light the panel, scan out a framebuffer",
-+	   "<fb address (hex)> [16|32]");
-diff --git a/board/samsung/midas/malitest.c b/board/samsung/midas/malitest.c
-new file mode 100644
-index 00000000..c11c30dc
---- /dev/null
-+++ b/board/samsung/midas/malitest.c
-@@ -0,0 +1,61 @@
-+// SPDX-License-Identifier: GPL-2.0
-+/*
-+ * malitest: bring up the Mali-400 (gpu/mali400) and clear a 720x1280x32 framebuffer
-+ * with the GPU. Pair with "xnufb <fb> 32" to see the result on the panel.
-+ *
-+ * usage: malitest <fb address> [rgba]   (rgba = 0xAABBGGRR, default 0xff00ff00)
-+ *        malitest <fb address> tri      (replay tri_job: GP + 4 PP, RGB triangle)
-+ */
-+#include <common.h>
-+#include <command.h>
-+#include <cpu_func.h>
-+#include "../../../../gpu/mali400/mali400.c"
-+#include "../../../../gpu/mali400/tri_job.h"
-+
-+#define MALI_WORK_PA	0x5f000000	/* above XNU RAM (0x4ff00000), below FB_PA */
-+
-+static void mali_flush(void *p, uint32_t len)
-+{
-+	ulong s = (ulong)p & ~(ulong)(CONFIG_SYS_CACHELINE_SIZE - 1);
-+
-+	flush_dcache_range(s, ALIGN((ulong)p + len, CONFIG_SYS_CACHELINE_SIZE));
-+}
-+
-+static void mali_udelay(unsigned us)
-+{
-+	udelay(us);
-+}
-+
-+static int do_malitest(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
-+{
-+	const struct mali_env env = {
-+		.gpu = 0x13000000, .cmu = 0x10030000, .pmu = 0x10020000,
-+		.mem = (uint8_t *)MALI_WORK_PA, .mem_pa = MALI_WORK_PA,
-+		.udelay = mali_udelay, .flush = mali_flush,
-+	};
-+	struct mali_fb fb = { .width = 720, .height = 1280, .stride = 2880 };
-+	uint32_t rgba = 0xff00ff00;
-+	int ret;
-+
-+	if (argc < 2)
-+		return CMD_RET_USAGE;
-+	fb.pa = simple_strtoul(argv[1], NULL, 16);
-+	if (argc > 2 && strcmp(argv[2], "tri"))
-+		rgba = simple_strtoul(argv[2], NULL, 16);
-+
-+	ret = mali_init(&env);
-+	printf("malitest: init %d (%#x)\n", ret, mali_last_status);
-+	if (!ret && argc > 2 && !strcmp(argv[2], "tri")) {
-+		ret = mali_run_job(&env, &tri_job, &fb);
-+		printf("malitest: tri %d (rawstat %#x)\n", ret, mali_last_status);
-+		invalidate_dcache_range(fb.pa, fb.pa + fb.stride * fb.height);
-+	} else if (!ret) {
-+		ret = mali_pp_clear(&env, &fb, rgba);
-+		printf("malitest: clear %d (rawstat %#x)\n", ret, mali_last_status);
-+		invalidate_dcache_range(fb.pa, fb.pa + fb.stride * fb.height);
-+	}
-+	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
-+}
-+
-+U_BOOT_CMD(malitest, 3, 0, do_malitest, "clear a framebuffer with the Mali-400",
-+	   "<fb address (hex)> [rgba (hex, 0xAABBGGRR) | tri]");

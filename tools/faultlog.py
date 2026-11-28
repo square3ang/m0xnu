@@ -4,17 +4,10 @@
 usage: faultlog.py <fault= address from the mkxnu info line> [dyld_shared_cache_armv7]
 kern_return: 1 KERN_INVALID_ADDRESS (SIGSEGV), 2 KERN_PROTECTION_FAILURE (SIGBUS), ...
 """
-import bisect, re, struct, subprocess, sys
+import bisect, struct, sys
+from fbmem import mem_words as mem
 
 RING = 16  # shim.c exy_fault_log
-
-
-def mem(addr):
-    o = subprocess.run(["fastboot", "getvar", f"mem:{addr:#x}"], capture_output=True, text=True, timeout=5)
-    m = re.search(r"mem:0x[0-9a-f]+: ((?:[0-9a-f]{8} ?){4})", o.stdout + o.stderr)
-    if not m:
-        sys.exit(f"getvar mem:{addr:#x} failed")
-    return [int(w, 16) for w in m[1].split()]
 
 
 def cache_images(path):

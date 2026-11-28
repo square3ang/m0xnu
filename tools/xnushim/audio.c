@@ -69,10 +69,10 @@ static uint32_t *audio_ring;
 static struct ioa2_status *audio_status;
 static volatile int audio_running;
 static int audio_thread_started;
-static void *audio_mtx;
+static void *volatile audio_mtx;
 static uint8_t audio_vol = 75u;
 static uint8_t audio_muted = 0u;
-static uint64_t audio_seed = 0ull;
+static volatile uint64_t audio_seed = 0ull;
 static volatile uint64_t audio_start_host = 0ull;
 static volatile uint32_t audio_ms_pid = 0u;
 
@@ -118,8 +118,9 @@ static void audio_ensure_mtx(void)
 {
     if (!audio_mtx) {
         void *iol = audio_iolock_alloc();
-        if (iol)
-            audio_mtx = audio_iolock_mach(iol);
+        void *m = iol ? audio_iolock_mach(iol) : 0;
+        if (m)
+            (void)__sync_val_compare_and_swap(&audio_mtx, (void *)0, m);
     }
 }
 
@@ -133,16 +134,17 @@ static void audio_pump_thread(void *param, int wait_res)
     uint64_t last_seed = 0ull;
 
     for (;;) {
+        void *mtx = audio_mtx;
+        if (mtx) audio_lck_mtx_lock(mtx);
         if (!audio_running || !audio_ring) {
             if (was_running) {
                 exy_i2s0_set_active(0);
                 was_running = 0;
             }
-            if (audio_mtx) {
-                audio_lck_mtx_lock(audio_mtx);
+            if (mtx) {
                 while (!audio_running || !audio_ring)
-                    audio_lck_mtx_sleep(audio_mtx, 0u, (void *)&audio_running, 0u);
-                audio_lck_mtx_unlock(audio_mtx);
+                    audio_lck_mtx_sleep(mtx, 0u, (void *)&audio_running, 0u);
+                audio_lck_mtx_unlock(mtx);
             } else {
                 iosleep_fn(200u);
             }
@@ -195,6 +197,7 @@ static void audio_pump_thread(void *param, int wait_res)
                 }
             }
         }
+        if (mtx) audio_lck_mtx_unlock(mtx);
         /* Wake every 750 us (~36 frames): 64-frame FIFO retains ~28 frames (0.58 ms) jitter headroom */
         clock_delay_until_fn(mach_abs_time() + 18000ull);
     }
@@ -225,6 +228,8 @@ int exy_audio_start_io(void *self)
             audio_thread_started = 1;
         }
     }
+    void *mtx = audio_mtx;
+    if (mtx) audio_lck_mtx_lock(mtx);
     audio_seed++;
     uint64_t t0 = mach_abs_time();
     audio_start_host = t0;
@@ -238,13 +243,10 @@ int exy_audio_start_io(void *self)
         audio_status->reserved[1] = 0ull;
         __asm__ volatile("dmb" ::: "memory");
     }
-    if (audio_mtx) {
-        audio_lck_mtx_lock(audio_mtx);
-        audio_running = 1;
+    audio_running = 1;
+    if (mtx) {
         audio_wakeup_prim((void *)&audio_running, 0, 0);
-        audio_lck_mtx_unlock(audio_mtx);
-    } else {
-        audio_running = 1;
+        audio_lck_mtx_unlock(mtx);
     }
     a_puts("[AUDIO] start vol=0x"); a_putx(audio_muted ? 0u : audio_vol); a_puts("\n");
     (void)exy_drv_set_volume(audio_muted ? 0u : audio_vol);
@@ -255,8 +257,11 @@ int exy_audio_stop_io(void *self)
 {
     if (self != audio_dev)
         return ioa2_orig_stop_io(self);
+    void *mtx = audio_mtx;
+    if (mtx) audio_lck_mtx_lock(mtx);
     audio_running = 0;
     exy_i2s0_set_active(0);
+    if (mtx) audio_lck_mtx_unlock(mtx);
     a_puts("[AUDIO] stop\n");
     return ioa2_orig_stop_io(self);
 }
@@ -265,11 +270,11 @@ int exy_audio_set_ctrl(void *self, uint32_t cid, uint32_t val, uint32_t *out_val
 {
     (void)self;
     a_puts("[AUDIO] ctrl "); a_putx(cid); a_puts(" "); a_putx(val); a_puts("\n");
-    if (cid == 313u || cid == 305u) {
+    if (cid == 305u || cid == 306u || cid == 308u || cid == 311u || cid == 313u) {
         if (val > 100u) val = 100u;
         audio_vol = (uint8_t)val;
         (void)exy_drv_set_volume(audio_muted ? 0u : audio_vol);
-    } else if (cid == 314u || cid == 303u || cid == 304u) {
+    } else if (cid == 303u || cid == 304u || cid == 307u || cid == 309u || cid == 312u || cid == 314u) {
         audio_muted = val ? 1u : 0u;
         val = audio_muted;
         (void)exy_drv_set_volume(audio_muted ? 0u : audio_vol);
@@ -400,7 +405,7 @@ static void add_vol_ctrl(void *ctrls, uint32_t cid, uint32_t scope, uint32_t ele
         dict_set_u32(c, "minimum value", 0u);
         dict_set_u32(c, "maximum value", 100u);
         dict_set_u32(rent, "start int value", 0u);
-        dict_set_u64(rent, "start db value",  (uint64_t)((int64_t)-57 << 32));
+        dict_set_u64(rent, "start db value",  ((uint64_t)(int64_t)-57) << 32);
         dict_set_u32(rent, "integer steps",   100u);
         dict_set_u64(rent, "db per step",     (57ull << 32) / 100ull);
         osarr_set_obj(rmap, rent);

@@ -5,23 +5,17 @@ usage: xnupcs.py [last-N]
 Prints the newest samples in order and a histogram, with the nearest kernel symbol.
 DBGPCSR reads PC + 8 (ARM) or + 4 (Thumb); the raw value is shown.
 """
-import bisect, collections, re, subprocess, sys
+import bisect, collections, subprocess, sys
+from fbmem import mem_words as mem
 
-RING = 0x4FF81000
+RING = 0x5EF81000  # mkxnu.py SAMPLER_RING (PHYS + MEMSIZE + 0x81000)
 KERNEL = "fw/kernelcache.n94.macho"
-
-
-def mem(addr):
-    out = subprocess.run(["fastboot", "getvar", f"mem:{addr:#x}"], capture_output=True, text=True, timeout=5)
-    m = re.search(r"mem:0x[0-9a-f]+: ((?:[0-9a-f]{8} ?){4})", out.stdout + out.stderr)
-    if not m:
-        sys.exit(f"read {addr:#x} failed: {out.stderr.strip()}")
-    return [int(w, 16) for w in m.group(1).split()]
 
 
 def main():
     last = int(sys.argv[1]) if len(sys.argv) > 1 else 24
     idx, when, magic, tcon = mem(RING + 0x400)
+    idx &= 0xff
     count, wtcnt = mem(RING + 0x410)[:2]
     print(f"{count} samples, MCT G_TCON {tcon:#x}, WDT WTCNT at the last sample {wtcnt:#x}")
     if magic != 0x4C504D53:
@@ -47,4 +41,5 @@ def main():
         print(f"  {n:4d}  {pc:08x}  {name(pc)}")
 
 
-main()
+if __name__ == "__main__":
+    main()

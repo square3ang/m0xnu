@@ -5,17 +5,10 @@ usage: patchcheck.py PATCH.txt IMAGE LBA
 Reads every sector the patch writes into RAM (tools/ubrun.sh, ends with reset), then compares
 them over "fastboot getvar mem:" with IMAGE (whose sector 0 is at LBA).
 """
-import re, struct, subprocess, sys, time
+import re, subprocess, sys, time
+from fbmem import mem_bytes as mem
 
 BUF = 0x5e000000  # sectorpatch.py builds at 0x50000000; stay clear of it
-
-
-def mem(addr):
-    o = subprocess.run(["fastboot", "getvar", f"mem:{addr:#x}"], capture_output=True, text=True, timeout=5)
-    m = re.search(r"mem:0x[0-9a-f]+: ((?:[0-9a-f]{8} ?){4})", o.stdout + o.stderr)
-    if not m:
-        sys.exit(f"getvar mem:{addr:#x} failed")
-    return struct.pack("<4I", *(int(w, 16) for w in m[1].split()))
 
 
 def main():
@@ -31,6 +24,8 @@ def main():
                 break
         except subprocess.TimeoutExpired:  # fastboot waits while the device is away
             pass
+    else:
+        sys.exit("timed out waiting for fastboot reconnect after reset")
     img = open(image, "rb")
     bad = 0
     for i, lba in enumerate(lbas):

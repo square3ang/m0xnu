@@ -2,4 +2,4 @@ prefix=@M0XNU_ROOT@/gpu/ios-gl/toolchain/drm
 Name: libdrm
 Description: Minimal libdrm shim for Exynos Mali-400 on iOS 9
 Version: 2.4.120
-Cflags: -I${prefix}/include -I@M0XNU_ROOT@/gpu/linux-lima/include/uapi
+Cflags: -I${prefix}/include -I@M0XNU_ROOT@/gpu/mesa-lima/include/drm-uapi

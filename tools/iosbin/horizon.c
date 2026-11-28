@@ -28,8 +28,7 @@ static const char *dirent_name(const unsigned char *ent)
 {
     /* Darwin 32-bit dirent: d_type@6 (<=15), d_namlen@7, d_name@8 (NUL at 8+namlen). */
     unsigned nl = ent[7];
-    if (ent[6] <= 15u && nl > 0u && nl < 255u && ent[8 + nl] == 0u &&
-        ent[8] >= 0x20u && ent[8] <= 0x7eu)
+    if (ent[6] <= 15u && nl > 0u && nl < 255u && ent[8 + nl] == 0u && ent[8] != 0u)
         return (const char *)(ent + 8);
     /* Fallback: 64-bit dirent (d_name@21). */
     return (const char *)(ent + 21);
@@ -53,7 +52,8 @@ static int unlink_ls_dir(const char *dir)
         if (!ent) break;
         const char *name = dirent_name(ent);
         if (name[0] == '.') continue;
-        snprintf(pbuf, sizeof(pbuf), "%s/%s", dir, name);
+        int n = snprintf(pbuf, sizeof(pbuf), "%s/%s", dir, name);
+        if (n <= 0 || (unsigned long)n >= sizeof(pbuf)) continue;
         if (unlink(pbuf) == 0) cnt++;
     }
     fn_cd(dp);
@@ -162,6 +162,11 @@ static const char migration_plist[] =
 
 static void write_disabled(void)
 {
+    mk_dir("/private/var/db", 0, 0);
+    mk_dir("/private/var/db/com.apple.xpc.launchd", 0, 0);
+    mk_dir("/private/var/mobile", 501, 501);
+    mk_dir("/private/var/mobile/Library", 501, 501);
+    mk_dir("/private/var/mobile/Library/Preferences", 501, 501);
     int fd = open("/private/var/db/com.apple.xpc.launchd/disabled.plist",
                   0x0601 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
     if (fd >= 0) {
@@ -176,7 +181,7 @@ static void write_disabled(void)
         chown("/private/var/mobile/Library/Preferences/.GlobalPreferences.plist", 501, 501);
     }
     fd = open("/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
-              0x0601 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+              0x0a01 /* O_WRONLY|O_CREAT|O_EXCL */, 0644);
     if (fd >= 0) {
         (void)write(fd, sb_prefs_plist, sizeof(sb_prefs_plist) - 1);
         close(fd);
@@ -275,12 +280,12 @@ static void write_disabled(void)
                     if (!ent) break;
                     const char *name = dirent_name(ent);
                     if (name[0] == '.') continue;
-                    snprintf(cdir, sizeof(cdir), "%s/%s/Library/Caches", roots[r], name);
-                    wiped += unlink_ls_dir(cdir);
-                    snprintf(cdir, sizeof(cdir), "%s/%s/Library/Caches/com.apple.lsd", roots[r], name);
-                    wiped += unlink_ls_dir(cdir);
-                    snprintf(cdir, sizeof(cdir), "%s/%s/Library/MobileInstallation", roots[r], name);
-                    wiped += unlink_ls_dir(cdir);
+                    int n = snprintf(cdir, sizeof(cdir), "%s/%s/Library/Caches", roots[r], name);
+                    if (n > 0 && (unsigned long)n < sizeof(cdir)) wiped += unlink_ls_dir(cdir);
+                    n = snprintf(cdir, sizeof(cdir), "%s/%s/Library/Caches/com.apple.lsd", roots[r], name);
+                    if (n > 0 && (unsigned long)n < sizeof(cdir)) wiped += unlink_ls_dir(cdir);
+                    n = snprintf(cdir, sizeof(cdir), "%s/%s/Library/MobileInstallation", roots[r], name);
+                    if (n > 0 && (unsigned long)n < sizeof(cdir)) wiped += unlink_ls_dir(cdir);
                 }
                 fn_cd(dp);
             }
@@ -290,8 +295,11 @@ static void write_disabled(void)
         int cfd = open("/dev/console", 1);
         if (cfd >= 0) {
             char msg[96];
-            int n = snprintf(msg, sizeof(msg), "[HORIZON] setup_reset_v3 mfd=%d wiped=%d\n", mfd, wiped);
-            if (n > 0) (void)write(cfd, msg, (unsigned long)n);
+            int n = snprintf(msg, sizeof(msg), "[HORIZON] setup_reset_v4 mfd=%d wiped=%d\n", mfd, wiped);
+            if (n > 0) {
+                if ((unsigned long)n >= sizeof(msg)) n = (int)sizeof(msg) - 1;
+                (void)write(cfd, msg, (unsigned long)n);
+            }
             close(cfd);
         }
     }
@@ -329,7 +337,10 @@ static void wifi_log_to_console(void)
     if (cfd >= 0) {
         char msg[64];
         int n = snprintf(msg, sizeof(msg), "[HORIZON] wifi log plist w=%ld\n", w);
-        if (n > 0) (void)write(cfd, msg, (unsigned long)n);
+        if (n > 0) {
+            if ((unsigned long)n >= sizeof(msg)) n = (int)sizeof(msg) - 1;
+            (void)write(cfd, msg, (unsigned long)n);
+        }
         close(cfd);
     }
 }
@@ -345,8 +356,8 @@ int main(int argc, char **argv)
 
     int pid = fork();
     if (pid == 0) {
-        char *argv[] = { "mount", "-vat", "nonfs", 0 };
-        execv("/sbin/mount", argv);
+        char *margv[] = { "mount", "-vat", "nonfs", 0 };
+        execv("/sbin/mount", margv);
         _exit(1);
     }
     int st = 0;
@@ -390,48 +401,6 @@ int main(int argc, char **argv)
         settimeofday(&tv, 0);
     }
     write_disabled();
-    {
-        typedef void *(*od_t)(const char *);
-        typedef void *(*rd_t)(void *);
-        typedef int (*cd_t)(void *);
-        typedef long (*read_t)(int, void *, unsigned long);
-        od_t fn_od = (od_t)dlsym((void *)-2, "opendir");
-        rd_t fn_rd = (rd_t)dlsym((void *)-2, "readdir");
-        cd_t fn_cd = (cd_t)dlsym((void *)-2, "closedir");
-        read_t fn_read = (read_t)dlsym((void *)-2, "read");
-        int cfd = open("/dev/console", 1);
-        if (cfd >= 0 && fn_od && fn_rd && fn_cd && fn_read) {
-            const char *dirs[2] = {
-                "/private/var/mobile/Library/Preferences/ByHost",
-                "/private/var/mobile/Library/Logs/CrashReporter/DiagnosticLogs/DataMigration"
-            };
-            char pbuf[256], buf[2048];
-            for (int d = 0; d < 2; d++) {
-                void *dp = fn_od(dirs[d]);
-                if (!dp) continue;
-                int dumped = 0;
-                for (;;) {
-                    unsigned char *ent = (unsigned char *)fn_rd(dp);
-                    if (!ent) break;
-                    const char *nm = dirent_name(ent);
-                    if (nm[0] == '.') continue;
-                    int n = snprintf(pbuf, sizeof(pbuf), "[DM%d] %s\n", d, nm);
-                    if (n > 0) (void)write(cfd, pbuf, (unsigned long)n);
-                    if (d == 1 && dumped < 2) {
-                        snprintf(pbuf, sizeof(pbuf), "%s/%s", dirs[d], nm);
-                        int fd = open(pbuf, 0);
-                        if (fd >= 0) {
-                            long r = fn_read(fd, buf, sizeof(buf) - 1);
-                            close(fd);
-                            if (r > 0) { (void)write(cfd, buf, (unsigned long)r); (void)write(cfd, "\n", 1); dumped++; }
-                        }
-                    }
-                }
-                fn_cd(dp);
-            }
-            close(cfd);
-        }
-    }
     wifi_log_to_console();
     unlink("/private/var/root/Library/Preferences/com.apple.backboardd.plist");
     /* ExyTouchd is now spawned from backboardd (Mali400GLDriverEX) so it inherits a live System bootstrap_port. */

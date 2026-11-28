@@ -40,6 +40,8 @@ static uint32_t now_ms(void)
     return (uint32_t)(tv.tv_sec * 1000u + (uint32_t)(tv.tv_usec / 1000u));
 }
 
+__attribute__((format(printf, 1, 2)))
+void kperf_log(const char *fmt, ...);
 void kperf_log(const char *fmt, ...)
 {
     if (!mali_iokit_conn) return;
@@ -55,6 +57,8 @@ void kperf_log(const char *fmt, ...)
     }
 }
 
+__attribute__((format(printf, 1, 2)))
+void mali_log(const char *fmt, ...);
 void mali_log(const char *fmt, ...)
 {
     char buf[256];
@@ -190,6 +194,7 @@ void wrap_WaitSync(void *sync, GLbitfield flags, uint32_t tlo, uint32_t thi);
 struct mali_gles_ctx {
     void *gli_ctx;
     void *eagl_priv;
+    void *sharegroup;
     struct st_context *st;
     GLuint bound_fbo;
     GLuint bound_rb;
@@ -208,6 +213,7 @@ struct mali_gles_ctx {
 
 struct iosurf_binding {
     int used;
+    void *owner;
     int is_rb;
     GLuint obj_id;
     void *surf;
@@ -223,12 +229,28 @@ struct iosurf_binding {
 
 struct fbo_attach {
     int used;
+    struct mali_gles_ctx *ctx;
     GLuint fbo_id;
     int is_rb;
     GLuint obj_id;
 };
 
+static pthread_mutex_t gld_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t gles_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+void mali_gld_lock(void)   { pthread_mutex_lock(&gld_mtx); }
+void mali_gld_unlock(void) { pthread_mutex_unlock(&gld_mtx); }
+void mali_gles_destroy_pipe_ctx(void *pctx)
+{
+    struct pipe_context *p = (struct pipe_context *)pctx;
+    if (p && p->destroy)
+        p->destroy(p);
+}
+
+static inline void *ctx_owner(const struct mali_gles_ctx *c)
+{
+    return c ? (c->sharegroup ? c->sharegroup : (void *)c) : NULL;
+}
 static struct pipe_frontend_screen g_fscreen;
 static struct mali_gles_ctx g_ctxs[MAX_CTX];
 static struct iosurf_binding g_iosurfs[MAX_IOSURF];
@@ -300,9 +322,12 @@ extern void *_mesa_MapBufferRange_no_error(GLenum t, GLintptr o, GLsizeiptr l, G
 extern GLboolean _mesa_UnmapBuffer_no_error(GLenum t);
 
 static int is_backboardd_proc(void);
+static int is_bench_enabled(void);
 static void *g_fast_gli = NULL;
 static struct mali_gles_ctx *g_fast_ctx = NULL;
 static uintptr_t g_fast_tid = 0;
+static uintptr_t g_single_tid = 0;
+static int g_multi_tid = 0;
 static void *g_tramp_targets[GLD_DISP_COUNT];
 extern struct {
     void *gli;
@@ -319,9 +344,24 @@ static inline uintptr_t fast_cur_tid(void)
 
 static inline struct mali_gles_ctx *fast_cur_ctx(void)
 {
-    if (__builtin_expect(g_fast_ctx && fast_cur_tid() == g_fast_tid, 1))
-        return g_fast_ctx;
+    uintptr_t t = fast_cur_tid();
+    uintptr_t ft = __atomic_load_n(&g_fast_tid, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(t == ft, 1)) {
+        struct mali_gles_ctx *c = __atomic_load_n(&g_fast_ctx, __ATOMIC_ACQUIRE);
+        if (__builtin_expect(c != NULL && __atomic_load_n(&g_fast_tid, __ATOMIC_ACQUIRE) == t, 1))
+            return c;
+    }
     return tls_cur_ctx;
+}
+
+static void clear_fast_path_locked(void)
+{
+    __atomic_store_n(&g_tramp_fast.gli, (void *)NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_fast_gli, (void *)NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_fast_tid, (uintptr_t)0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tramp_fast.tid, (uintptr_t)0, __ATOMIC_RELEASE);
+    __asm__ volatile("dmb ish" ::: "memory");
+    __atomic_store_n(&g_fast_ctx, (struct mali_gles_ctx *)NULL, __ATOMIC_RELEASE);
 }
 
 static void mali_ensure_current_by_gli(void *gli_ctx)
@@ -365,42 +405,55 @@ static void mali_ensure_current_by_gli(void *gli_ctx)
             g_tramp_targets[i] = fn;
         }
         __asm__ volatile("dmb ish" ::: "memory");
-        g_tramp_fast.targets = g_tramp_targets;
+        __atomic_store_n(&g_tramp_fast.targets, (void *const *)g_tramp_targets, __ATOMIC_RELEASE);
     }
+    struct st_context *st = c ? c->st : NULL;
     pthread_mutex_unlock(&gles_mtx);
-    if (c && c->st) {
-        st_api_make_current(c->st, NULL, NULL);
+    if (c && st) {
+        st_api_make_current(st, NULL, NULL);
         tls_cur_gli = gli_ctx;
         tls_cur_ctx = c;
-        /* Keep MRU fast-path active even in multi-context processes (e.g. SpringBoard):
-         * clear gli and tid before updating ctx so concurrent threads never observe a torn pair. */
-        g_tramp_fast.gli = NULL;
-        g_fast_gli = NULL;
-        g_fast_tid = 0;
-        g_tramp_fast.tid = 0;
-        __asm__ volatile("dmb ish" ::: "memory");
         uintptr_t tid = fast_cur_tid();
-        g_fast_ctx = c;
-        __asm__ volatile("dmb ish" ::: "memory");
-        g_fast_tid = tid;
-        g_tramp_fast.tid = tid;
-        __asm__ volatile("dmb ish" ::: "memory");
-        g_fast_gli = gli_ctx;
-        g_tramp_fast.gli = gli_ctx;
+        pthread_mutex_lock(&gles_mtx);
+        /* Keep fast-path active only while a single thread uses GL; once a second thread
+         * enters, latch g_multi_tid and permanently clear fast globals so gl_tramp.S /
+         * fast_cur_ctx() use TLS with zero cross-thread torn reads. */
+        if (c->gli_ctx == gli_ctx && c->st == st) {
+            if (!g_multi_tid && (g_single_tid == 0 || g_single_tid == tid)) {
+                g_single_tid = tid;
+                clear_fast_path_locked();
+                __atomic_store_n(&g_fast_ctx, c, __ATOMIC_RELEASE);
+                __asm__ volatile("dmb ish" ::: "memory");
+                __atomic_store_n(&g_fast_tid, tid, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_tramp_fast.tid, tid, __ATOMIC_RELEASE);
+                __asm__ volatile("dmb ish" ::: "memory");
+                __atomic_store_n(&g_fast_gli, gli_ctx, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_tramp_fast.gli, gli_ctx, __ATOMIC_RELEASE);
+            } else if (!g_multi_tid) {
+                g_multi_tid = 1;
+                clear_fast_path_locked();
+            }
+        }
+        pthread_mutex_unlock(&gles_mtx);
     }
 }
 
 void *mali_prepare_call(void *gli_ctx, uint32_t idx)
 {
-    if (__builtin_expect(!gli_ctx || (gli_ctx == g_fast_gli && fast_cur_tid() == g_fast_tid), 1)) {
+    uintptr_t ft = __atomic_load_n(&g_fast_tid, __ATOMIC_ACQUIRE);
+    void *fg = __atomic_load_n(&g_fast_gli, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(!gli_ctx || (gli_ctx == fg && fast_cur_tid() == ft &&
+                                      __atomic_load_n(&g_fast_tid, __ATOMIC_ACQUIRE) == ft), 1)) {
         if (__builtin_expect(idx >= GLD_DISP_COUNT, 0))
             return (void *)wrap_Noop;
-        return g_tramp_fast.targets ? g_tramp_fast.targets[idx] : gld_disp_entries[idx].target;
+        void *const *t = __atomic_load_n(&g_tramp_fast.targets, __ATOMIC_ACQUIRE);
+        return t ? t[idx] : gld_disp_entries[idx].target;
     }
     mali_ensure_current_by_gli(gli_ctx);
     if (idx >= GLD_DISP_COUNT)
         return (void *)wrap_Noop;
-    return g_tramp_fast.targets ? g_tramp_fast.targets[idx] : gld_disp_entries[idx].target;
+    void *const *t = __atomic_load_n(&g_tramp_fast.targets, __ATOMIC_ACQUIRE);
+    return t ? t[idx] : gld_disp_entries[idx].target;
 }
 
 static int is_backboardd_proc(void);
@@ -544,7 +597,12 @@ void mali_gles_init_screen(void *pipe_screen)
     }
 }
 
-void *mali_gles_create_context(void *gli_ctx, void *shared_st)
+static void rebuild_iosurf_fbo_mask_locked(void);
+static void shrink_iosurf_hi_locked(void);
+static void shrink_fbo_hi_locked(void);
+static void cleanup_nw_binds_locked(struct mali_gles_ctx *c);
+
+void *mali_gles_create_context(void *gli_ctx, void *shared_st, void *sharegroup)
 {
     pthread_mutex_lock(&gles_mtx);
     if (!g_fscreen.screen || !gli_ctx) {
@@ -559,6 +617,11 @@ void *mali_gles_create_context(void *gli_ctx, void *shared_st)
         }
     }
     if (!slot) {
+        static int ctx_full_logged = 0;
+        if (!ctx_full_logged) {
+            ctx_full_logged = 1;
+            mali_log("[MALI] g_ctxs full (MAX_CTX=%d)\n", MAX_CTX);
+        }
         pthread_mutex_unlock(&gles_mtx);
         return NULL;
     }
@@ -578,6 +641,7 @@ void *mali_gles_create_context(void *gli_ctx, void *shared_st)
     if (st) {
         memset(slot, 0, sizeof(*slot));
         slot->gli_ctx = gli_ctx;
+        slot->sharegroup = sharegroup;
         slot->st = st;
         slot->sw = -1;
         slot->sh = -1;
@@ -592,19 +656,40 @@ void mali_gles_destroy_context(void *gli_ctx)
     pthread_mutex_lock(&gles_mtx);
     struct mali_gles_ctx *c = find_ctx_locked(gli_ctx);
     if (c) {
-        g_tramp_fast.gli = NULL;
-        g_fast_gli = NULL;
-        __asm__ volatile("dmb ish" ::: "memory");
-        g_fast_ctx = NULL;
-        g_fast_tid = 0;
-        g_tramp_fast.tid = 0;
+        clear_fast_path_locked();
         old_st = c->st;
+        void *owner = ctx_owner(c);
         if (tls_cur_gli == gli_ctx) {
             st_api_make_current(NULL, NULL, NULL);
             tls_cur_gli = NULL;
             tls_cur_ctx = NULL;
         }
+        for (int i = 0; i < g_fbo_hi; i++) {
+            if (g_fbos[i].used && g_fbos[i].ctx == c)
+                g_fbos[i].used = 0;
+        }
+        cleanup_nw_binds_locked(c);
         memset(c, 0, sizeof(*c));
+        int owner_shared = 0;
+        for (int i = 0; i < MAX_CTX; i++) {
+            if (g_ctxs[i].st && ctx_owner(&g_ctxs[i]) == owner) {
+                owner_shared = 1;
+                break;
+            }
+        }
+        if (!owner_shared && owner) {
+            for (int i = 0; i < g_iosurf_hi; i++) {
+                if (g_iosurfs[i].used && g_iosurfs[i].owner == owner) {
+                    if (g_iosurfs[i].pt) pipe_resource_reference(&g_iosurfs[i].pt, NULL);
+                    if (g_iosurfs[i].surf) CFRelease(g_iosurfs[i].surf);
+                    memset(&g_iosurfs[i], 0, sizeof(g_iosurfs[i]));
+                }
+            }
+            shrink_iosurf_hi_locked();
+        }
+        shrink_fbo_hi_locked();
+        rebuild_iosurf_fbo_mask_locked();
+        g_iosurf_gen++;
     }
     pthread_mutex_unlock(&gles_mtx);
     if (old_st) {
@@ -650,23 +735,48 @@ void mali_gles_reinstall_for_gli(void *gli_ctx)
 
 /* --- IOSurface <-> FBO tracking and readback ------------------------------- */
 
-static struct iosurf_binding *find_iosurf_locked(int is_rb, GLuint obj_id)
+static void shrink_iosurf_hi_locked(void)
 {
-    if (!obj_id) return NULL;
+    while (g_iosurf_hi > 0 && !g_iosurfs[g_iosurf_hi - 1].used)
+        g_iosurf_hi--;
+}
+
+static void shrink_fbo_hi_locked(void)
+{
+    while (g_fbo_hi > 0 && !g_fbos[g_fbo_hi - 1].used)
+        g_fbo_hi--;
+}
+
+static struct iosurf_binding *find_iosurf_locked(void *owner, int is_rb, GLuint obj_id)
+{
+    if (!obj_id || !owner) return NULL;
     for (int i = 0; i < g_iosurf_hi; i++)
-        if (g_iosurfs[i].used && g_iosurfs[i].is_rb == is_rb && g_iosurfs[i].obj_id == obj_id)
+        if (g_iosurfs[i].used && g_iosurfs[i].owner == owner &&
+            g_iosurfs[i].is_rb == is_rb && g_iosurfs[i].obj_id == obj_id)
             return &g_iosurfs[i];
     return NULL;
 }
 
-static struct iosurf_binding *find_fbo_iosurf_locked(GLuint fbo_id)
+static struct iosurf_binding *find_fbo_iosurf_locked(struct mali_gles_ctx *c, GLuint fbo_id)
 {
-    if (!fbo_id) return NULL;
+    if (!c || !fbo_id) return NULL;
+    void *owner = ctx_owner(c);
     for (int i = 0; i < g_fbo_hi; i++) {
-        if (g_fbos[i].used && g_fbos[i].fbo_id == fbo_id)
-            return find_iosurf_locked(g_fbos[i].is_rb, g_fbos[i].obj_id);
+        if (g_fbos[i].used && g_fbos[i].ctx == c && g_fbos[i].fbo_id == fbo_id)
+            return find_iosurf_locked(owner, g_fbos[i].is_rb, g_fbos[i].obj_id);
     }
     return NULL;
+}
+
+static GLuint find_fbo_for_iosurf_locked(struct mali_gles_ctx *c, int is_rb, GLuint obj_id)
+{
+    if (!c || !obj_id) return 0;
+    for (int i = 0; i < g_fbo_hi; i++) {
+        if (g_fbos[i].used && g_fbos[i].ctx == c &&
+            g_fbos[i].is_rb == is_rb && g_fbos[i].obj_id == obj_id)
+            return g_fbos[i].fbo_id;
+    }
+    return 0;
 }
 
 static void rebuild_iosurf_fbo_mask_locked(void)
@@ -681,7 +791,7 @@ static void rebuild_iosurf_fbo_mask_locked(void)
     }
     for (int i = 0; i < g_fbo_hi; i++) {
         if (g_fbos[i].used && g_fbos[i].fbo_id < 64u &&
-            find_iosurf_locked(g_fbos[i].is_rb, g_fbos[i].obj_id))
+            find_iosurf_locked(ctx_owner(g_fbos[i].ctx), g_fbos[i].is_rb, g_fbos[i].obj_id))
             m |= (1ull << g_fbos[i].fbo_id);
     }
     g_iosurf_obj_bloom[0] = bm[0];
@@ -766,6 +876,20 @@ static int is_backboardd_proc(void)
     return g_is_backboardd;
 }
 
+static int is_bench_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        char ba[256];
+        size_t bl = sizeof(ba) - 1;
+        int (*sbn)(const char *, void *, size_t *, void *, size_t) =
+            (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctlbyname");
+        cached = (sbn && sbn("kern.bootargs", ba, &bl, NULL, 0) == 0 &&
+                  (ba[bl] = '\0', strstr(ba, "bench=") != NULL)) ? 1 : 0;
+    }
+    return cached;
+}
+
 static struct pipe_resource *ensure_scanout_res(struct pipe_screen *scr, uint32_t idx)
 {
     if (idx >= 2u || !scr)
@@ -803,6 +927,7 @@ static struct pipe_resource *ensure_scanout_res(struct pipe_screen *scr, uint32_
 struct dirty_snap {
     void *surf;
     struct pipe_resource *pt;
+    GLuint fbo_id;
     int is_rb;
     uint32_t w, h, invert, fmt;
     uint32_t rx, ry, rw, rh;
@@ -873,10 +998,11 @@ static int flush_current_fbo_iosurf(char tag)
     struct dirty_snap snaps[16];
     int nsnaps = 0;
 
+    void *owner = ctx_owner(c);
     pthread_mutex_lock(&gles_mtx);
     for (int i = 0; i < g_iosurf_hi && nsnaps < 16; i++) {
         struct iosurf_binding *b = &g_iosurfs[i];
-        if (!b->used || !b->dirty || !b->surf || !b->w || !b->h)
+        if (!b->used || b->owner != owner || !b->dirty || !b->surf || !b->w || !b->h)
             continue;
         uint32_t rx = b->dirty_x0, ry = b->dirty_y0;
         uint32_t rw = (b->dirty_x1 > rx) ? (b->dirty_x1 - rx) : 0;
@@ -889,6 +1015,7 @@ static int flush_current_fbo_iosurf(char tag)
         snaps[nsnaps].surf = b->surf;
         snaps[nsnaps].pt = NULL;
         pipe_resource_reference(&snaps[nsnaps].pt, b->pt);
+        snaps[nsnaps].fbo_id = find_fbo_for_iosurf_locked(c, b->is_rb, b->obj_id);
         snaps[nsnaps].is_rb = b->is_rb;
         snaps[nsnaps].w = b->w;
         snaps[nsnaps].h = b->h;
@@ -968,12 +1095,7 @@ static int flush_current_fbo_iosurf(char tag)
                     static uint32_t win_n, win_t0, win_d;
                     if (bench_fps < 0) {
                         extern int g_mali_bench_en;
-                        char ba[256];
-                        size_t bl = sizeof(ba) - 1;
-                        int (*sbn)(const char *, void *, size_t *, void *, size_t) =
-                            (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctlbyname");
-                        bench_fps = (sbn && sbn("kern.bootargs", ba, &bl, NULL, 0) == 0 &&
-                                     (ba[bl] = '\0', strstr(ba, "bench=") != NULL)) ? 1 : 0;
+                        bench_fps = is_bench_enabled();
                         g_mali_bench_en = bench_fps;
                     }
                     if (bench_fps) {
@@ -1014,10 +1136,8 @@ static int flush_current_fbo_iosurf(char tag)
             uint32_t fb_idx = g_scanout_idx;
             struct pipe_resource *dst_res = ensure_scanout_res(c->st->pipe->screen, fb_idx);
             if (dst_res) {
-                if (!finished) {
+                if (!finished)
                     _mesa_Flush();
-                    finished = 1;
-                }
                 g_scanout_idx ^= 1u;
                 struct pipe_blit_info bi;
                 memset(&bi, 0, sizeof(bi));
@@ -1108,16 +1228,8 @@ static int flush_current_fbo_iosurf(char tag)
                           g_zc_log, (int)getpid(), s->w, s->h, s->invert, s->zc_va, draws);
             }
             {
-                static int app_bench = -1;
                 static uint32_t aw_t0 = 0, aw_n = 0, aw_d = 0, aw_j0 = 0;
-                if (app_bench < 0) {
-                    char ba[256]; size_t bl = sizeof(ba) - 1;
-                    int (*sbn)(const char *, void *, size_t *, void *, size_t) =
-                        (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctlbyname");
-                    app_bench = (sbn && sbn("kern.bootargs", ba, &bl, NULL, 0) == 0 &&
-                                 (ba[bl] = '\0', strstr(ba, "bench=") != NULL)) ? 1 : 0;
-                }
-                if (app_bench) {
+                if (is_bench_enabled()) {
                     extern uint32_t lima_stat_jobs;
                     uint32_t t1 = now_ms();
                     if (aw_n == 0u) { aw_t0 = t1; aw_j0 = lima_stat_jobs; }
@@ -1199,6 +1311,11 @@ static int flush_current_fbo_iosurf(char tag)
         }
         if (!copied_direct) {
             size_t sub_row_bytes = (size_t)s->rw * 4u;
+            int switched_fbo = 0;
+            if (s->fbo_id && s->fbo_id != c->bound_fbo) {
+                _mesa_BindFramebuffer(GL_FRAMEBUFFER, s->fbo_id);
+                switched_fbo = 1;
+            }
             pthread_mutex_lock(&gles_mtx);
             uint8_t *tmp = ensure_scratch(sub_row_bytes * s->rh);
             if (tmp) {
@@ -1231,6 +1348,8 @@ static int flush_current_fbo_iosurf(char tag)
                 }
             }
             pthread_mutex_unlock(&gles_mtx);
+            if (switched_fbo)
+                _mesa_BindFramebuffer(GL_FRAMEBUFFER, c->bound_fbo);
         }
         if (g_fl_log < 16u && g_fl_checks < 64u) {
             g_fl_checks++;
@@ -1251,16 +1370,8 @@ static int flush_current_fbo_iosurf(char tag)
             }
         }
         if (tag == 'P' && !is_bb) {
-            static int fl_bench = -1;
             static uint32_t fw_t0 = 0, fw_n = 0, fw_d = 0, fw_j0 = 0;
-            if (fl_bench < 0) {
-                char ba[256]; size_t bl = sizeof(ba) - 1;
-                int (*sbn)(const char *, void *, size_t *, void *, size_t) =
-                    (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctlbyname");
-                fl_bench = (sbn && sbn("kern.bootargs", ba, &bl, NULL, 0) == 0 &&
-                            (ba[bl] = '\0', strstr(ba, "bench=") != NULL)) ? 1 : 0;
-            }
-            if (fl_bench) {
+            if (is_bench_enabled()) {
                 extern uint32_t lima_stat_jobs;
                 uint32_t t1 = now_ms();
                 if (fw_n == 0u) { fw_t0 = t1; fw_j0 = lima_stat_jobs; }
@@ -1302,7 +1413,7 @@ static void mark_current_fbo_dirty(void)
     if (c->dirty_fbo_id == c->bound_fbo && c->dirty_fbo_gen == g_iosurf_gen && c->dirty_fbo_pt == cur_pt)
         return;
     pthread_mutex_lock(&gles_mtx);
-    struct iosurf_binding *b = find_fbo_iosurf_locked(c->bound_fbo);
+    struct iosurf_binding *b = find_fbo_iosurf_locked(c, c->bound_fbo);
     if (b && b->w && b->h) {
         b->seed = 0;
         if (cur_pt && cur_pt != b->pt)
@@ -1421,16 +1532,16 @@ void wrap_BindTexture(GLenum target, GLuint tex)
     else _mesa_BindTexture(target, tex);
 }
 
-static void set_fbo_color0(GLuint fbo, int is_rb, GLuint obj_id)
+static void set_fbo_color0(struct mali_gles_ctx *c, GLuint fbo, int is_rb, GLuint obj_id)
 {
-    if (!fbo) return;
+    if (!c || !fbo) return;
     if (__builtin_expect(!is_rb && is_backboardd_proc() && fbo < 64u && !(g_iosurf_fbo_mask & (1ull << fbo)) &&
         obj_id && !(g_iosurf_obj_bloom[(obj_id >> 6) & 3u] & (1ull << (obj_id & 63u))), 1))
         return;
     pthread_mutex_lock(&gles_mtx);
     int slot_idx = -1;
     for (int i = 0; i < g_fbo_hi; i++) {
-        if (g_fbos[i].used && g_fbos[i].fbo_id == fbo) { slot_idx = i; break; }
+        if (g_fbos[i].used && g_fbos[i].ctx == c && g_fbos[i].fbo_id == fbo) { slot_idx = i; break; }
         if (!g_fbos[i].used && slot_idx < 0) slot_idx = i;
     }
     if (slot_idx < 0 && g_fbo_hi < MAX_FBOS)
@@ -1439,15 +1550,23 @@ static void set_fbo_color0(GLuint fbo, int is_rb, GLuint obj_id)
         struct fbo_attach *slot = &g_fbos[slot_idx];
         if (obj_id) {
             slot->used = 1;
+            slot->ctx = c;
             slot->fbo_id = fbo;
             slot->is_rb = is_rb;
             slot->obj_id = obj_id;
             if (slot_idx >= g_fbo_hi) g_fbo_hi = slot_idx + 1;
         } else {
             slot->used = 0;
+            shrink_fbo_hi_locked();
         }
         rebuild_iosurf_fbo_mask_locked();
         g_iosurf_gen++;
+    } else if (obj_id) {
+        static int fbo_full_logged = 0;
+        if (!fbo_full_logged) {
+            fbo_full_logged = 1;
+            mali_log("[MALI] g_fbos full (MAX_FBOS=%d)\n", MAX_FBOS);
+        }
     }
     pthread_mutex_unlock(&gles_mtx);
 }
@@ -1456,7 +1575,7 @@ void wrap_FramebufferRenderbuffer(GLenum target, GLenum att, GLenum rbtarget, GL
 {
     struct mali_gles_ctx *c = fast_cur_ctx();
     if (c && att == GL_COLOR_ATTACHMENT0)
-        set_fbo_color0(c->bound_fbo, 1, rb);
+        set_fbo_color0(c, c->bound_fbo, 1, rb);
     if (is_backboardd_proc()) _mesa_FramebufferRenderbuffer_no_error(target, att, rbtarget, rb);
     else _mesa_FramebufferRenderbuffer(target, att, rbtarget, rb);
 }
@@ -1465,7 +1584,7 @@ void wrap_FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLui
 {
     struct mali_gles_ctx *c = fast_cur_ctx();
     if (c && att == GL_COLOR_ATTACHMENT0 && level == 0)
-        set_fbo_color0(c->bound_fbo, 0, tex);
+        set_fbo_color0(c, c->bound_fbo, 0, tex);
     if (is_backboardd_proc()) _mesa_FramebufferTexture2D_no_error(target, att, textarget, tex, level);
     else _mesa_FramebufferTexture2D(target, att, textarget, tex, level);
 
@@ -1473,10 +1592,11 @@ void wrap_FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLui
      * to zero-copy zc_va so Mali PP renders directly into IOSurface RAM instead of WC CPU readback. */
     if (!is_backboardd_proc() && c && c->st && c->st->ctx && att == GL_COLOR_ATTACHMENT0 &&
         level == 0 && tex != 0 && mali_iokit_conn) {
+        void *owner = ctx_owner(c);
         void *surf = NULL;
         uint32_t w = 0, h = 0, invert = 0;
         pthread_mutex_lock(&gles_mtx);
-        struct iosurf_binding *b = find_iosurf_locked(0, tex);
+        struct iosurf_binding *b = find_iosurf_locked(owner, 0, tex);
         if (b && b->surf && !b->zc_va && b->fmt == 0x80e1u && b->type == GL_UNSIGNED_BYTE &&
             (uint64_t)b->w * (uint64_t)b->h >= 65536ull) {
             surf = b->surf;
@@ -1519,7 +1639,7 @@ void wrap_FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLui
                 }
                 if (zc_va) {
                     pthread_mutex_lock(&gles_mtx);
-                    struct iosurf_binding *b2 = find_iosurf_locked(0, tex);
+                    struct iosurf_binding *b2 = find_iosurf_locked(owner, 0, tex);
                     if (b2 && b2->surf == surf) {
                         b2->zc_va = zc_va;
                         b2->zc_bpr = zc_bpr;
@@ -1536,13 +1656,15 @@ void wrap_FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLui
 
 void wrap_DeleteFramebuffers(GLsizei n, const GLuint *fbs)
 {
-    if (fbs && n > 0) {
+    struct mali_gles_ctx *c = fast_cur_ctx();
+    if (c && fbs && n > 0) {
         pthread_mutex_lock(&gles_mtx);
         for (GLsizei j = 0; j < n; j++) {
             for (int i = 0; i < g_fbo_hi; i++)
-                if (g_fbos[i].used && g_fbos[i].fbo_id == fbs[j])
+                if (g_fbos[i].used && g_fbos[i].ctx == c && g_fbos[i].fbo_id == fbs[j])
                     g_fbos[i].used = 0;
         }
+        shrink_fbo_hi_locked();
         rebuild_iosurf_fbo_mask_locked();
         g_iosurf_gen++;
         pthread_mutex_unlock(&gles_mtx);
@@ -1552,11 +1674,13 @@ void wrap_DeleteFramebuffers(GLsizei n, const GLuint *fbs)
 
 static void delete_iosurf_objs(int is_rb, GLsizei n, const GLuint *ids)
 {
-    if (!ids || n <= 0) return;
+    struct mali_gles_ctx *c = fast_cur_ctx();
+    void *owner = ctx_owner(c);
+    if (!owner || !ids || n <= 0) return;
     pthread_mutex_lock(&gles_mtx);
     int changed = 0;
     for (GLsizei j = 0; j < n; j++) {
-        struct iosurf_binding *b = find_iosurf_locked(is_rb, ids[j]);
+        struct iosurf_binding *b = find_iosurf_locked(owner, is_rb, ids[j]);
         if (b) {
             if (b->pt) pipe_resource_reference(&b->pt, NULL);
             if (b->surf) CFRelease(b->surf);
@@ -1565,7 +1689,10 @@ static void delete_iosurf_objs(int is_rb, GLsizei n, const GLuint *ids)
             changed = 1;
         }
     }
-    if (changed) rebuild_iosurf_fbo_mask_locked();
+    if (changed) {
+        shrink_iosurf_hi_locked();
+        rebuild_iosurf_fbo_mask_locked();
+    }
     pthread_mutex_unlock(&gles_mtx);
 }
 
@@ -1663,11 +1790,12 @@ static GLuint current_tex2d_id(void)
 
 static void invalidate_bound_tex_seed(void)
 {
+    void *owner = ctx_owner(tls_cur_ctx);
     GLuint tid = current_tex2d_id();
-    if (!tid)
+    if (!tid || !owner)
         return;
     pthread_mutex_lock(&gles_mtx);
-    struct iosurf_binding *b = find_iosurf_locked(0, tid);
+    struct iosurf_binding *b = find_iosurf_locked(owner, 0, tid);
     if (b)
         b->seed = 0;
     pthread_mutex_unlock(&gles_mtx);
@@ -1783,18 +1911,24 @@ void wrap_ResolveMultisampleFramebufferAPPLE(void)
 }
 
 static char g_ext_buf[4096];
+static int g_ext_ready = 0;
 
 const GLubyte *wrap_GetString(GLenum name)
 {
     const GLubyte *s = _mesa_GetString(name);
     if (name == GL_EXTENSIONS && s) {
-        if (!g_ext_buf[0]) {
-            size_t len = strlen((const char *)s);
-            const char *extra = " GL_APPLE_texture_format_BGRA8888 GL_APPLE_framebuffer_multisample GL_IMG_texture_compression_pvrtc";
-            if (len + strlen(extra) + 1 < sizeof(g_ext_buf)) {
-                memcpy(g_ext_buf, s, len);
-                strcpy(g_ext_buf + len, extra);
+        if (!__atomic_load_n(&g_ext_ready, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_lock(&gles_mtx);
+            if (!g_ext_ready) {
+                size_t len = strlen((const char *)s);
+                const char *extra = " GL_APPLE_texture_format_BGRA8888 GL_APPLE_framebuffer_multisample GL_IMG_texture_compression_pvrtc";
+                if (len + strlen(extra) + 1 < sizeof(g_ext_buf)) {
+                    memcpy(g_ext_buf, s, len);
+                    strcpy(g_ext_buf + len, extra);
+                }
+                __atomic_store_n(&g_ext_ready, 1, __ATOMIC_RELEASE);
             }
+            pthread_mutex_unlock(&gles_mtx);
         }
         if (g_ext_buf[0])
             return (const GLubyte *)g_ext_buf;
@@ -1844,7 +1978,15 @@ void wrap_VertexAttrib4fv(GLuint idx, const GLfloat *v)
 }
 
 static GLuint next_fence_id = 1;
-void wrap_GenFencesAPPLE(GLsizei n, GLuint *fences) { for (GLsizei i = 0; i < n; i++) fences[i] = next_fence_id++; }
+void wrap_GenFencesAPPLE(GLsizei n, GLuint *fences)
+{
+    for (GLsizei i = 0; i < n; i++) {
+        GLuint id = __atomic_fetch_add(&next_fence_id, 1u, __ATOMIC_RELAXED);
+        if (!id)
+            id = __atomic_fetch_add(&next_fence_id, 1u, __ATOMIC_RELAXED);
+        fences[i] = id;
+    }
+}
 void wrap_DeleteFencesAPPLE(GLsizei n, const GLuint *fences) { (void)n; (void)fences; }
 void wrap_SetFenceAPPLE(GLuint fence) { (void)fence; }
 GLboolean wrap_IsFenceAPPLE(GLuint fence) { return fence != 0; }
@@ -1952,14 +2094,14 @@ static size_t format_bpp(uint32_t fmt, uint32_t type)
     }
 }
 
-static void bind_iosurf_slot(int is_rb, GLuint obj_id, void *surf, uint32_t w, uint32_t h,
+static void bind_iosurf_slot(void *owner, int is_rb, GLuint obj_id, void *surf, uint32_t w, uint32_t h,
                              uint32_t plane, uint32_t invert, uint32_t fmt, uint32_t type,
                              uint32_t seed, struct pipe_resource *pt, uint32_t zc_va, uint32_t zc_bpr)
 {
-    if (!obj_id || !surf)
+    if (!owner || !obj_id || !surf)
         return;
     pthread_mutex_lock(&gles_mtx);
-    struct iosurf_binding *slot = find_iosurf_locked(is_rb, obj_id);
+    struct iosurf_binding *slot = find_iosurf_locked(owner, is_rb, obj_id);
     if (!slot) {
         for (int i = 0; i < g_iosurf_hi; i++) {
             if (!g_iosurfs[i].used) { slot = &g_iosurfs[i]; break; }
@@ -1977,6 +2119,7 @@ static void bind_iosurf_slot(int is_rb, GLuint obj_id, void *surf, uint32_t w, u
         if (!slot->used || slot->surf != surf)
             CFRetain(surf);
         slot->used = 1;
+        slot->owner = owner;
         slot->is_rb = is_rb;
         slot->obj_id = obj_id;
         slot->surf = surf;
@@ -1993,6 +2136,12 @@ static void bind_iosurf_slot(int is_rb, GLuint obj_id, void *surf, uint32_t w, u
         slot->dirty = 0;
         rebuild_iosurf_fbo_mask_locked();
         g_iosurf_gen++;
+    } else {
+        static int iosurf_full_logged = 0;
+        if (!iosurf_full_logged) {
+            iosurf_full_logged = 1;
+            mali_log("[MALI] g_iosurfs full (MAX_IOSURF=%d)\n", MAX_IOSURF);
+        }
     }
     pthread_mutex_unlock(&gles_mtx);
 }
@@ -2018,6 +2167,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
     mali_ensure_current_by_gli(gli_ctx);
     if (!tls_cur_ctx)
         return 0;
+    void *owner = ctx_owner(tls_cur_ctx);
 
     if (target == GL_RENDERBUFFER) {
         struct gl_context *glctx = tls_cur_ctx->st ? tls_cur_ctx->st->ctx : NULL;
@@ -2051,7 +2201,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                         _mesa_FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                                       GL_RENDERBUFFER, tls_cur_ctx->bound_rb);
                 }
-                bind_iosurf_slot(1, tls_cur_ctx->bound_rb, surf, w, h, plane, invert, 0x80e1u, GL_UNSIGNED_BYTE, 0u, cached_pt, 0u, 0u);
+                bind_iosurf_slot(owner, 1, tls_cur_ctx->bound_rb, surf, w, h, plane, invert, 0x80e1u, GL_UNSIGNED_BYTE, 0u, cached_pt, 0u, 0u);
                 pipe_resource_reference(&cached_pt, NULL);
                 return 1;
             }
@@ -2079,7 +2229,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                 pipe_resource_reference(&g_bb_swap[slot].pt, new_pt);
                 pthread_mutex_unlock(&gles_mtx);
             }
-            bind_iosurf_slot(1, tls_cur_ctx->bound_rb, surf, w, h, plane, invert, 0x80e1u, GL_UNSIGNED_BYTE, 0u, new_pt, 0u, 0u);
+            bind_iosurf_slot(owner, 1, tls_cur_ctx->bound_rb, surf, w, h, plane, invert, 0x80e1u, GL_UNSIGNED_BYTE, 0u, new_pt, 0u, 0u);
             return 1;
         }
 
@@ -2113,7 +2263,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                 zc_bpr = 0u;
             }
         }
-        bind_iosurf_slot(1, tls_cur_ctx->bound_rb, surf, w, h, plane, invert, 0x80e1u, GL_UNSIGNED_BYTE, 0u, rb_pt, zc_va, zc_bpr);
+        bind_iosurf_slot(owner, 1, tls_cur_ctx->bound_rb, surf, w, h, plane, invert, 0x80e1u, GL_UNSIGNED_BYTE, 0u, rb_pt, zc_va, zc_bpr);
         {
             static uint32_t g_rbb_log = 0;
             if (!is_backboardd_proc() && g_rbb_log < 8u) {
@@ -2143,7 +2293,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
             int skip_unchanged = 0;
             if (cur_seed != 0u && texObj && texObj->pt && tex_id) {
                 pthread_mutex_lock(&gles_mtx);
-                struct iosurf_binding *slot = find_iosurf_locked(0, tex_id);
+                struct iosurf_binding *slot = find_iosurf_locked(owner, 0, tex_id);
                 if (slot && slot->surf == surf && slot->w == w && slot->h == h &&
                     slot->plane == plane && slot->invert == invert &&
                     slot->fmt == m_fmt && slot->type == m_type &&
@@ -2225,6 +2375,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                         iosurf_pipe_fmt_ok(pt->format, m_ifmt, m_fmt, m_type)) {
                         struct lima_resource *lres = lima_resource(pt);
                         if (zc_tex_va && lres && !lres->tiled && lres->bo) {
+                            int zc_ok = 1;
                             if (lres->bo->va != (uint32_t)zc_tex_va || !(lres->bo->handle & 0x80000000u)) {
                                 lima_flush_job_accessing_bo((struct lima_context *)tls_cur_ctx->st->pipe, lres->bo, false);
                                 if (!(lres->bo->handle & 0x80000000u)) {
@@ -2233,16 +2384,22 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
                                     if (ext) {
                                         lima_bo_unreference(lres->bo);
                                         lres->bo = ext;
+                                    } else {
+                                        zc_ok = 0;
                                     }
                                 }
-                                lres->bo->va = (uint32_t)zc_tex_va;
-                                lres->bo_gen = lima_next_bo_gen();
+                                if (zc_ok) {
+                                    lres->bo->va = (uint32_t)zc_tex_va;
+                                    lres->bo_gen = lima_next_bo_gen();
+                                }
                             }
-                            lres->bo->cacheable = false;
-                            lres->levels[0].stride = (uint32_t)bpr;
-                            lres->levels[0].offset = 0u;
-                            tex_pt = pt;
-                            uploaded_direct = 1;
+                            if (zc_ok) {
+                                lres->bo->cacheable = false;
+                                lres->levels[0].stride = (uint32_t)bpr;
+                                lres->levels[0].offset = 0u;
+                                tex_pt = pt;
+                                uploaded_direct = 1;
+                            }
                         } else if (lres && !lres->tiled && lres->bo &&
                                    !(lres->bo->handle & 0x80000000u) &&
                                    lres->levels[0].stride >= row_bytes &&
@@ -2308,7 +2465,7 @@ static uint8_t swiz_texImageIOSurface(void *self, void *cmd,
             }
             IOSurfaceUnlock(surf, 1, NULL);
         }
-        bind_iosurf_slot(0, tex_id, surf, w, h, plane, invert, m_fmt, m_type, cur_seed, tex_pt, 0u, 0u);
+        bind_iosurf_slot(owner, 0, tex_id, surf, w, h, plane, invert, m_fmt, m_type, cur_seed, tex_pt, 0u, 0u);
         return 1;
     }
     return 0;
@@ -2332,9 +2489,10 @@ struct eagl_native_window {
     uint32_t (*properties)(void *win);
 };
 
-#define MAX_NW_BINDS 8
+#define MAX_NW_BINDS 32
 struct nw_bind {
     int used;
+    struct mali_gles_ctx *ctx;
     GLuint rb_id;
     struct eagl_native_window *win;
     uint32_t w, h;
@@ -2342,6 +2500,14 @@ struct nw_bind {
     uint32_t prev_seq;
 };
 static struct nw_bind g_nw_binds[MAX_NW_BINDS];
+
+static void cleanup_nw_binds_locked(struct mali_gles_ctx *c)
+{
+    for (int i = 0; i < MAX_NW_BINDS; i++) {
+        if (g_nw_binds[i].used && g_nw_binds[i].ctx == c)
+            memset(&g_nw_binds[i], 0, sizeof(g_nw_binds[i]));
+    }
+}
 
 static int  nw_cb1(void *d) { (void)d; return 1; }
 static void nw_cb2(void *d, void *s) { (void)d; (void)s; }
@@ -2383,11 +2549,13 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
         void *gli_ctx = *(void **)((uint8_t *)priv + 0x10);
         mali_ensure_current_by_gli(gli_ctx);
         struct mali_gles_ctx *c = tls_cur_ctx;
+        void *owner = ctx_owner(c);
         struct nw_bind *nb = NULL;
         if (c && !is_backboardd_proc()) {
             pthread_mutex_lock(&gles_mtx);
             for (int i = 0; i < MAX_NW_BINDS; i++) {
-                if (g_nw_binds[i].used && (!c->bound_rb || g_nw_binds[i].rb_id == c->bound_rb)) {
+                if (g_nw_binds[i].used && g_nw_binds[i].ctx == c &&
+                    (!c->bound_rb || g_nw_binds[i].rb_id == c->bound_rb)) {
                     nb = &g_nw_binds[i];
                     break;
                 }
@@ -2395,7 +2563,7 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
             GLuint rb_match = nb ? nb->rb_id : c->bound_rb;
             for (int i = 0; i < g_iosurf_hi; i++) {
                 struct iosurf_binding *b = &g_iosurfs[i];
-                if (b->used && b->is_rb && (!rb_match || b->obj_id == rb_match)) {
+                if (b->used && b->owner == owner && b->is_rb && (!rb_match || b->obj_id == rb_match)) {
                     b->dirty = 1;
                     b->dirty_x0 = 0; b->dirty_y0 = 0;
                     b->dirty_x1 = b->w; b->dirty_y1 = b->h;
@@ -2423,7 +2591,7 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
                     uint32_t zc_bpr = 0u;
                     uint32_t zc_va = map_iosurf_zc_va(rs, nw, nh, &zc_bpr);
                     pthread_mutex_lock(&gles_mtx);
-                    struct iosurf_binding *b = find_iosurf_locked(1, nb->rb_id);
+                    struct iosurf_binding *b = find_iosurf_locked(owner, 1, nb->rb_id);
                     if (b) {
                         if (b->surf != rs) { CFRetain(rs); if (b->surf) CFRelease(b->surf); b->surf = rs; }
                         b->zc_va = zc_va; b->zc_bpr = zc_bpr;
@@ -2443,7 +2611,7 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
             void *cur_surf = NULL;
             int has_zc = 0;
             pthread_mutex_lock(&gles_mtx);
-            struct iosurf_binding *cb = find_iosurf_locked(1, nb->rb_id);
+            struct iosurf_binding *cb = find_iosurf_locked(owner, 1, nb->rb_id);
             if (cb && cb->surf) {
                 cur_surf = cb->surf;
                 has_zc = (cb->zc_va != 0u);
@@ -2481,27 +2649,8 @@ static uint8_t swiz_presentRenderbuffer(void *self, void *cmd, uint32_t target)
                 nb->need_begin = 1;
             if (want_log) {
                 g_nws_log++;
-                uint32_t sh0 = 0, sh12 = 0, sh16 = 0, st0 = 0, st1 = 0, st2 = 0, ty0 = 0, ty1 = 0, ty2 = 0;
-                uint8_t *w8 = (uint8_t *)nb->win;
-                uint8_t *iq = *(uint8_t **)(w8 + 76);
-                if (iq) {
-                    uint8_t *shobj = *(uint8_t **)(iq + 28);
-                    uint8_t *sh = shobj ? *(uint8_t **)(shobj + 12) : NULL;
-                    if (sh) {
-                        sh0  = *(uint32_t *)(sh + 0);
-                        sh12 = *(uint32_t *)(sh + 12);
-                        sh16 = *(uint32_t *)(sh + 16);
-                        st0 = *(uint32_t *)(sh + 232 + 0 * 80 + 32);
-                        st1 = *(uint32_t *)(sh + 232 + 1 * 80 + 32);
-                        st2 = *(uint32_t *)(sh + 232 + 2 * 80 + 32);
-                        ty0 = *(uint32_t *)(sh + 232 + 0 * 80 + 40);
-                        ty1 = *(uint32_t *)(sh + 232 + 1 * 80 + 40);
-                        ty2 = *(uint32_t *)(sh + 232 + 2 * 80 + 40);
-                    }
-                }
-                kperf_log("[GL] nw_swap#%u rc=%d beg_s=%p beg=%u w=%u sw=%u sh=%x,%x,%x st=%x,%x,%x ty=%u,%u,%u iu=%u\n",
-                          g_nws_log, swap_rc, beg_surf, beg_ms, ts1 - ts0, ts2 - ts1,
-                          sh0, sh12, sh16, st0, st1, st2, ty0, ty1, ty2, iu);
+                kperf_log("[GL] nw_swap#%u rc=%d beg_s=%p beg=%u w=%u sw=%u iu=%u\n",
+                          g_nws_log, swap_rc, beg_surf, beg_ms, ts1 - ts0, ts2 - ts1, iu);
             }
             return 1;
         }
@@ -2526,7 +2675,7 @@ static uint8_t swiz_renderbufferStorageFromDrawable(void *self, void *cmd, uint3
     int slot = -1;
     pthread_mutex_lock(&gles_mtx);
     for (int i = 0; i < MAX_NW_BINDS; i++) {
-        if (g_nw_binds[i].used && g_nw_binds[i].rb_id == rb_id) { slot = i; break; }
+        if (g_nw_binds[i].used && g_nw_binds[i].ctx == c && g_nw_binds[i].rb_id == rb_id) { slot = i; break; }
         if (!g_nw_binds[i].used && slot < 0) slot = i;
     }
     struct eagl_native_window *old_win = (slot >= 0 && g_nw_binds[slot].used) ? g_nw_binds[slot].win : NULL;
@@ -2537,6 +2686,7 @@ static uint8_t swiz_renderbufferStorageFromDrawable(void *self, void *cmd, uint3
         if (slot >= 0) {
             pthread_mutex_lock(&gles_mtx);
             g_nw_binds[slot].used = 0;
+            g_nw_binds[slot].ctx = NULL;
             g_nw_binds[slot].win = NULL;
             g_nw_binds[slot].prev_seq = 0u;
             pthread_mutex_unlock(&gles_mtx);
@@ -2577,6 +2727,7 @@ static uint8_t swiz_renderbufferStorageFromDrawable(void *self, void *cmd, uint3
     if (slot >= 0) {
         pthread_mutex_lock(&gles_mtx);
         g_nw_binds[slot].used = 1;
+        g_nw_binds[slot].ctx = c;
         g_nw_binds[slot].rb_id = rb_id;
         g_nw_binds[slot].win = win;
         g_nw_binds[slot].w = w;
@@ -2584,6 +2735,12 @@ static uint8_t swiz_renderbufferStorageFromDrawable(void *self, void *cmd, uint3
         g_nw_binds[slot].need_begin = 0;
         g_nw_binds[slot].prev_seq = 0u;
         pthread_mutex_unlock(&gles_mtx);
+    } else {
+        static int nw_full_logged = 0;
+        if (!nw_full_logged) {
+            nw_full_logged = 1;
+            mali_log("[MALI] g_nw_binds full (MAX_NW_BINDS=%d)\n", MAX_NW_BINDS);
+        }
     }
     {
         static uint32_t g_nwb_log = 0;

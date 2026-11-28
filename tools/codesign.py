@@ -8,7 +8,7 @@ optional XML entitlements, then prints the 20-byte hex CDHash.
 Usage: codesign.py <macho> [--ident com.exy.foo] [--ent entitlements.plist] [-o out]
        codesign.py --selftest
 """
-import argparse, hashlib, os, struct, sys
+import argparse, hashlib, os, struct, sys, tempfile
 
 MH_MAGIC = 0xFEEDFACE
 LC_SEGMENT = 0x1
@@ -36,7 +36,11 @@ def _find_commands(data):
     codesig = None
     first_sect_off = len(data)
     for _ in range(ncmds):
+        if off + 8 > len(data):
+            raise ValueError(f"load command table overruns file at {off:#x}")
         cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmdsize < 8 or off + cmdsize > len(data):
+            raise ValueError(f"bad load command size {cmdsize:#x} at {off:#x}")
         if cmd == LC_SEGMENT:
             name, vm, vs, fo, fs, mp, ip, nsects, fl = struct.unpack_from("<16s8I", data, off + 8)
             if name.rstrip(b"\0") == b"__LINKEDIT":
@@ -100,8 +104,13 @@ def sign_macho(data, ident, entitlements=b""):
     ncmds, sizeofcmds, first_sect_off, linkedit, codesig = _find_commands(buf)
     if not linkedit:
         raise ValueError("Mach-O has no __LINKEDIT segment")
+    le_off, le_vm, le_vs, le_fo, _ = linkedit
     if codesig:
-        cs_cmd_off, cs_data_off, _ = codesig
+        cs_cmd_off, cs_data_off, cs_data_size = codesig
+        if cs_data_off < le_fo or cs_data_off > len(buf) or cs_data_off + cs_data_size != len(buf):
+            raise ValueError(
+                f"existing LC_CODE_SIGNATURE ({cs_data_off:#x}+{cs_data_size:#x}) is not at __LINKEDIT tail (len={len(buf):#x}, le_fo={le_fo:#x})"
+            )
         del buf[cs_data_off:]
     else:
         if 28 + sizeofcmds + 16 > first_sect_off:
@@ -120,7 +129,6 @@ def sign_macho(data, ident, entitlements=b""):
     # because page 0 contains the Mach-O header and load commands.
     dummy_sb, _ = build_superblob(bytes(buf), ident, entitlements)
     cs_size = len(dummy_sb)
-    le_off, le_vm, le_vs, le_fo, _ = linkedit
     new_fs = (cs_off + cs_size) - le_fo
     new_vs = max(le_vs, align(new_fs, PAGE_SIZE))
     struct.pack_into("<I", buf, le_off + 28, new_vs)
@@ -152,6 +160,26 @@ def selftest():
     # Re-signing must be idempotent
     signed2, cdhash2 = sign_macho(signed, "com.exy.test", b"<plist/>")
     assert signed2 == signed and cdhash2 == cdhash
+    # Edge cases: zero cmdsize, zero cs_data_off, and trailing bytes after LC_CODE_SIGNATURE must fail
+    bad_cmd = bytearray(raw)
+    struct.pack_into("<I", bad_cmd, 28 + 4, 0)
+    for label, blob in (
+        ("zero cmdsize", bytes(bad_cmd)),
+        ("trailing bytes", signed + b"\0"),
+    ):
+        try:
+            sign_macho(blob, "com.exy.test")
+            raise AssertionError(f"expected ValueError for {label}")
+        except ValueError:
+            pass
+    bad_cs = bytearray(signed)
+    _, _, _, _, cs = _find_commands(bad_cs)
+    struct.pack_into("<II", bad_cs, cs[0] + 8, 0, 0)
+    try:
+        sign_macho(bytes(bad_cs), "com.exy.test")
+        raise AssertionError("expected ValueError for zero cs_data_off")
+    except ValueError:
+        pass
     print("codesign selftest OK:", cdhash.hex())
 
 
@@ -171,7 +199,19 @@ def main():
     ident = a.ident or os.path.basename(a.macho)
     ent = open(a.ent, "rb").read() if a.ent else b""
     out, cdhash = sign_macho(open(a.macho, "rb").read(), ident, ent)
-    open(a.o or a.macho, "wb").write(out)
+    dst = a.o or a.macho
+    dst_dir = os.path.dirname(os.path.abspath(dst))
+    fd, tmp = tempfile.mkstemp(dir=dst_dir, prefix=".codesign.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(out)
+        if os.path.exists(dst):
+            os.chmod(tmp, os.stat(dst).st_mode & 0o7777)
+        os.replace(tmp, dst)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     print(cdhash.hex())
 
 

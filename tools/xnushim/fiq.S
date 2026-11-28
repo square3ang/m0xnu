@@ -116,10 +116,9 @@ exy_get_decrementer:			@ ticks to exy_deadline[cpu], clamped to [0, 0x7fffffff]
 	and	r12, r12, #3
 	ldr	r2, =exy_deadline
 	add	r12, r2, r12, lsl #3
-	ldr	r2, [r12]
-	ldr	r12, [r12, #4]
+	ldrd	r2, r3, [r12]		@ single uninterruptible 64-bit load (8-byte aligned)
 	subs	r0, r2, r0
-	sbcs	r1, r12, r1
+	sbcs	r1, r3, r1
 	movlt	r0, #0			@ passed
 	bxlt	lr
 	cmp	r1, #0

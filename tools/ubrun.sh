@@ -3,7 +3,7 @@
 # "script" image of a FIT and "fastboot boot" it (see fastboot_bootcmd in midas.h).
 # No output comes back; leave results in RAM and read them with "fastboot getvar mem:<addr>".
 # usage: ubrun.sh "<cmd>; <cmd>..."   or   ubrun.sh -f script.txt
-set -eu
+set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
 if [ "$1" = -f ]; then cp "$2" "$d/s.txt"; else printf '%s\n' "$1" | tr ';' '\n' > "$d/s.txt"; fi
@@ -18,4 +18,5 @@ cat > "$d/s.its" <<EOF
 EOF
 "$root/u-boot/tools/mkimage" -f "$d/s.its" "$d/s.itb" >/dev/null
 [ "$(stat -c %s "$d/s.itb")" -ge 4096 ] || truncate -s 4096 "$d/s.itb"  # fastboot: "too short"
-timeout 30 fastboot boot "$d/s.itb" 2>&1 | grep -E "FAILED|error" && exit 1 || true
+out=$(timeout 30 fastboot boot "$d/s.itb" 2>&1) || { echo "$out" >&2; exit 1; }
+if grep -qiE "FAILED|error" <<< "$out"; then echo "$out" >&2; exit 1; fi

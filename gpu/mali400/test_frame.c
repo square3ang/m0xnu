@@ -37,7 +37,7 @@ static void check_job(void)
 	dte[0x5f000000 >> 22] = dte[0x60000000 >> 22] = 1;	/* work area, fb */
 	for (i = 0; i < 1024; i++)
 		pts += dte[i];
-	assert(pool <= MALI_MEM_SIZE - 0x20000 && pts <= 8);
+	assert(pool <= MALI_MEM_SIZE - MALI_W_POOL && pts <= MALI_W_PT_NUM);
 	for (i = 0; i < tri_job.nblobs; i++)
 		assert(mapped(tri_job.blobs[i].va) && mapped(tri_job.blobs[i].va + 4 * tri_job.blobs[i].n - 1));
 	for (i = 0; i < 6; i++)
@@ -46,6 +46,42 @@ static void check_job(void)
 	for (i = 0; i < 4; i++)
 		assert(mapped(tri_job.plbu_array[i]));
 	printf("job: %u ranges, %#x bytes, %u page tables\n", tri_job.nranges, pool, pts);
+}
+
+static void check_map_va(void)
+{
+	static uint8_t work[MALI_MEM_SIZE];
+	struct mali_env env = { .mem = work, .mem_pa = 0x5f000000u };
+	uint32_t *dte = (uint32_t *)work;
+
+	mali_pt_reset(&env);
+	/* Reject zero length and 32-bit VA/PA wrap without leaking page tables. */
+	assert(mali_map_va(&env, 0u, 0x62000000u, 0u) == MALI_ERR_MAP);
+	assert(mali_map_va(&env, 0x04000000u, 0x62000000u, 0u) == MALI_ERR_MAP);
+	assert(mali_map_va(&env, 0xfffff000u, 0x62000000u, 0x2000u) == MALI_ERR_MAP);
+	assert(mali_map_va(&env, 0x04000000u, 0xfffff000u, 0x2000u) == MALI_ERR_MAP);
+	assert(dte[0] == 0u && dte[0x04000000u >> 22] == 0u);
+
+	/* Valid mapping at 4 GiB top boundary + unmap clears PTE. */
+	assert(mali_map_va(&env, 0xfffff000u, 0x62000000u, 0x1000u) == MALI_OK);
+	uint32_t *top_pt = (uint32_t *)(work + (dte[1023] & ~0xfffu) - env.mem_pa);
+	assert((top_pt[1023] & ~0xfffu) == 0x62000000u && (top_pt[1023] & 1u));
+	mali_unmap_va(&env, 0xfffff000u, 0x1000u);
+	assert(top_pt[1023] == 0u);
+
+	/* Partial shrink: unmap upper page leaves lower page intact. */
+	assert(mali_map_va(&env, 0x80000000u, 0x62000000u, 0x2000u) == MALI_OK);
+	uint32_t *zc_pt = (uint32_t *)(work + (dte[0x80000000u >> 22] & ~0xfffu) - env.mem_pa);
+	assert((zc_pt[0] & 1u) && (zc_pt[1] & 1u));
+	mali_unmap_va(&env, 0x80001000u, 0x1000u);
+	assert((zc_pt[0] & 1u) && zc_pt[1] == 0u);
+
+	/* Exhaust all MALI_W_PT_NUM page tables, verify next distinct 4 MiB DTE fails. */
+	mali_pt_reset(&env);
+	for (unsigned i = 0; i < MALI_W_PT_NUM; i++)
+		assert(mali_map_va(&env, i << 22, 0x62000000u, 0x1000u) == MALI_OK);
+	assert(mali_map_va(&env, (uint32_t)MALI_W_PT_NUM << 22, 0x62000000u, 0x1000u) == MALI_ERR_MAP);
+	printf("map_va: %u PTs ok\n", MALI_W_PT_NUM);
 }
 
 int main(void)
@@ -87,6 +123,7 @@ int main(void)
 	assert(s[1] == 0xb8000000 && s[3] == 0xb8000001 && s[2 * 45 + 1] == 0xb8000100);
 	assert(s[2 * 45 * 80 - 1] == (0xb8000000 | 44 | 79 << 8) && s[2 * 45 * 80 + 1] == 0xbc000000);
 	check_job();
+	check_map_va();
 	puts("ok");
 	return 0;
 }

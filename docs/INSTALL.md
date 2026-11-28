@@ -14,17 +14,14 @@
 ### Host Linux Packages
 ```bash
 # Arch Linux example (install equivalent packages on Ubuntu/Debian)
-sudo pacman -S base-devel git python clang lld arm-none-eabi-gcc arm-none-eabi-binutils \
-               dtc uboot-tools android-tools heimdall meson ninja p7zip hfsprogs zstd
+sudo pacman -S base-devel git python python-cryptography clang llvm lld zig \
+               arm-none-eabi-gcc arm-none-eabi-binutils dtc uboot-tools \
+               android-tools heimdall meson ninja p7zip hfsprogs zstd
 ```
 - **iOS armv7 linker (`arm-apple-darwin11-ld`)**: Place `ld64` from `cctools-port` at `tools/cctools/bin/arm-apple-darwin11-ld` (required by `tools/iosbin/build.sh` and `gpu/ios-gl/build.sh`).
 - **iOS 9.3.5 (`13G36`) IPSW** (user-supplied):
   - `iPhone4,1_9.3.5_13G36_Restore.ipsw`
-  - Extract and decrypt:
-    - `fw/kernelcache.n94.macho` (decrypted & decompressed Mach-O kernelcache)
-    - `fw/DeviceTree.n94ap.bin` (decrypted DeviceTree)
-    - `fw/rootfs.raw` (decrypted HFS+ root filesystem image)
-  - Refer to The Apple Wiki (`13G36 (iPhone4,1)`) for public decryption keys.
+  - Run `python3 tools/fw.py` to fetch and decrypt `fw/kernelcache.n94.macho` and `fw/DeviceTree.n94ap.bin`, and separately extract/decrypt `fw/rootfs.raw` (HFS+ root filesystem image) using public keys from The Apple Wiki (`13G36 (iPhone4,1)`).
 - **Wi-Fi firmware (optional)**: `/lib/firmware/brcm/brcmfmac4334-sdio.bin(.zst)` from Linux `linux-firmware`.
 
 ---
@@ -87,7 +84,7 @@ Outputs: `out/iosbin/HorizonSetup`, `out/iosbin/ExyTouchd`, and their `.cdhash` 
 meson setup out/mesa-ios9 gpu/mesa-lima \
   --cross-file gpu/ios-gl/toolchain/ios9-armv7.cross \
   -Dplatforms= -Dgallium-drivers=lima -Dvulkan-drivers= -Dglx=disabled \
-  -Degl=disabled -Dgles1=enabled -Dgles2=enabled -Dshared-glapi=disabled \
+  -Degl=disabled -Dgles1=enabled -Dgles2=enabled \
   -Dllvm=disabled -Dbuildtype=release
 ninja -C out/mesa-ios9
 

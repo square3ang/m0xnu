@@ -76,17 +76,16 @@
 #define  GP_IRQ_ALL		0x7fffff
 
 #define VM_PRESENT		0x1
-#define VM_UNCACHED		0x7	/* LIMA_VM_FLAGS_UNCACHE */
 #define VM_CACHED		0x18f	/* read-cacheable only (no WRITE_CACHEABLE/WRITE_BUFFERABLE tile glitches) */
 
 /* work area layout */
 #define W_DTE			0x0000
 #define W_PT			0x1000
-#define W_PT_NUM		144	/* 144 x 4 MiB = 576 MiB GPU VA space (0x1000..0x91000) */
+#define W_PT_NUM		MALI_W_PT_NUM	/* 144 x 4 MiB = 576 MiB GPU VA space (0x1000..0x91000) */
 #define W_RSW			0x91000
 #define W_CLEAR_PROG		0x91040
 #define W_STREAM		0x92000
-#define W_POOL			0xa0000	/* job memory */
+#define W_POOL			MALI_W_POOL	/* job memory */
 
 uint32_t mali_last_status;
 uint32_t mali_vpll_con0;
@@ -133,16 +132,37 @@ static void exynos_g3d_on(const struct mali_env *e)
 	wr(e->cmu + CMU_DIV_G3D, rd(e->cmu + CMU_DIV_G3D) & ~0xfu); /* /1 = 440 MHz */
 }
 
+void mali_pt_reset(const struct mali_env *e)
+{
+	uint32_t *w = (uint32_t *)e->mem;
+	unsigned i;
+
+	for (i = 0; i < (W_PT_NUM + 31) / 32; i++)
+		mali_pt_used[i] = 0;
+	for (i = 0; i < W_STREAM / 4; i++)
+		w[i] = 0;
+}
+
 /* map GPU [va, va + len) to [pa, pa + len) */
-static int map_va(const struct mali_env *e, uint32_t va, uint32_t pa, uint32_t len)
+int mali_map_va(const struct mali_env *e, uint32_t va, uint32_t pa, uint32_t len)
 {
 	uint32_t *dte = (uint32_t *)(e->mem + W_DTE);
-	uint32_t a, end = va + (len - 1);	/* inclusive: ranges may end at 4 GiB */
+	uint32_t a, a0, end, p0;
 	uint32_t last_dte = ~0u;
 	uint32_t *pt = 0;
 
-	pa &= ~0xfffu;
-	for (a = va & ~0xfffu; a <= end; a += 0x1000, pa += 0x1000) {
+	if (!len)
+		return MALI_ERR_MAP;
+	end = va + (len - 1u);	/* inclusive: ranges may end at 4 GiB */
+	if (end < va)
+		return MALI_ERR_MAP;
+	a0 = va & ~0xfffu;
+	p0 = pa & ~0xfffu;
+	if (p0 + ((end & ~0xfffu) - a0) < p0)
+		return MALI_ERR_MAP;
+
+	pa = p0;
+	for (a = a0; a <= end; a += 0x1000u, pa += 0x1000u) {
 		uint32_t dte_idx = a >> 22;
 
 		if (dte_idx != last_dte) {
@@ -170,10 +190,42 @@ static int map_va(const struct mali_env *e, uint32_t va, uint32_t pa, uint32_t l
 			last_dte = dte_idx;
 		}
 		pt[(a >> 12) & 0x3ff] = pa | VM_CACHED;
-		if (a == 0xfffff000)
+		if (a == 0xfffff000u)
 			break;
 	}
 	return MALI_OK;
+}
+
+void mali_unmap_va(const struct mali_env *e, uint32_t va, uint32_t len)
+{
+	uint32_t *dte = (uint32_t *)(e->mem + W_DTE);
+	uint32_t a, end;
+	uint32_t last_dte = ~0u;
+	uint32_t *pt = 0;
+
+	if (!len)
+		return;
+	end = va + (len - 1u);
+	if (end < va)
+		return;
+	for (a = va & ~0xfffu; a <= end; a += 0x1000u) {
+		uint32_t dte_idx = a >> 22;
+
+		if (dte_idx != last_dte) {
+			uint32_t d = dte[dte_idx];
+			pt = (d & VM_PRESENT) ? (uint32_t *)(e->mem + (d & ~0xfffu) - e->mem_pa) : 0;
+			last_dte = dte_idx;
+		}
+		if (pt)
+			pt[(a >> 12) & 0x3ff] = 0u;
+		if (a == 0xfffff000u)
+			break;
+	}
+}
+
+static inline int map_va(const struct mali_env *e, uint32_t va, uint32_t pa, uint32_t len)
+{
+	return mali_map_va(e, va, pa, len);
 }
 
 static int map(const struct mali_env *e, uint32_t pa, uint32_t len)
@@ -227,7 +279,6 @@ static int pp_hard_reset(const struct mali_env *e, uintptr_t pp)
 int mali_init(const struct mali_env *e)
 {
 	uintptr_t g = e->gpu;
-	uint32_t *w = (uint32_t *)e->mem;
 	unsigned i;
 	int err;
 
@@ -255,10 +306,7 @@ int mali_init(const struct mali_env *e)
 	wr(g + M_L2 + L2_ENABLE, 3);		/* ACCESS | READ_ALLOCATE */
 	wr(g + M_L2 + L2_MAX_READS, 0x1c);
 
-	for (i = 0; i < (W_PT_NUM + 31) / 32; i++)
-		mali_pt_used[i] = 0;
-	for (i = 0; i < W_STREAM / 4; i++)
-		w[i] = 0;
+	mali_pt_reset(e);
 	if ((err = map(e, e->mem_pa, MALI_MEM_SIZE)))
 		return err;
 	e->flush(e->mem, W_STREAM);
@@ -370,7 +418,8 @@ int mali_pp_clear(const struct mali_env *e, const struct mali_fb *fb, uint32_t r
 	unsigned i;
 	int err;
 
-	if (fb->width > 4096 || fb->height > 4096 ||
+	if (!fb->width || !fb->height || fb->width > 4096 || fb->height > 4096 ||
+	    fb->stride < fb->width * 4u || (fb->stride & 7u) || fb->stride > 16384u ||
 	    ((fb->width + 15) / 16) * ((fb->height + 15) / 16) * 8 + 8 > W_POOL - W_STREAM)
 		return MALI_ERR_MAP;
 	if ((err = map(e, fb->pa, fb->stride * fb->height)))

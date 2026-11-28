@@ -34,10 +34,13 @@ extern uint32_t mali_work_size;
 extern void *lima_screen_create(int fd, const void *config, void *ro);
 extern void *lima_context_create(void *pscreen, void *priv, unsigned flags);
 extern void  mali_gles_init_screen(void *pipe_screen);
-extern void *mali_gles_create_context(void *gli_ctx, void *shared_st);
+extern void *mali_gles_create_context(void *gli_ctx, void *shared_st, void *sharegroup);
 extern void  mali_gles_destroy_context(void *gli_ctx);
+extern void  mali_gles_destroy_pipe_ctx(void *pctx);
 extern void  mali_gles_reinstall_for_gli(void *gli_ctx);
 extern void  mali_gles_install_dispatch(void *eagl_priv);
+extern void  mali_gld_lock(void);
+extern void  mali_gld_unlock(void);
 
 #define MALI_FAKE_DRM_FD 999
 
@@ -103,15 +106,20 @@ int gldCreateDevice(void **out_dev, uint32_t display_mask, void *info)
     (void)info;
     if (!out_dev)
         return -1;
+    mali_gld_lock();
     if (g_shared_dev) {
         *out_dev = g_shared_dev;
+        mali_gld_unlock();
         return 0;
     }
     struct mali_device *dev = (struct mali_device *)calloc(1, sizeof(*dev));
-    if (!dev)
+    if (!dev) {
+        mali_gld_unlock();
         return -1;
+    }
     dev->display_mask = display_mask ? display_mask : 1;
 
+    int ok = 0;
     uint32_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                IOServiceMatching("SGXDriver543"));
     if (svc) {
@@ -131,15 +139,28 @@ int gldCreateDevice(void **out_dev, uint32_t display_mask, void *info)
                 static struct mali_dri_opt_cache opt_cache;
                 struct mali_pipe_screen_config cfg = { 0, &opt_cache, &opt_info };
                 dev->lima_screen = lima_screen_create(MALI_FAKE_DRM_FD, &cfg, 0);
-                mali_gles_init_screen(dev->lima_screen);
-                mali_log("[MALI] dev conn=%u work_pa=0x%x sz=0x%x lima_screen=%p\n",
-                         dev->conn, dev->work_pa, dev->mem_size, dev->lima_screen);
+                if (dev->lima_screen) {
+                    mali_gles_init_screen(dev->lima_screen);
+                    mali_log("[MALI] dev conn=%u work_pa=0x%x sz=0x%x lima_screen=%p\n",
+                             dev->conn, dev->work_pa, dev->mem_size, dev->lima_screen);
+                    ok = 1;
+                }
+            }
+            if (!ok) {
+                IOServiceClose(dev->conn);
+                mali_iokit_conn = 0;
             }
         }
         IOObjectRelease(svc);
     }
+    if (!ok) {
+        free(dev);
+        mali_gld_unlock();
+        return -1;
+    }
     g_shared_dev = dev;
     *out_dev = dev;
+    mali_gld_unlock();
     return 0;
 }
 
@@ -246,12 +267,14 @@ int gldCreateContext(void *sg_p, void **out_ctx, void *pf, void *limits_p, void 
              sg, ctx->dev, ctx->gli_ctx, limits_p, state_p);
     if (ctx->dev && ctx->dev->lima_screen) {
         if (ctx->gli_ctx) {
+            mali_gld_lock();
             void *shared_st = (sg && sg->ctxs) ? sg->ctxs->st_ctx : 0;
-            ctx->st_ctx = mali_gles_create_context(ctx->gli_ctx, shared_st);
+            ctx->st_ctx = mali_gles_create_context(ctx->gli_ctx, shared_st, sg);
             if (sg && ctx->st_ctx) {
                 ctx->sg_next = sg->ctxs;
                 sg->ctxs = ctx;
             }
+            mali_gld_unlock();
         } else {
             ctx->lima_ctx = lima_context_create(ctx->dev->lima_screen, 0, 0);
         }
@@ -284,6 +307,7 @@ void gldDestroyContext(void *p)
     struct mali_ctx *ctx = (struct mali_ctx *)p;
     if (!ctx) return;
     if (ctx->sg) {
+        mali_gld_lock();
         struct mali_ctx **pp = &ctx->sg->ctxs;
         while (*pp) {
             if (*pp == ctx) {
@@ -293,9 +317,12 @@ void gldDestroyContext(void *p)
             pp = &(*pp)->sg_next;
         }
         ctx->sg_next = 0;
+        mali_gld_unlock();
     }
     if (ctx->gli_ctx)
         mali_gles_destroy_context(ctx->gli_ctx);
+    else if (ctx->lima_ctx)
+        mali_gles_destroy_pipe_ctx(ctx->lima_ctx);
     free(ctx);
 }
 

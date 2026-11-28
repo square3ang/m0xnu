@@ -4,7 +4,6 @@ def load(path='fw/kernelcache.n94.macho'):
     m=open(path,'rb').read()
     i=m.find(b'<dict><key>_PrelinkInfoDictionary</key>')
     if i<0: i=m.find(b'<dict>',m.find(b'_PrelinkInfoDictionary')-20)
-    j=m.find(b'</dict>\x00',i)
     j = m.rfind(b'</dict>', i, m.find(b'\x00', i)) + 7
     root=ET.fromstring(m[i:j].decode('latin1'))
     ids={}

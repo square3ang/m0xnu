@@ -5,9 +5,10 @@
 # Fills red/green/blue thirds, runs "xnufb", grabs a camera frame (/dev/video0) while
 # U-Boot sleeps, then resets: falling back to the installed U-Boot (fastboot exit or
 # re-entry) has wedged its USB twice.
-set -eu
+set -euo pipefail
 cd "$(dirname "$0")/.."
-bpp=${1:-32}; out=${2:-/tmp/opencode/fbtest.jpg}
+bpp=${1:-32}; out=${2:-/tmp/fbtest.jpg}
+mkdir -p "$(dirname "$out")"
 wait_fb() { for _ in $(seq 1 40); do v=$(timeout 3 fastboot getvar version-bootloader 2>&1 | grep -o 'U-Boot.*') && { echo "$v"; return; }; sleep 2; done; echo "no fastboot" >&2; exit 1; }
 wait_fb
 timeout 30 fastboot boot out/chain.itb >/dev/null 2>&1

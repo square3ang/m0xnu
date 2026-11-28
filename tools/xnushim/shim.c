@@ -84,7 +84,6 @@ typedef void *buf_t;
 #define WDT_PA          0x10060000
 #define WTDAT           0x04
 #define WTCNT           0x08
-#define WDT_PET_LIMIT   (86400ull * 24000000) /* MCT ticks (24 h live boot) */
 
 #define MSHC_PA         0x12550000  /* eMMC: DesignWare MMC 2.40a, left in transfer state by U-Boot */
 #define MSHC_CTRL       0x000
@@ -101,7 +100,7 @@ uintptr_t mct, gicd, gicc, wdt, mshc, exy_pl310, pmu_va, sysram_va, boot_magic_v
 uint32_t exy_ncpus = 1;             /* patched by mkxnu.py from --args cpus=N (1..4) */
 uint32_t exy_wdt_sec = 0;           /* 0=unlimited; patched by mkxnu.py to 160 when bench=1 */
 volatile uint32_t exy_usb_hb;       /* incremented by exy_usb_poll_thread; stalls stop WDT petting */
-uint64_t exy_deadline[4];           /* per-CPU deadlines read by exy_get_decrementer (fiq.S) */
+uint64_t exy_deadline[4] __attribute__((aligned(8))); /* per-CPU deadlines read by exy_get_decrementer (fiq.S) */
 uint32_t exy_smp_boot_info[5] __attribute__((aligned(32))) = {
     0x00020001u, 0x80000000u, 0x40000000u, 0x1ef00000u, 0u
 };
@@ -109,7 +108,7 @@ uint32_t exy_smp_cpu_data_pa[4] __attribute__((aligned(32)));
 uint32_t exy_smp_entered[4] __attribute__((aligned(32)));
 uint32_t exy_smp_started __attribute__((aligned(32)));
 extern char exy_smp_entry[];
-static volatile uint32_t mct_lock, emmc_lock;
+static volatile uint32_t emmc_lock, pl310_lock;
 static uint64_t boot_mct0;
 static int smp_ptd_cleaned;
 
@@ -125,14 +124,33 @@ struct {
     uint32_t irq_handler, cpu_signal, pad[6];
 } exy_dbg __attribute__((aligned(32)));
 
+static void spin_lock(volatile uint32_t *lk);
+static void spin_unlock(volatile uint32_t *lk);
+
+uint32_t exy_pl310_lock(void)
+{
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr\ncpsid i" : "=r"(cpsr) :: "memory");
+    spin_lock(&pl310_lock);
+    return cpsr;
+}
+
+void exy_pl310_unlock(uint32_t cpsr)
+{
+    spin_unlock(&pl310_lock);
+    __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+}
+
 static void clean_line(volatile void *p)
 {
     __asm__ volatile("mcr p15, 0, %0, c7, c10, 1\ndsb" :: "r"(p) : "memory");
     uintptr_t va = (uintptr_t)p;
     if (exy_pl310 && va >= 0x80000000u && va < 0xa0000000u) {
+        uint32_t f = exy_pl310_lock();
         *(volatile uint32_t *)(exy_pl310 + 0x7b0u) = (uint32_t)((va - 0x40000000u) & ~31u);
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
         __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
     }
 }
 
@@ -179,10 +197,12 @@ static void clean_range_pa(const void *p, uint32_t pa, uint32_t len)
         __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" :: "r"(va0 + off) : "memory");
     __asm__ volatile("dsb" ::: "memory");
     if (exy_pl310 && pa0 >= 0x40000000u && pa0 < 0x80000000u) {
+        uint32_t f = exy_pl310_lock();
         for (uint32_t off = 0; off < n; off += 32u)
             *(volatile uint32_t *)(exy_pl310 + 0x7b0u) = pa0 + off;
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
         __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
     }
 }
 
@@ -483,17 +503,19 @@ static const char md_node_fmt[] __attribute__((section(".drv.rodata"))) = "md%d"
 __attribute__((section(".drv.text")))
 static void md1_add(void)
 {
-    static int done;
+    static volatile uint32_t done;
     uint32_t *md = MDEV(1);
 
     if (done || !exy_var_lba || (md[3] & 1))
         return;
-    done = 1;
+    if (__sync_lock_test_and_set(&done, 1u))
+        return;
     md[0] = md[1] = 0;
     md[2] = exy_var_sectors >> 3;  /* pages */
     md[4] = 512;
     md[5] = 1 | (uint32_t)MDEV_BMAJOR << 24;
     md[7] = (uint32_t)devfs_make_node(md[5], 1 /* DEVFS_BLOCK */, 0, 5 /* operator */, 0600, md_node_fmt, 1);
+    __asm__ volatile("dmb ish" ::: "memory");
     md[3] |= 1;  /* mdInited */
 }
 
@@ -502,7 +524,7 @@ static void md1_add(void)
 #define shim_iolock_mach    ((void *(*)(void *))0x80329749)
 #define shim_lck_mtx_lock   ((void (*)(void *))0x800c2ae9)
 #define shim_lck_mtx_unlock ((void (*)(void *))0x800c2b79)
-static void *emmc_mtx;
+static void *volatile emmc_mtx;
 volatile uint32_t exy_last_emmc_mct;
 
 __attribute__((section(".drv.text")))
@@ -510,8 +532,7 @@ void exy_md_strategy(buf_t bp)
 {
     uint32_t minor = buf_device(bp) & 0xffffff;
     md1_add();  /* first I/O comes after IOFindBSDRoot made md0: devfs is up */
-    if (exy_gpu_on) {  /* once, in thread context: Mali draws into the console framebuffer */
-        exy_gpu_on = 0;
+    if (__sync_lock_test_and_set(&exy_gpu_on, 0u)) {  /* once, in thread context: Mali draws into the console framebuffer */
         exy_gpu_demo();
     }
     if (!exy_emmc_lba || minor > 1 || (minor == 1 && !exy_var_lba)) {
@@ -519,14 +540,17 @@ void exy_md_strategy(buf_t bp)
         return;
     }
     uint32_t count = buf_count(bp), err = 0, base = minor ? exy_var_lba : exy_emmc_lba;
-    uint64_t off = (uint64_t)buf_blkno(bp) * MDEV_SECSIZE(minor);
+    int64_t blkno = buf_blkno(bp);
+    uint64_t sec_sz = MDEV_SECSIZE(minor);
     uint64_t limit = minor ? (uint64_t)exy_var_sectors << 9 : (uint64_t)MDEV(0)[2] << 12;
+    uint64_t off = (blkno >= 0) ? ((uint64_t)blkno * sec_sz) : 0ull;
     int write = !(buf_flags(bp) & B_READ);
     void *va;
     int map_err = 0;
     if (write && minor == 0)
         err = 30;  /* EROFS */
-    else if (((off | count) & 511) || off + count > limit)
+    else if (blkno < 0 || !sec_sz || (uint64_t)blkno > limit / sec_sz ||
+             ((off | count) & 511u) || off > limit || (uint64_t)count > limit - off)
         err = 22;  /* EINVAL: never touch sectors outside the partition */
     else if (count && (map_err = buf_map(bp, &va)) == 0) {
         uint32_t lba = base + (uint32_t)(off >> 9), st, sum = 0;
@@ -534,17 +558,29 @@ void exy_md_strategy(buf_t bp)
         if (!emmc_mtx) {
             void *l = shim_iolock_alloc();
             void *m = l ? shim_iolock_mach(l) : 0;
-            if (m)
-                (void)__sync_val_compare_and_swap(&emmc_mtx, (void *)0, m);
+            if (m) {
+                uint32_t f;
+                __asm__ volatile("mrs %0, cpsr\ncpsid if" : "=r"(f) :: "memory");
+                spin_lock(&emmc_lock);
+                if (!emmc_mtx)
+                    emmc_mtx = m;
+                spin_unlock(&emmc_lock);
+                __asm__ volatile("msr cpsr_c, %0" :: "r"(f) : "memory");
+            }
         }
         uint32_t cpsr = 0;
-        int used_mtx = (emmc_mtx != 0);
-        if (used_mtx) {
-            shim_lck_mtx_lock(emmc_mtx);
-        } else {
+        void *mtx = emmc_mtx;
+        if (!mtx) {
             __asm__ volatile("mrs %0, cpsr\ncpsid if" : "=r"(cpsr) :: "memory");
             spin_lock(&emmc_lock);
+            mtx = emmc_mtx;
+            if (mtx) {
+                spin_unlock(&emmc_lock);
+                __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+            }
         }
+        if (mtx)
+            shim_lck_mtx_lock(mtx);
         uint32_t t0 = rd(mct + G_CNT_L);
         exy_last_emmc_mct = t0;
         if ((st = exy_emmc_idma_xfer(lba, count >> 9, va, write)) &&
@@ -557,8 +593,8 @@ void exy_md_strategy(buf_t bp)
         uint32_t idx = exy_emmc_log.reads++;
         uint32_t *r = exy_emmc_log.ring[idx % 64];
         r[0] = lba; r[1] = count | (uint32_t)write << 31; r[2] = sum; r[3] = st;
-        if (used_mtx) {
-            shim_lck_mtx_unlock(emmc_mtx);
+        if (mtx) {
+            shim_lck_mtx_unlock(mtx);
         } else {
             spin_unlock(&emmc_lock);
             __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
@@ -628,8 +664,6 @@ static uint32_t aic_bits(uint32_t w, uint32_t v)
     return v;
 }
 
-extern int exy_mali_try_irq(uint32_t gic_id) __attribute__((weak));
-
 static uint32_t aic_iack(void)
 {
     uint32_t me = cur_cpu_id();
@@ -648,10 +682,6 @@ static uint32_t aic_iack(void)
             return AIC_IACK_IPI | AIC_IACK_OTHER;
         }
         if (id < 32) {
-            wr(my_gicc + GICC_EOIR, iar);
-            continue;
-        }
-        if (id >= 155u && id <= 159u && exy_mali_try_irq && exy_mali_try_irq(id)) {
             wr(my_gicc + GICC_EOIR, iar);
             continue;
         }
@@ -707,15 +737,19 @@ void exy_aic_write(void *self, uint32_t off, uint32_t v)
         uint32_t id = (off - AIC_TARGET) / 4 + 32;
         if (id < 32 * GIC_WORDS)
             wr8(gicd + GICD_ITARGETSR + id, v & 0xff);
-    } else if (off >= AIC_SW_SET && off < AIC_SW_SET + 0x80)
-        wr(gicd + GICD_ISPENDR + 4 * w, aic_bits(w, v));
-    else if (off >= AIC_SW_CLR && off < AIC_SW_CLR + 0x80)
-        wr(gicd + GICD_ICPENDR + 4 * w, aic_bits(w, v));
-    else if (off >= AIC_MASK_SET && off < AIC_MASK_SET + 0x80)
-        wr(gicd + GICD_ICENABLER + 4 * w, aic_bits(w, v));
-    else if (off >= AIC_MASK_CLR && off < AIC_MASK_CLR + 0x80)
-        wr(gicd + GICD_ISENABLER + 4 * w, aic_bits(w, v & (w < GIC_WORDS ? aic_allow[w] : 0)));
-    else if (off != 0x200c && !(off >= 0x5000 && off < 0x6000)) {  /* IPI ack/mask: SGIs need neither */
+    } else if (off >= AIC_SW_SET && off < AIC_SW_SET + 0x80) {
+        uint32_t b = aic_bits(w, v);
+        if (w < GIC_WORDS && b) wr(gicd + GICD_ISPENDR + 4 * w, b);
+    } else if (off >= AIC_SW_CLR && off < AIC_SW_CLR + 0x80) {
+        uint32_t b = aic_bits(w, v);
+        if (w < GIC_WORDS && b) wr(gicd + GICD_ICPENDR + 4 * w, b);
+    } else if (off >= AIC_MASK_SET && off < AIC_MASK_SET + 0x80) {
+        uint32_t b = aic_bits(w, v);
+        if (w < GIC_WORDS && b) wr(gicd + GICD_ICENABLER + 4 * w, b);
+    } else if (off >= AIC_MASK_CLR && off < AIC_MASK_CLR + 0x80) {
+        uint32_t b = (w < GIC_WORDS) ? aic_bits(w, v & aic_allow[w]) : 0u;
+        if (w < GIC_WORDS && b) wr(gicd + GICD_ISENABLER + 4 * w, b);
+    } else if (off != 0x200c && !(off >= 0x5000 && off < 0x6000)) {  /* IPI ack/mask: SGIs need neither */
         exy_aic_dbg.unk_wr = off;
         exy_aic_dbg.unk_val = v;
     }

@@ -123,8 +123,14 @@ static inline int mod_val_2bpp_lut(const uint8_t *src, const uint32_t *tx, const
     if (!(col & 1u))
         return ((mod >> (ly * 8u + lx)) & 1u) ? 8 : 0;
     if (((lx + ly) & 1u) == 0u) {
-        uint32_t bitpos = ly * 8u + lx;
-        uint32_t m = (bitpos == 0u) ? ((mod & 2u) >> 1) * 3u : ((mod >> bitpos) & 3u);
+        uint32_t bitpos = ly * 8u + (lx & ~1u);
+        uint32_t m;
+        if (bitpos == 0u)
+            m = ((mod & 2u) >> 1) * 3u;
+        else if (bitpos == 20u && (mod & 1u))
+            m = ((mod >> 21) & 1u) * 3u;
+        else
+            m = (mod >> bitpos) & 3u;
         static const int lut[4] = { 0, 3, 5, 8 };
         return lut[m];
     }
@@ -134,11 +140,11 @@ static inline int mod_val_2bpp_lut(const uint8_t *src, const uint32_t *tx, const
 static int pvrtc_decode_impl(const uint8_t *src, size_t src_sz, uint32_t w, uint32_t h,
                              int is_2bpp, int force_opaque, uint8_t *dst_rgba, uint16_t *dst_565)
 {
-    if (!src || (!dst_rgba && !dst_565) || !w || !h)
+    if (!src || (!dst_rgba && !dst_565) || !w || !h || w > 4096u || h > 4096u)
         return -1;
     uint32_t blk_w = is_2bpp ? 8u : 4u;
-    uint32_t bw = w / blk_w; if (bw < 2u) bw = 2u;
-    uint32_t bh = h / 4u;    if (bh < 2u) bh = 2u;
+    uint32_t bw = (w + blk_w - 1u) / blk_w; if (bw < 2u) bw = 2u;
+    uint32_t bh = (h + 3u) / 4u;            if (bh < 2u) bh = 2u;
     uint32_t pbw = 2u; while (pbw < bw) pbw <<= 1u;
     uint32_t pbh = 2u; while (pbh < bh) pbh <<= 1u;
     bw = pbw; bh = pbh;
@@ -146,16 +152,16 @@ static int pvrtc_decode_impl(const uint8_t *src, size_t src_sz, uint32_t w, uint
     if (src_sz < need)
         return -1;
 
-    /* Scratch buffers: stack for <=512 blocks (covers up to 2048x2048 4bpp), heap fallback for larger. */
-    uint32_t st_tx[512], st_ty[512];
-    struct pvrtc_blk st_r0[512], st_r1[512];
-    struct pvrtc_vcol st_vc[512];
+    /* Scratch buffers: stack for <=128 blocks (~7 KiB, up to 512x512 4bpp), heap fallback for larger. */
+    uint32_t st_tx[128], st_ty[128];
+    struct pvrtc_blk st_r0[128], st_r1[128];
+    struct pvrtc_vcol st_vc[128];
 
-    uint32_t *tx = (bw <= 512u) ? st_tx : (uint32_t *)malloc(bw * sizeof(uint32_t));
-    uint32_t *ty = (bh <= 512u) ? st_ty : (uint32_t *)malloc(bh * sizeof(uint32_t));
-    struct pvrtc_blk *row0 = (bw <= 512u) ? st_r0 : (struct pvrtc_blk *)malloc(bw * sizeof(*row0));
-    struct pvrtc_blk *row1 = (bw <= 512u) ? st_r1 : (struct pvrtc_blk *)malloc(bw * sizeof(*row1));
-    struct pvrtc_vcol *vc  = (bw <= 512u) ? st_vc : (struct pvrtc_vcol *)malloc(bw * sizeof(*vc));
+    uint32_t *tx = (bw <= 128u) ? st_tx : (uint32_t *)malloc(bw * sizeof(uint32_t));
+    uint32_t *ty = (bh <= 128u) ? st_ty : (uint32_t *)malloc(bh * sizeof(uint32_t));
+    struct pvrtc_blk *row0 = (bw <= 128u) ? st_r0 : (struct pvrtc_blk *)malloc(bw * sizeof(*row0));
+    struct pvrtc_blk *row1 = (bw <= 128u) ? st_r1 : (struct pvrtc_blk *)malloc(bw * sizeof(*row1));
+    struct pvrtc_vcol *vc  = (bw <= 128u) ? st_vc : (struct pvrtc_vcol *)malloc(bw * sizeof(*vc));
     if (!tx || !ty || !row0 || !row1 || !vc) {
         if (tx && tx != st_tx) free(tx);
         if (ty && ty != st_ty) free(ty);

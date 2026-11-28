@@ -149,18 +149,55 @@ struct {
     struct exy_drv_status st;
 } exy_drv_log __attribute__((aligned(32)));
 
-static uintptr_t rtc_va, dsim_va, i2c1_va, i2c4_va, pwm_va, i2s0_va, pmu_drv_va;
+#define k_iosleep_drv     ((void (*)(uint32_t))0x80328fd1)
+#define pe_parse_boot_argn ((int (*)(const char *, void *, int))0x80387ab9)
+
+static uintptr_t rtc_va, dsim_va, i2c1_va, i2c4_va, pwm_va, i2s0_va, pmu_drv_va, cmu_top_va;
 static uintptr_t sd2_va, sd3_va, otg_va, tmu_va, adc_va, uart0_va, uart2_va, gpz_va, audss_va;
 static uint8_t tmu_trim25;
 static int otg_gadget_started;
+static int usb_debug_enabled;
 static uint8_t accel_addr, gyro_addr;
 static void *pm_power_src;
 static void *pm_poll_tc;
 static void *vib_stop_tc;
 static int drv_inited;
+static volatile uint32_t m77_lock, i2c4_lock, rtc_lock;
 
 static inline uint32_t drd(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void dwr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+
+static void drv_bus_lock(volatile uint32_t *lk)
+{
+    for (uint32_t spins = 0u; __sync_lock_test_and_set(lk, 1u); ) {
+        if (spins < 50u) {
+            spins++;
+            exy_udelay(20);
+        } else {
+            k_iosleep_drv(1u);
+        }
+    }
+}
+
+static void drv_bus_unlock(volatile uint32_t *lk)
+{
+    __sync_lock_release(lk);
+}
+
+static uint32_t rtc_spin_lock(void)
+{
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr\ncpsid i" : "=r"(cpsr) :: "memory");
+    while (__sync_lock_test_and_set(&rtc_lock, 1u))
+        __asm__ volatile("yield" ::: "memory");
+    return cpsr;
+}
+
+static void rtc_spin_unlock(uint32_t cpsr)
+{
+    __sync_lock_release(&rtc_lock);
+    __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+}
 
 /* --- 1. GPIO & Open-Drain Bit-Bang I2C Engine ------------------------------ */
 
@@ -423,11 +460,14 @@ void exy_rtc_write_epoch(uint32_t ep);
 
 uint32_t exy_rtc_read_epoch(void)
 {
-    if (!rtc_va)
-        rtc_va = ml_io_map(RTC_PA, 0x1000);
+    if (!rtc_va) {
+        uintptr_t va = ml_io_map(RTC_PA, 0x1000);
+        if (va) (void)__sync_val_compare_and_swap(&rtc_va, (uintptr_t)0, va);
+    }
     if (!rtc_va)
         return 1763596800u;
     uint32_t s1, s2, mi, h, d, mo, y;
+    uint32_t cpsr = rtc_spin_lock();
     do {
         s1 = bcd2bin(drd(rtc_va + 0x70u) & 0x7fu);
         mi = bcd2bin(drd(rtc_va + 0x74u) & 0x7fu);
@@ -437,6 +477,7 @@ uint32_t exy_rtc_read_epoch(void)
         y  = bcd2bin(drd(rtc_va + 0x88u) & 0xffu) + 2000u;
         s2 = bcd2bin(drd(rtc_va + 0x70u) & 0x7fu);
     } while (s1 != s2);
+    rtc_spin_unlock(cpsr);
     uint32_t ep = ymdhms_to_epoch(y, mo, d, h, mi, s1);
     if (ep >= 1451606400u && ep < 4102444800u) { /* 2016..2100 */
         exy_drv_log.st.probe_mask |= DRV_BIT_RTC;
@@ -452,14 +493,17 @@ void exy_rtc_write_epoch(uint32_t ep)
 {
     if (ep < 1451606400u || ep >= 4102444800u)
         return;
-    if (!rtc_va)
-        rtc_va = ml_io_map(RTC_PA, 0x1000);
+    if (!rtc_va) {
+        uintptr_t va = ml_io_map(RTC_PA, 0x1000);
+        if (va) (void)__sync_val_compare_and_swap(&rtc_va, (uintptr_t)0, va);
+    }
     if (!rtc_va)
         return;
     uint32_t y, mo, d, h, mi, s;
     epoch_to_ymdhms(ep, &y, &mo, &d, &h, &mi, &s);
     if (y < 2000u || y > 2099u)
         return;
+    uint32_t cpsr = rtc_spin_lock();
     uint32_t con = drd(rtc_va + 0x40u);
     dwr(rtc_va + 0x40u, con | 1u); /* CTLEN = 1 */
     dwr(rtc_va + 0x70u, bin2bcd(s));
@@ -469,6 +513,7 @@ void exy_rtc_write_epoch(uint32_t ep)
     dwr(rtc_va + 0x84u, bin2bcd(mo));
     dwr(rtc_va + 0x88u, bin2bcd(y - 2000u));
     dwr(rtc_va + 0x40u, con & ~1u); /* CTLEN = 0 */
+    rtc_spin_unlock(cpsr);
     exy_drv_log.st.probe_mask |= DRV_BIT_RTC;
     exy_drv_log.st.rtc_epoch = ep;
     exy_clean_line(&exy_drv_log);
@@ -516,6 +561,7 @@ void exy_drv_power_sync(void)
         }
     }
 
+    drv_bus_lock(&m77_lock);
     uint8_t chg_det = 0;
     if (bb_read_reg(&m77, 0x66u, 0xb4u /* CHG_DETAILS_01 */, &chg_det, 1) == 0) {
         exy_drv_log.st.probe_mask |= DRV_BIT_CHG;
@@ -539,31 +585,34 @@ void exy_drv_power_sync(void)
     }
 
     /* Enable 500 mA USB charging on MAX77693 whenever USB/AC cable is connected and charger is off.
-     * Clear any latched TIMER_EXPIRED (det=0x26) by disabling FCHGTIME and toggling CHG_EN 0->1. */
+     * Clear any latched TIMER_EXPIRED (det=0x26) by setting a finite 8h FCHGTIME and toggling CHG_EN 0->1. */
     if ((exy_drv_log.st.probe_mask & DRV_BIT_CHG) && exy_drv_log.st.cable_type == 1u &&
         exy_drv_log.st.chg_state == 0u && exy_drv_log.st.batt_soc < 99u) {
         uint8_t c00 = 0;
-        bb_read_reg(&m77, 0x66u, 0xb7u, &c00, 1);
-        uint8_t unlock[2] = { 0xbdu /* CHG_CNFG_06 */, 0x0cu };
-        uint8_t timer[2]  = { 0xb8u /* CHG_CNFG_01 */, 0x80u }; /* PQEN=1, FCHGTIME=0 (disable timer) */
-        uint8_t ilim[2]   = { 0xc0u /* CHG_CNFG_09 */, 0x19u }; /* 500 mA input limit */
-        uint8_t ichg[2]   = { 0xb9u /* CHG_CNFG_02 */, 0x0fu }; /* 500 mA fast charge */
-        uint8_t off[2]    = { 0xb7u /* CHG_CNFG_00 */, (uint8_t)((c00 & ~0x0fu) | 0x04u) };
-        uint8_t on[2]     = { 0xb7u /* CHG_CNFG_00 */, (uint8_t)((c00 & ~0x0fu) | 0x05u) };
-        bb_write(&m77, 0x66u, unlock, 2);
-        bb_write(&m77, 0x66u, timer, 2);
-        bb_write(&m77, 0x66u, ilim, 2);
-        bb_write(&m77, 0x66u, ichg, 2);
-        bb_write(&m77, 0x66u, off, 2);
-        exy_udelay(5000);
-        bb_write(&m77, 0x66u, on, 2);
-        exy_udelay(2000);
-        if (bb_read_reg(&m77, 0x66u, 0xb4u, &chg_det, 1) == 0) {
-            exy_drv_log.st.pad0 = chg_det;
-            uint8_t st = chg_det & 0xfu;
-            exy_drv_log.st.chg_state = (st == 4u) ? 2u : ((st <= 3u || st == 5u) ? 1u : 0u);
+        if (bb_read_reg(&m77, 0x66u, 0xb7u, &c00, 1) == 0) {
+            uint8_t unlock[2] = { 0xbdu /* CHG_CNFG_06 */, 0x0cu };
+            uint8_t timer[2]  = { 0xb8u /* CHG_CNFG_01 */, 0x83u }; /* PQEN=1, FCHGTIME=8h safety timer */
+            uint8_t ilim[2]   = { 0xc0u /* CHG_CNFG_09 */, 0x19u }; /* 500 mA input limit */
+            uint8_t ichg[2]   = { 0xb9u /* CHG_CNFG_02 */, 0x0fu }; /* 500 mA fast charge */
+            uint8_t off[2]    = { 0xb7u /* CHG_CNFG_00 */, (uint8_t)((c00 & ~0x0fu) | 0x04u) };
+            uint8_t on[2]     = { 0xb7u /* CHG_CNFG_00 */, (uint8_t)((c00 & ~0x0fu) | 0x05u) };
+            if (bb_write(&m77, 0x66u, unlock, 2) == 0 &&
+                bb_write(&m77, 0x66u, timer, 2) == 0 &&
+                bb_write(&m77, 0x66u, ilim, 2) == 0 &&
+                bb_write(&m77, 0x66u, ichg, 2) == 0 &&
+                bb_write(&m77, 0x66u, off, 2) == 0) {
+                exy_udelay(5000);
+                (void)bb_write(&m77, 0x66u, on, 2);
+                exy_udelay(2000);
+            }
+            if (bb_read_reg(&m77, 0x66u, 0xb4u, &chg_det, 1) == 0) {
+                exy_drv_log.st.pad0 = chg_det;
+                uint8_t st = chg_det & 0xfu;
+                exy_drv_log.st.chg_state = (st == 4u) ? 2u : ((st <= 3u || st == 5u) ? 1u : 0u);
+            }
         }
     }
+    drv_bus_unlock(&m77_lock);
 
     /* Push real battery & charger state into native Apple IOPMPowerSource */
     if (pm_power_src && (exy_drv_log.st.probe_mask & DRV_BIT_FG)) {
@@ -594,29 +643,42 @@ void exy_drv_power_sync(void)
     }
 }
 
-extern int exy_cpu_set_opp(int opp);
 extern int exy_gpu_set_opp(int opp);
 extern volatile uint32_t exy_last_touch_mct;
 extern volatile uint32_t exy_last_gpu_mct;
 extern volatile uint32_t exy_last_disp_mct;
 extern volatile uint32_t exy_last_emmc_mct;
 static void tmu_adc_poll(void);
+static void drv_puts(const char *s);
+static void drv_putx(uint32_t v);
 static uint32_t pm_tick_cnt;
 
 static int therm_tier;
+static int therm_crit_cnt;
 
 static void dvfs_thermal_update(void)
 {
     uint32_t now = exy_mct_lo();
-    /* Effective SoC temperature: trust TMU if in sane [20..115]C range, else map AP NTC thermistor ADC */
+    /* Effective SoC temperature: trust TMU whenever >= 20C (including >115C overheat!);
+     * only fall back to AP NTC thermistor ADC if TMU is unprobed or < 20C. */
     int temp_c = (int)exy_drv_log.st.cpu_temp_c;
-    if (temp_c < 20 || temp_c > 115) {
+    if (temp_c < 20) {
         uint16_t a = exy_drv_log.st.adc_ap;
         if (a > 0u && a < 380u)      temp_c = 90;
         else if (a > 0u && a < 460u) temp_c = 82;
         else if (a > 0u && a < 540u) temp_c = 74;
         else if (a > 0u && a < 640u) temp_c = 64;
         else                         temp_c = 48;
+    }
+
+    if (temp_c >= 108) {
+        if (++therm_crit_cnt >= 2 || temp_c >= 115) {
+            drv_puts("[TMU] OVERHEAT temp="); drv_putx((uint32_t)temp_c); drv_puts(" -> halt\n");
+            (void)exy_gpu_set_opp(0);
+            exy_halt_restart(0u);
+        }
+    } else {
+        therm_crit_cnt = 0;
     }
 
     /* 4-tier thermal state with 3C hysteresis: <68 / 68-75 / 76-81 / >=82 */
@@ -632,27 +694,25 @@ static void dvfs_thermal_update(void)
         therm_tier = 1;
     }
 
-    uint32_t dt_touch = exy_last_touch_mct ? (uint32_t)(now - exy_last_touch_mct) : ~0u;
-    uint32_t dt_gpu   = exy_last_gpu_mct   ? (uint32_t)(now - exy_last_gpu_mct)   : ~0u;
-    uint32_t dt_disp  = exy_last_disp_mct  ? (uint32_t)(now - exy_last_disp_mct)  : ~0u;
-    uint32_t dt_emmc  = exy_last_emmc_mct  ? (uint32_t)(now - exy_last_emmc_mct)  : ~0u;
+    /* Expire stale 32-bit MCT timestamps after 5 s so the 179 s wrap never falsely wakes GPU boost. */
+    const uint32_t stale = 24000u * 5000u;
+    uint32_t ts_t = exy_last_touch_mct, ts_g = exy_last_gpu_mct;
+    uint32_t ts_d = exy_last_disp_mct,  ts_e = exy_last_emmc_mct;
+    uint32_t dt_touch = ts_t ? (uint32_t)(now - ts_t) : ~0u;
+    uint32_t dt_gpu   = ts_g ? (uint32_t)(now - ts_g) : ~0u;
+    uint32_t dt_disp  = ts_d ? (uint32_t)(now - ts_d) : ~0u;
+    uint32_t dt_emmc  = ts_e ? (uint32_t)(now - ts_e) : ~0u;
+    if (ts_t && dt_touch >= stale) (void)__sync_val_compare_and_swap(&exy_last_touch_mct, ts_t, 0u);
+    if (ts_g && dt_gpu   >= stale) (void)__sync_val_compare_and_swap(&exy_last_gpu_mct,   ts_g, 0u);
+    if (ts_d && dt_disp  >= stale) (void)__sync_val_compare_and_swap(&exy_last_disp_mct,  ts_d, 0u);
+    if (ts_e && dt_emmc  >= stale) (void)__sync_val_compare_and_swap(&exy_last_emmc_mct,  ts_e, 0u);
 
-    int touch_act = dt_touch < 24000u * 1500u;
-    int gpu_act   = dt_gpu   < 24000u * 400u;
-    int disp_act  = dt_disp  < 24000u * 600u;
-    int emmc_act  = dt_emmc  < 24000u * 600u;
-    int recent    = dt_touch < 24000u * 3000u || dt_disp < 24000u * 3000u ||
-                    dt_gpu   < 24000u * 1500u || dt_emmc < 24000u * 1500u;
-
-    int cpu_opp = (touch_act || gpu_act || disp_act || emmc_act) ? 2 : (recent ? 1 : 0);
+    int gpu_act = dt_gpu < 24000u * 400u;
     int gpu_opp = gpu_act ? 2 : 0;
 
-    static const int cpu_cap[4] = { 2, 2, 1, 0 }; /* 1200, 1200, 600, 400 MHz */
-    static const int gpu_cap[4] = { 2, 1, 1, 0 }; /*  440,  220, 220, 147 MHz */
-    if (cpu_opp > cpu_cap[therm_tier]) cpu_opp = cpu_cap[therm_tier];
+    static const int gpu_cap[4] = { 2, 1, 1, 0 }; /* 440, 220, 220, 147 MHz */
     if (gpu_opp > gpu_cap[therm_tier]) gpu_opp = gpu_cap[therm_tier];
 
-    (void)exy_cpu_set_opp(cpu_opp);
     (void)exy_gpu_set_opp(gpu_opp);
 }
 
@@ -778,7 +838,9 @@ static void vib_stop_cb(void *p0, void *p1)
         dwr(pwm_va + 0x08u /* TCON */, drd(pwm_va + 0x08u) & ~1u);
     struct bb_i2c m77 = bus_m77();
     uint8_t off[2] = { 0x02u /* CONFIG2 */, 0x00u };
+    drv_bus_lock(&m77_lock);
     bb_write(&m77, 0x48u, off, 2);
+    drv_bus_unlock(&m77_lock);
 }
 
 int exy_drv_vibrate(uint32_t ms)
@@ -796,7 +858,9 @@ int exy_drv_vibrate(uint32_t ms)
     /* Enable MAX77693 Haptic LRA external PWM mode */
     struct bb_i2c m77 = bus_m77();
     uint8_t cfg2[2] = { 0x02u, 0xc0u }; /* MOTOR_EN | LRA | EXT_PWM */
+    drv_bus_lock(&m77_lock);
     bb_write(&m77, 0x48u, cfg2, 2);
+    drv_bus_unlock(&m77_lock);
     /* PWM0: PCLK ~100 MHz / (24+1) / 8 = 500 kHz; 205 Hz LRA resonant -> TCNTB0=2440, 50% duty */
     dwr(pwm_va + 0x00u /* TCFG0 */, (drd(pwm_va + 0x00u) & ~0xffu) | 24u);
     dwr(pwm_va + 0x04u /* TCFG1 */, (drd(pwm_va + 0x04u) & ~0xfu) | 3u); /* /8 */
@@ -822,11 +886,13 @@ static void haptic_init(void)
     exy_udelay(2000);
     struct bb_i2c m77 = bus_m77();
     uint8_t st = 0;
+    drv_bus_lock(&m77_lock);
     if (bb_read_reg(&m77, 0x48u, 0x00u, &st, 1) == 0) {
         exy_drv_log.st.probe_mask |= DRV_BIT_HAPTIC;
         uint8_t off[2] = { 0x02u, 0x00u };
         bb_write(&m77, 0x48u, off, 2);
     }
+    drv_bus_unlock(&m77_lock);
 }
 
 /* --- 7. Sensors: LSM330DLC (I2C1), AK8975C (GPY2), CM36651 (GPF0), TKey ---- */
@@ -924,46 +990,53 @@ static void tkey_poll(void)
 
 /* --- 8. Wolfson WM1811 Audio Codec (I2C4 @ 0x1A) + I2S0 -------------------- */
 
-static int wm1811_use_bb;
+static int wm1811_use_bb; /* 0=HW I2C4, 1=BB GPB[0]=SDA/GPB[1]=SCL, 2=BB GPB[1]=SDA/GPB[0]=SCL */
 
 static int wm1811_read(uint16_t reg, uint16_t *out)
 {
     uint8_t b[2];
+    int rc = -1;
+    drv_bus_lock(&i2c4_lock);
     if (wm1811_use_bb) {
-        struct bb_i2c bus = { gpio_l_va ? gpio_l_va + 0x040u : 0, 0, 1 };
+        uint8_t sda = (wm1811_use_bb == 2) ? 1u : 0u;
+        uint8_t scl = (wm1811_use_bb == 2) ? 0u : 1u;
+        struct bb_i2c bus = { gpio_l_va ? gpio_l_va + 0x040u : 0, sda, scl };
         bb_start(&bus);
-        if (bb_tx_byte(&bus, 0x1au << 1) != 0 ||
-            bb_tx_byte(&bus, (uint8_t)(reg >> 8)) != 0 ||
-            bb_tx_byte(&bus, (uint8_t)reg) != 0) {
-            bb_stop(&bus);
-            return -1;
+        if (bb_tx_byte(&bus, 0x1au << 1) == 0 &&
+            bb_tx_byte(&bus, (uint8_t)(reg >> 8)) == 0 &&
+            bb_tx_byte(&bus, (uint8_t)reg) == 0) {
+            bb_start(&bus);
+            if (bb_tx_byte(&bus, (0x1au << 1) | 1u) == 0) {
+                b[0] = bb_rx_byte(&bus, 1);
+                b[1] = bb_rx_byte(&bus, 0);
+                *out = (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
+                rc = 0;
+            }
         }
-        bb_start(&bus);
-        if (bb_tx_byte(&bus, (0x1au << 1) | 1u) != 0) {
-            bb_stop(&bus);
-            return -1;
-        }
-        b[0] = bb_rx_byte(&bus, 1);
-        b[1] = bb_rx_byte(&bus, 0);
         bb_stop(&bus);
+    } else if (i2c4_va && exy_i2c_read_reg16(i2c4_va, 0x1au, reg, b, 2) == 0) {
         *out = (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
-        return 0;
+        rc = 0;
     }
-    if (!i2c4_va || exy_i2c_read_reg16(i2c4_va, 0x1au, reg, b, 2) != 0)
-        return -1;
-    *out = (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
-    return 0;
+    drv_bus_unlock(&i2c4_lock);
+    return rc;
 }
 
 static int wm1811_write(uint16_t reg, uint16_t val)
 {
     uint8_t b[4] = { (uint8_t)(reg >> 8), (uint8_t)reg, (uint8_t)(val >> 8), (uint8_t)val };
+    int rc = -1;
+    drv_bus_lock(&i2c4_lock);
     if (wm1811_use_bb) {
-        struct bb_i2c bus = { gpio_l_va ? gpio_l_va + 0x040u : 0, 0, 1 };
-        return bb_write(&bus, 0x1au, b, 4);
+        uint8_t sda = (wm1811_use_bb == 2) ? 1u : 0u;
+        uint8_t scl = (wm1811_use_bb == 2) ? 0u : 1u;
+        struct bb_i2c bus = { gpio_l_va ? gpio_l_va + 0x040u : 0, sda, scl };
+        rc = bb_write(&bus, 0x1au, b, 4);
+    } else if (i2c4_va) {
+        rc = exy_i2c_write(i2c4_va, 0x1au, b, 4);
     }
-    if (!i2c4_va) return -1;
-    return exy_i2c_write(i2c4_va, 0x1au, b, 4);
+    drv_bus_unlock(&i2c4_lock);
+    return rc;
 }
 
 static void drv_puts(const char *s)
@@ -993,7 +1066,7 @@ static void audio_init(void)
     if (pmu_drv_va)
         dwr(pmu_drv_va + 0x0a00u /* PMU_DEBUG */, 0x0900u); /* CLKOUT = XUSBXTI 24 MHz */
     /* Configure Exynos 4412 EPLL = 49.152 MHz -> AUDSS /4 = 12.288 MHz (256fs @ 48 kHz) for I2S0 */
-    uintptr_t cmu_top = ml_io_map(0x1003c000u, 0x1000u);
+    uintptr_t cmu_top = cmu_top_va;
     if (cmu_top) {
         dwr(cmu_top + 0x950u /* gate_ip_peril */, drd(cmu_top + 0x950u) | (1u << 10)); /* I2C4 */
         /* Switch MUX_EPLL_SEL (src_top0 bit 4) to FINPLL, lock EPLL at 49.152 MHz (M=49,P=3,S=3,K=9961) */
@@ -1030,20 +1103,12 @@ static void audio_init(void)
         (void)wm1811_read(0x0000u, &id);
     }
     if (id != 0x8994u && id != 0x1811u && id != 0x8958u) {
-        /* Check GPB[0]=SCL4, GPB[1]=SDA4 */
+        /* Check GPB[0]=SCL4, GPB[1]=SDA4 and keep wm1811_use_bb=2 for subsequent reads/writes */
         struct bb_i2c bus = { gpio_l_va + 0x040u, 1, 0 };
         bb_init(&bus);
-        uint8_t b[2] = { 0, 0 };
-        bb_start(&bus);
-        if (bb_tx_byte(&bus, 0x1au << 1) == 0 && bb_tx_byte(&bus, 0) == 0 && bb_tx_byte(&bus, 0) == 0) {
-            bb_start(&bus);
-            if (bb_tx_byte(&bus, (0x1au << 1) | 1u) == 0) {
-                b[0] = bb_rx_byte(&bus, 1);
-                b[1] = bb_rx_byte(&bus, 0);
-                id = (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
-            }
-        }
-        bb_stop(&bus);
+        wm1811_use_bb = 2;
+        id = 0;
+        (void)wm1811_read(0x0000u, &id);
     }
     if (id == 0x8994u || id == 0x1811u || id == 0x8958u) {
         exy_drv_log.st.wm1811_id = id;
@@ -1197,64 +1262,6 @@ int exy_drv_audio_tone(uint16_t hz, uint16_t ms)
 {
     (void)hz; (void)ms;
     return 0; /* muted during Wi-Fi bring-up per user request; I2S0/IOAudio2Device unchanged */
-    if (!(exy_drv_log.st.probe_mask & DRV_BIT_I2S0) || !i2s0_va)
-        return -1;
-    if (hz < 100u) hz = 880u;
-    if (hz > 8000u) hz = 8000u;
-    if (ms > 500u) ms = 500u;
-    if (!ms) return 0;
-    /* Stream 48 kHz 16-bit stereo triangle wave through I2S0 TX FIFO (keep CON_RESET bit 31 = 1!) */
-    uint32_t total = ((uint32_t)ms * 48u);
-    uint32_t period = 48000u / (uint32_t)hz;
-    if (period < 4u) period = 4u;
-    uint32_t half = period >> 1;
-    dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4));
-    dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15));
-    dwr(i2s0_va + 0x08u, 0u);
-    /* Play two clear tones (hz, then 1.33*hz) at max speaker gain so user can hear easily */
-    exy_drv_set_volume(100u);
-    uint32_t t0 = exy_mct_lo(), pushed = 0u;
-    for (int pass = 0; pass < 2; pass++) {
-        uint32_t cur_hz = (pass == 0) ? (uint32_t)hz : ((uint32_t)hz * 4u) / 3u;
-        uint32_t period = 48000u / cur_hz;
-        if (period < 4u) period = 4u;
-        uint32_t half = period >> 1;
-        dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4));
-        dwr(i2s0_va + 0x08u /* I2SFIC */, (1u << 15));
-        dwr(i2s0_va + 0x08u, 0u);
-        for (uint32_t i = 0; i < total; i++) {
-            uint32_t pos = i % period;
-            int32_t tri = (pos < half) ? (int32_t)((pos * 28000u) / half) - 14000
-                                       : 14000 - (int32_t)(((pos - half) * 28000u) / half);
-            uint32_t sample = ((uint32_t)(uint16_t)(int16_t)tri) | ((uint32_t)(uint16_t)(int16_t)tri << 16);
-            if (i == 16u)
-                dwr(i2s0_va + 0x00u /* I2SCON */, (1u << 31) | 1u);
-            uint32_t wait = 0;
-            while ((drd(i2s0_va + 0x00u) & (1u << 8)) && ++wait < 4000u)
-                exy_udelay(1);
-            if (wait >= 4000u) break;
-            dwr(i2s0_va + 0x10u /* I2STXD */, sample);
-            pushed++;
-        }
-        dwr(i2s0_va + 0x00u, (1u << 31) | (1u << 4));
-        if (pass == 0) exy_udelay(60000);
-    }
-    uint32_t dt_us = (exy_mct_lo() - t0) / 24u;
-    (void)period; (void)half;
-    uint16_t irq2 = 0, p1 = 0, s26 = 0, c1 = 0, rst = 0, s24 = 0;
-    (void)wm1811_read(0x0731u, &irq2); /* INTERRUPT_STATUS_2: bit 5 = FLL1_LOCK */
-    (void)wm1811_read(0x0001u, &p1);
-    (void)wm1811_read(0x0026u, &s26);
-    (void)wm1811_read(0x0208u, &c1);
-    (void)wm1811_read(0x0212u, &rst); /* Rate Status (SR_ERROR) */
-    (void)wm1811_read(0x0024u, &s24);
-    drv_puts("[TONE] n="); drv_putx(pushed);
-    drv_puts(" us="); drv_putx(dt_us);
-    drv_puts(" wm="); drv_putx(((uint32_t)irq2 << 16) | s26);
-    drv_puts(" p1="); drv_putx(((uint32_t)s24 << 16) | p1);
-    drv_puts(" clk="); drv_putx(((uint32_t)c1 << 16) | rst);
-    drv_puts("\n");
-    return 0;
 }
 
 /* --- 8b. Skyworks AAT1290 Camera Flash / Torch (GPJ1[0..2]) ---------------- */
@@ -1316,8 +1323,13 @@ static void tmu_adc_init(void)
         if (tmu_trim25 < 40u || tmu_trim25 > 100u)
             tmu_trim25 = 55u; /* Exynos 4412 nominal efuse fallback */
         /* Exynos 4412 TMU_CONTROL (per U-Boot exynos-tmu.c): 0x10608802 (VREF=16, MUX=6,
-         * TRIP_MODE=4 [15:13], BUF_SLOPE=8, bit1=1), then set CORE_EN=1 (0x10608803). */
-        dwr(tmu_va + 0x50u /* THRESHOLD_TEMP_RISE */, 0xffffffffu);
+         * TRIP_MODE=4 [15:13], BUF_SLOPE=8, bit1=1), then set CORE_EN=1 (0x10608803).
+         * Program hardware rise thresholds for 85 / 95 / 105 / 115 C (trim + deg - 25). */
+        uint32_t t85  = (uint32_t)tmu_trim25 + 60u; if (t85  > 250u) t85  = 250u;
+        uint32_t t95  = (uint32_t)tmu_trim25 + 70u; if (t95  > 250u) t95  = 250u;
+        uint32_t t105 = (uint32_t)tmu_trim25 + 80u; if (t105 > 250u) t105 = 250u;
+        uint32_t t115 = (uint32_t)tmu_trim25 + 90u; if (t115 > 250u) t115 = 250u;
+        dwr(tmu_va + 0x50u /* THRESHOLD_TEMP_RISE */, (t115 << 24) | (t105 << 16) | (t95 << 8) | t85);
         dwr(tmu_va + 0x70u /* INTEN */, 0u);
         dwr(tmu_va + 0x78u /* INTCLEAR */, 0x01110111u);
         dwr(tmu_va + 0x20u /* TMU_CONTROL */, 0x10608802u);
@@ -1389,7 +1401,7 @@ static void wifi_bt_probe(void)
 {
     /* BCM4334 Wi-Fi on SDHCI3 (0x12540000): ungate SDMMC3 clock, release WLAN_EN (GPJ0[0]=1) + GPK3[0..6] */
     if (gpio_l_va && gpio_r_va && sd3_va) {
-        uintptr_t cmu_fsys = ml_io_map(0x1003c000u, 0x1000u);
+        uintptr_t cmu_fsys = cmu_top_va;
         if (cmu_fsys) {
             /* Enable SDMMC3 bus clock (gate_ip_fsys bit 8) + SCLK_MMC3 = MPLL(800MHz)/8/2 = 50 MHz (div_fsys1 bits 31:16) */
             dwr(cmu_fsys + 0x940u /* gate_ip_fsys */, drd(cmu_fsys + 0x940u) | (1u << 8));
@@ -1465,7 +1477,6 @@ static void wifi_bt_probe(void)
 
 /* --- Minimal DWC2 USB 2.0 EP0 Remote-Fastboot Gadget (VID 18d1, PID 4ee8) -- */
 #define USBPHY_PA         0x125b0000u
-#define k_iosleep_drv     ((void (*)(uint32_t))0x80328fd1)
 #define k_thread_drv      ((int  (*)(void (*)(void *, int), void *, void **))0x80042c15)
 
 static void dwc2_ep0_arm_out(void)
@@ -1536,13 +1547,13 @@ static void dwc2_handle_setup(const uint8_t s[8])
         dwc2_ep0_arm_out();
         return;
     }
-    if (bm == 0x00u && req == 0x05u) { /* SET_ADDRESS */
+    if (bm == 0x00u && req == 0x05u && len == 0u) { /* SET_ADDRESS */
         dwr(otg_va + 0x800u /* DCFG */, (drd(otg_va + 0x800u) & ~(0x7fu << 4)) | ((uint32_t)(val & 0x7fu) << 4));
         dwc2_ep0_tx(0, 0u);
         dwc2_ep0_arm_out();
         return;
     }
-    if (bm == 0x00u && req == 0x09u) { /* SET_CONFIGURATION */
+    if (bm == 0x00u && req == 0x09u && len == 0u) { /* SET_CONFIGURATION */
         dwc2_ep0_tx(0, 0u);
         dwc2_ep0_arm_out();
         return;
@@ -1552,21 +1563,21 @@ static void dwc2_handle_setup(const uint8_t s[8])
         dwc2_ep0_arm_out();
         return;
     }
-    if (bm == 0x40u && req == 0xfcu) { /* Vendor synthetic button press (val=bitmask) */
+    if (usb_debug_enabled && bm == 0x40u && len == 0u && req == 0xfcu) { /* Vendor synthetic button press (val=bitmask) */
         extern void exy_synth_btn_inject(uint32_t mask);
         exy_synth_btn_inject(val);
         dwc2_ep0_tx(0, 0u);
         dwc2_ep0_arm_out();
         return;
     }
-    if (bm == 0x40u && req == 0xfdu) { /* Vendor synthetic touch (val=x|(down<<15), idx=y) */
+    if (usb_debug_enabled && bm == 0x40u && len == 0u && req == 0xfdu) { /* Vendor synthetic touch (val=x|(down<<15), idx=y) */
         extern void exy_synth_touch_inject(uint16_t x, uint16_t y, uint32_t down);
         exy_synth_touch_inject(val & 0x7fffu, idx, (val >> 15) & 1u);
         dwc2_ep0_tx(0, 0u);
         dwc2_ep0_arm_out();
         return;
     }
-    if (bm == 0x40u && req == 0xfbu && val == 0x1337u) { /* Vendor Remote Fastboot! */
+    if (usb_debug_enabled && bm == 0x40u && len == 0u && req == 0xfbu && val == 0x1337u) { /* Vendor Remote Fastboot! */
         dwc2_ep0_tx(0, 0u);
         exy_udelay(30000);
         exy_clean_line(&exy_drv_log);
@@ -1658,8 +1669,10 @@ static void exy_usb_gadget_init(void)
 {
     if (otg_gadget_started || !otg_va)
         return;
+    uint32_t serial_arg = 0u;
+    usb_debug_enabled = pe_parse_boot_argn("serial", &serial_arg, (int)sizeof(serial_arg)) ? 1 : 0;
     /* 1. Ungate Exynos 4412 USBOTG/USBHOST bus clocks */
-    uintptr_t cmu_fsys = ml_io_map(0x1003c000u, 0x1000u);
+    uintptr_t cmu_fsys = cmu_top_va;
     if (cmu_fsys)
         dwr(cmu_fsys + 0x940u, drd(cmu_fsys + 0x940u) | (1u << 12) | (1u << 13));
     /* 2. Power on VUOTG_3.0V (LDO12), VHSIC_1.0V (LDO15: 25mV step -> 0xc8=1.0V), VHSIC_1.8V (LDO16) + MAX77693 SAFEOUT1 & MUIC USB path */
@@ -1668,12 +1681,14 @@ static void exy_usb_gadget_init(void)
     exy_pmic_write_reg(0x4fu /* LDO16 */, 0xd4u);
     struct bb_i2c m77 = bus_m77();
     uint8_t so = 0u;
+    drv_bus_lock(&m77_lock);
     if (bb_read_reg(&m77, 0x66u, 0xc6u, &so, 1) == 0) {
         uint8_t b[2] = { 0xc6u, (uint8_t)(so | (1u << 6)) };
         (void)bb_write(&m77, 0x66u, b, 2);
     }
     uint8_t muic_usb[2] = { 0x0cu /* CONTROL1 */, 0x09u /* DN1DP2 */ };
     (void)bb_write(&m77, 0x25u, muic_usb, 2);
+    drv_bus_unlock(&m77_lock);
     /* Wait for LDO12/15/16 + SAFEOUT1 rails to settle on cold standalone boot */
     exy_udelay(5000);
     /* 3. Enable Exynos 4412 USB OTG PHY0 (24 MHz) */
@@ -1728,11 +1743,6 @@ static void exy_usb_gadget_init(void)
         otg_gadget_started = 1;
 }
 
-void exy_drv_otg_check(void)
-{
-    /* Handled asynchronously by exy_usb_poll_thread (18d1:4ee8 remote fastboot). */
-}
-
 static void bus_probes_init(void)
 {
     /* microSD: enable VTF_2.8V (LDO21) and read GPX3[4] CD (active-low) + SDHCI2 PRESENT_STATE */
@@ -1772,6 +1782,7 @@ void exy_drivers_init(void *parent_service)
     i2s0_va    = ml_io_map(I2S0_PA, 0x1000);
     gpz_va     = ml_io_map(GPZ_PA, 0x1000);
     pmu_drv_va = ml_io_map(PMU_PA, 0x1000);
+    cmu_top_va = ml_io_map(0x1003c000u, 0x1000);
     tmu_va     = ml_io_map(TMU_PA, 0x1000);
     adc_va     = ml_io_map(ADC_PA, 0x1000);
     uart0_va   = ml_io_map(UART0_PA, 0x1000);
@@ -1811,12 +1822,6 @@ void exy_drivers_init(void *parent_service)
                 ioservice_register(pm_power_src, 0);
                 exy_drv_log.init_done = 0x108u;
                 exy_clean_line(&exy_drv_log);
-                pm_poll_tc = tc_alloc(pm_poll_tick, 0);
-                if (pm_poll_tc) {
-                    uint64_t dl = 0;
-                    clk_int_deadline(2000u, 1000000u, &dl);
-                    tc_enter_delayed(pm_poll_tc, dl);
-                }
             }
         }
     }
@@ -1840,6 +1845,15 @@ void exy_drivers_init(void *parent_service)
     bus_probes_init();
     exy_drv_log.init_done = 0x10eu; exy_clean_line(&exy_drv_log);
     (void)exy_rtc_read_epoch();
+
+    if (pm_power_src && (exy_drv_log.st.probe_mask & DRV_BIT_PMPS)) {
+        pm_poll_tc = tc_alloc(pm_poll_tick, 0);
+        if (pm_poll_tc) {
+            uint64_t dl = 0;
+            clk_int_deadline(2000u, 1000000u, &dl);
+            tc_enter_delayed(pm_poll_tc, dl);
+        }
+    }
 
     exy_drv_log.init_done = 1u;
     exy_clean_line(&exy_drv_log);

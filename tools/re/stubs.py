@@ -1,13 +1,17 @@
 """Kext __stub address -> imported kernel symbol (via __nl_symbol_ptr).
-Needs /tmp/opencode/ksyms.txt: llvm-nm fw/kernelcache.n94.macho | awk '{print $1, $3}'"""
-import struct
-m = open('fw/kernelcache.n94.macho', 'rb').read()
+Set M0XNU_KSYMS (default: /tmp/ksyms.txt from: llvm-nm fw/kernelcache.n94.macho | awk '{print $1, $3}')."""
+import os, struct
+
 v2f = lambda v: v - 0x804b7000 + 0x46d000
-ks = {}
-for l in open('/tmp/opencode/ksyms.txt'):
-    a, n = l.split()
-    ks.setdefault(int(a, 16) & ~1, n)
-def stubs(lo, size):
+
+
+def stubs(lo, size, kernel='fw/kernelcache.n94.macho', ksyms=None):
+    m = open(kernel, 'rb').read()
+    ks = {}
+    with open(ksyms or os.environ.get('M0XNU_KSYMS', '/tmp/ksyms.txt')) as f:
+        for l in f:
+            a, n = l.split()
+            ks.setdefault(int(a, 16) & ~1, n)
     out = {}
     for s in range(lo, lo + size, 16):
         h = struct.unpack_from('<4H', m, v2f(s))

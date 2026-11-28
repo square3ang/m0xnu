@@ -4,18 +4,11 @@
 usage: emmccheck.py <emmc log addr from the mkxnu info line> <image>
 Reads exy_emmc_log over fastboot and recomputes each logged read's word sum from the image.
 """
-import re, struct, subprocess, sys
+import struct, sys
+from fbmem import mem_words as mem
 
 SYSTEM_LBA = 2277376
 USERDATA_LBA = 7716864  # md1, mkxnu --emmc-var
-
-
-def mem(addr):
-    out = subprocess.run(["fastboot", "getvar", f"mem:{addr:#x}"], capture_output=True, text=True, timeout=5)
-    m = re.search(r"mem:0x[0-9a-f]+: ((?:[0-9a-f]{8} ?){4})", out.stdout + out.stderr)
-    if not m:
-        sys.exit(f"read {addr:#x} failed: {out.stderr.strip()}")
-    return [int(w, 16) for w in m.group(1).split()]
 
 
 def main():
@@ -29,10 +22,11 @@ def main():
                   f"{'write' if count >> 31 else 'read'} md1")
             continue
         off = (lba - SYSTEM_LBA) * 512
-        data = img[off:off + count]
-        want = sum(struct.unpack(f"<{len(data) // 4}I", data[:len(data) // 4 * 4])) & 0xffffffff if len(data) == count else None
-        ok = "ok" if want == got else ("past image" if want is None else f"BAD want {want:08x}")
+        data = img[off:off + count] if off >= 0 else b""
+        want = sum(struct.unpack(f"<{len(data) // 4}I", data[:len(data) // 4 * 4])) & 0xffffffff if off >= 0 and len(data) == count else None
+        ok = "ok" if want == got else ("out of image" if want is None else f"BAD want {want:08x}")
         print(f"{i:4d} lba {lba:#x} (+{off:#x}) {count:#7x} sum {got:08x} st {st:#x} {ok}")
 
 
-main()
+if __name__ == "__main__":
+    main()

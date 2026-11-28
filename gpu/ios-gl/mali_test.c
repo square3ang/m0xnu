@@ -454,17 +454,24 @@ int main(int argc, char **argv)
     if (!h) {
         printf("mali_test: dlopen failed: %s\n", dlerror());
     } else {
-        void *(*create_dev)(uint32_t, void *) = dlsym(h, "gldCreateDevice");
-        void *(*create_ctx)(void *, void *, void *, void *) = dlsym(h, "gldCreateContext");
+        int (*create_dev)(void **, uint32_t, void *) = dlsym(h, "gldCreateDevice");
+        int (*create_sg)(void *, void **, uint32_t) = dlsym(h, "gldCreateShareGroup");
+        int (*create_ctx)(void *, void **, void *, void *, void *, void *) = dlsym(h, "gldCreateContext");
+        void (*destroy_ctx)(void *) = dlsym(h, "gldDestroyContext");
+        void (*destroy_sg)(void *) = dlsym(h, "gldDestroyShareGroup");
         void *(*get_scr)(void *) = dlsym(h, "mali_gld_get_lima_screen");
         void *(*get_ctx)(void *) = dlsym(h, "mali_gld_get_lima_ctx");
         const char *(*get_str)(void *, uint32_t) = dlsym(h, "gldGetDeviceString");
-        void *dev = create_dev ? create_dev(svc, 0) : 0;
-        void *scr = (dev && get_scr) ? get_scr(dev) : 0;
-        void *ctx = (dev && create_ctx) ? create_ctx(dev, 0, 0, 0) : 0;
-        void *lctx = (ctx && get_ctx) ? get_ctx(ctx) : 0;
+        void *dev = NULL, *sg = NULL, *ctx = NULL;
+        if (create_dev) create_dev(&dev, 1u, NULL);
+        if (dev && create_sg) create_sg(dev, &sg, 0u);
+        void *scr = (dev && get_scr) ? get_scr(dev) : NULL;
+        if (sg && create_ctx) create_ctx(sg, &ctx, NULL, NULL, NULL, NULL);
+        void *lctx = (ctx && get_ctx) ? get_ctx(ctx) : NULL;
         const char *ren = (dev && get_str) ? get_str(dev, 0x1F01) : "";
         printf("mali_test: GLD dev=%p lima_screen=%p lima_ctx=%p renderer=%s\n", dev, scr, lctx, ren);
+        if (ctx && destroy_ctx) destroy_ctx(ctx);
+        if (sg && destroy_sg) destroy_sg(sg);
     }
 
     IOObjectRelease(svc);

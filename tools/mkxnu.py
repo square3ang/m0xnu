@@ -225,6 +225,11 @@ def selftest():
     assert macho_cdhash(mh) == hashlib.sha1(cd).digest()
     tc = pack_trust_cache([hashlib.sha1(cd).digest(), hashlib.sha1(cd).digest()])
     assert len(tc) == 24 + 20 and struct.unpack_from("<I", tc, 20)[0] == 1
+    try:
+        boot_args(0x41000000, 0x40f00000, 0x1000, "x" * 256)
+        raise AssertionError("expected ValueError for 256-byte cmdline")
+    except ValueError:
+        pass
 
 
 def macho_cdhash(data):
@@ -877,10 +882,13 @@ def boot_args(top, dt_phys, dt_len, cmdline, fb=False):
     # Boot_Video: base (phys), display, row bytes, width, height, depth. display 0 makes
     # machine init call initialize_screen(kPETextMode): verbose text; 1 is graphics mode,
     # which only shows the (here missing) boot logo.
+    cmd_b = cmdline.encode()
+    if len(cmd_b) >= 256:
+        raise ValueError(f"boot-args too long ({len(cmd_b)} >= 256 bytes): {cmdline!r}")
     vdisp = 0 if "-v" in cmdline.split() else 1
     video = (FB_PA, vdisp, FB_W * FB_BPP // 8, FB_W, FB_H, FB_BPP) if fb else (0, 0, 0, 0, 0, 0)
     ba = struct.pack("<HHIIII6IIII256sII", 1, 2, VIRT, PHYS, MEMSIZE, top, *video,
-                     0, p2v(dt_phys), dt_len, cmdline.encode(), 0, MEMSIZE)
+                     0, p2v(dt_phys), dt_len, cmd_b, 0, MEMSIZE)
     assert len(ba) == 0x140  # 32-bit struct boot_args, pexpert/pexpert/arm/boot.h
     return ba
 
@@ -901,25 +909,23 @@ AMFI_BOOTARG_ORIG = bytes.fromhex("71d0")
 AMFI_TC_INIT_SITE = 0x807650da  # AMFI init: str.w r8, [r0] (loaded_trust_caches = NULL)
 AMFI_TC_INIT_ORIG = bytes.fromhex("c0f80080")
 TBD_OPS = 0x803f5790          # A5 tbd_ops: fiq, get_timebase, get_decrementer, set_decrementer
-# Kernel functions replaced wholesale by shim functions (4-aligned Thumb entries).
+# Kernel functions replaced wholesale by shim functions (4-aligned Thumb entries): {va: (orig8, sym)}.
 HOOKS = {
-    0x803891bc: "exy_putc",        # _serial_putc
-    0x80366e40: "exy_cpu_signal",  # _PE_cpu_signal
-    0x800287bc: "exy_tap_conslog", # _conslog_putc, continues in the original (taps.S)
-    0x80364c94: "exy_gmt_time",    # _PEGetGMTTimeOfDay: read Exynos 4412 RTC (drivers.c)
-    0x80364cc4: "exy_set_gmt_time",# _PESetGMTTimeOfDay: write Exynos 4412 RTC (drivers.c)
-    0x80363c08: "exy_get_utc_time",# IOPlatformExpert::getUTCTimeOfDay
-    0x80363c20: "exy_set_utc_time",# IOPlatformExpert::setUTCTimeOfDay
-    0x8055189c: "exy_get_utc_time",# AppleARMPE::getUTCTimeOfDay (eliminates 30s IORTC wait!)
-    0x80551938: "exy_set_utc_time",# AppleARMPE::setUTCTimeOfDay (eliminates 30s IORTC wait!)
-    0x800ce390: "exy_cons_putc",   # pe_serial serial_putc: cons_ops[0].putc (taps.S)
-    0x80364390: "exy_halt_restart",  # _PEHaltRestart: reboot through the WDT
+    0x803891bc: (bytes.fromhex("b0b502af04464df2"), "exy_putc"),        # _serial_putc
+    0x80366e40: (bytes.fromhex("b0b502af05460c46"), "exy_cpu_signal"),  # _PE_cpu_signal
+    0x800287bc: (bytes.fromhex("b0b502af4df69e65"), "exy_tap_conslog"), # _conslog_putc, continues in the original (taps.S)
+    0x80364c94: (bytes.fromhex("80b56f4682b043f6"), "exy_gmt_time"),    # _PEGetGMTTimeOfDay: read Exynos 4412 RTC (drivers.c)
+    0x80364cc4: (bytes.fromhex("014643f61e30c0f2"), "exy_set_gmt_time"),# _PESetGMTTimeOfDay: write Exynos 4412 RTC (drivers.c)
+    0x80363c08: (bytes.fromhex("b0b502af0d460168"), "exy_get_utc_time"),# IOPlatformExpert::getUTCTimeOfDay
+    0x80363c20: (bytes.fromhex("0268d2f888231047"), "exy_set_utc_time"),# IOPlatformExpert::setUTCTimeOfDay
+    0x8055189c: (bytes.fromhex("f0b503af4df8048d"), "exy_get_utc_time"),# AppleARMPE::getUTCTimeOfDay (eliminates 30s IORTC wait!)
+    0x80551938: (bytes.fromhex("b0b502af87b01748"), "exy_set_utc_time"),# AppleARMPE::setUTCTimeOfDay (eliminates 30s IORTC wait!)
+    0x800ce390: (bytes.fromhex("b0b502af48f24e10"), "exy_cons_putc"),   # pe_serial serial_putc: cons_ops[0].putc (taps.S)
+    0x80364390: (bytes.fromhex("f0b503af2de9000d"), "exy_halt_restart"),# _PEHaltRestart: reboot through the WDT
 }
 USER_FAULT_SITE = 0x800ccbc2    # sleh_abort, user data abort: bl vm_fault_internal -> exy_user_vm_fault
 VM_FAULT_INTERNAL = 0x800792c5
-EXTMETHOD = 0x803704f4  # is_io_connect_method; --disp logs every IOConnectCallMethod (disp.c exy_uc_log)
-EXTMETHOD_HEAD = bytes.fromhex("f0b503af2de9000d")  # push {r4-r7, lr}; add r7, sp, #12; stmdb sp!, {r8, sl, fp}
-CONSLOG_HEAD = bytes.fromhex("b0b502af4df69e65")  # bytes taps.S replays
+XNUBOOT_MAX_BYTES = 0xb000 * 512  # U-Boot xnuboot reads 0xb000 sectors (22 MiB) from CACHE
 # Virtual methods replaced in prelinked kext vtables: {slot va: (original, shim function)}.
 # AppleInterruptController reaches every AIC register through readReg/writeReg; the shim
 # translates AIC registers to the GIC.
@@ -1016,6 +1022,7 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
     tc_phys = align(data_phys + len(shim_data), PAGE)
     rd_phys = align(tc_phys + len(tc), PAGE)  # below topOfKernelData: statically mapped, never freed
     top = align(rd_phys + len(rd), 0x4000)  # TTB base: kernel builds and clears page tables here
+    assert top <= PHYS + MEMSIZE, f"image top {top:#x} exceeds XNU RAM end {PHYS + MEMSIZE:#x}"
     # --emmc-root: md0 only borrows this range for its size; exy_md_strategy never touches it
     keep = set(ARM_IO_KEEP)
     if disp:
@@ -1027,7 +1034,9 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
     img = bytearray(top - start)
 
     def put(phys, data):
-        img[phys - start: phys - start + len(data)] = data
+        o = phys - start
+        assert 0 <= o and o + len(data) <= len(img), f"put({phys:#x}, {len(data):#x}) out of image bounds"
+        img[o: o + len(data)] = data
 
     for _, va, vs, fo, fs in segs:
         put(v2p(va), m[fo:fo + min(fs, vs)])  # tail up to vs stays zero (bss)
@@ -1075,10 +1084,10 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
     o = v2p(USER_FAULT_SITE) - start
     assert img[o:o + 4] == struct.pack("<HH", *thumb_bl(USER_FAULT_SITE, VM_FAULT_INTERNAL))
     img[o:o + 4] = struct.pack("<HH", *thumb_bl(USER_FAULT_SITE, syms["exy_user_vm_fault"]))
-    assert img[v2p(0x800287bc) - start:][:8] == CONSLOG_HEAD
-    for va, sym in HOOKS.items():  # ldr.w pc, [pc] ; .word shim function
-        assert va % 4 == 0
+    for va, (orig, sym) in HOOKS.items():  # ldr.w pc, [pc] ; .word shim function
+        assert va % 4 == 0, f"HOOK {va:#x} ({sym}) not 4-byte aligned"
         o = v2p(va) - start
+        assert img[o:o + len(orig)] == orig, f"HOOK {va:#x} ({sym}): unexpected bytes {img[o:o + 8].hex()}"
         img[o:o + 8] = bytes.fromhex("dff800f0") + struct.pack("<I", syms[sym])
     for va, (orig, sym) in VTABLE_HOOKS.items():
         o = v2p(va) - start
@@ -1115,13 +1124,18 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
             img[o:o + len(orig)] = bytes.fromhex(new_b)
         # Hook AppleKeyStore get_device_state (0x80f9fef0) -> exy_aks_get_device_state (kMobileLockStateDisabled=3)
         # and sel 31 get_configuration (0x80faf5a4) -> exy_aks_get_config (empty plist, fixes ManagedConfiguration).
-        for aks_fn_va, aks_sym in ((0x80f9fef0, "exy_aks_get_device_state"),
-                                   (0x80faf5a4, "exy_aks_get_config"),
-                                   (0x80fa1234, "exy_aks_find_aes"),
-                                   (0x80f9f35c, "exy_aks_hw_aes"),
-                                   (0x80fa0dec, "exy_aks_wrap_key"),
-                                   (0x80fa0ffc, "exy_aks_unwrap_key")):
+        for aks_fn_va, orig_h, aks_sym in (
+            (0x80f9fef0, "b0b502af83b0bd68", "exy_aks_get_device_state"),
+            (0x80faf5a4, "f0b503af82b01546", "exy_aks_get_config"),
+            (0x80fa1234, "f0b503af05462c46", "exy_aks_find_aes"),
+            (0x80f9f35c, "f0b503af2de9000d", "exy_aks_hw_aes"),
+            (0x80fa0dec, "f0b503af2de90005", "exy_aks_wrap_key"),
+            (0x80fa0ffc, "f0b503af2de90005", "exy_aks_unwrap_key"),
+        ):
+            assert aks_fn_va % 4 == 0, f"AKS hook {aks_fn_va:#x} ({aks_sym}) not 4-byte aligned"
             aks_o = v2p(aks_fn_va) - start
+            orig = bytes.fromhex(orig_h)
+            assert img[aks_o:aks_o + 8] == orig, f"AKS hook {aks_fn_va:#x} ({aks_sym}): unexpected bytes {img[aks_o:aks_o + 8].hex()}"
             img[aks_o:aks_o + 8] = bytes.fromhex("dff800f0") + struct.pack("<I", syms[aks_sym])
         # Skip nonexistent Apple /vram (PurpleGfxMem) & /arm-io/edram (PurpleEDRAM) regions in
         # IOSurfaceRoot::start so expected_region_count stays 0 and IOSurfaceCreate falls back
@@ -1144,7 +1158,7 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
             for slot in (43, 122, 139, 211, 221, *range(236, 312)):
                 img[clcd_vt + slot * 4:clcd_vt + slot * 4 + 4] = img[iomfb_vt + slot * 4:iomfb_vt + slot * 4 + 4]
             for slot, val in ((90, syms["exy_clcd_start"]),
-                              (146, syms["exy_clcd_new_uc"]),
+                              (146, 0x80d37099),  # IOMobileFramebuffer::newUserClient
                               (262, 0x80d3ceb9), (263, 0x80d3ceb9),
                               (270, syms["exy_clcd_start_hardware"]),
                               (272, syms["exy_clcd_swap_begin"]),
@@ -1165,7 +1179,7 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
             (sgx_vt, 91, 0x80df26f5, 0x80332409),  # IOService::stop
             (sgx_vt, 146, 0x80df51b1, 0x803397c1),  # IOService::newUserClient
             (uc_vt, 90, 0x80de0a35, syms["exy_mali_uc_start"]),
-            (uc_vt, 91, 0x80de0b09, 0x80332409),
+            (uc_vt, 91, 0x80de0b09, syms["exy_mali_uc_stop"]),
             (uc_vt, 208, 0x80de128d, syms["exy_mali_external_method"]),
             (uc_vt, 218, 0x8036e199, syms["exy_mali_client_memory"]),
         ):
@@ -1182,14 +1196,16 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
     sites = [(s, thumb_call_target(s, *struct.unpack_from("<HH", m, s - segs[0][1] + segs[0][3])))
              for lo, hi in traces for s in thumb_call_sites(lo, hi) if s not in cp_sites]
     tr_va = align(stub_va + len(code), 8)
-    slots_va = tr_va + len(assemble(trace_code(mailbox, []), tr_va))
-    tcode = assemble(trace_code(mailbox, sites), tr_va)
-    assert len(tcode) == slots_va - tr_va + TRACE_SLOT * len(sites)
-    assert tr_va + len(tcode) <= HDR_AREA[1], f"stubs overflow the header gap: {len(sites)} trace sites"
-    put(v2p(tr_va), tcode)
-    for i, (s, _) in enumerate(sites):
-        o = v2p(s) - start
-        img[o:o + 4] = struct.pack("<HH", *thumb_blx(s, slots_va + TRACE_SLOT * i))
+    tcode = b""
+    if sites:
+        slots_va = tr_va + len(assemble(trace_code(mailbox, []), tr_va))
+        tcode = assemble(trace_code(mailbox, sites), tr_va)
+        assert len(tcode) == slots_va - tr_va + TRACE_SLOT * len(sites)
+        assert tr_va + len(tcode) <= HDR_AREA[1], f"stubs overflow the header gap: {len(sites)} trace sites"
+        put(v2p(tr_va), tcode)
+        for i, (s, _) in enumerate(sites):
+            o = v2p(s) - start
+            img[o:o + 4] = struct.pack("<HH", *thumb_blx(s, slots_va + TRACE_SLOT * i))
 
     vbar = 0
     if vec:
@@ -1201,7 +1217,9 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
         o = v2p(SCTLR_V_SITE) - start
         assert struct.unpack_from("<I", img, o)[0] == SCTLR_V_ORIG
         struct.pack_into("<I", img, o, SCTLR_V_NOHI)
-    put(tr_phys, assemble(trampoline(mailbox, ba_phys, v2p(entry), stop, vbar, sampler), tr_phys))
+    tramp_code = assemble(trampoline(mailbox, ba_phys, v2p(entry), stop, vbar, sampler), tr_phys)
+    assert len(tramp_code) <= PAGE, f"trampoline overflows PAGE ({len(tramp_code):#x} > {PAGE:#x})"
+    put(tr_phys, tramp_code)
 
     for va, mode in cps:
         o = v2p(va) - start
@@ -1214,7 +1232,7 @@ def build(cps, stop, cmdline, traces=(), vec=False, ramdisk=None, sampler=False,
                 tramp=tr_phys, mailbox=mailbox, top=top, traced=len(sites), vbar=vbar,
                 log=v2p(syms["exy_log"]), fiqs=v2p(syms["exy_fiq_sample"]), dbg=v2p(syms["exy_dbg"]), aic=v2p(syms["exy_aic_dbg"]),
                 emmc=v2p(syms["exy_emmc_log"]), gpu=v2p(syms["exy_gpu_log"]), disp=v2p(syms["exy_disp_log"]),
-                touch=v2p(syms["exy_touch_log"]), drv=v2p(syms["exy_drv_log"]), uc=v2p(syms["exy_uc_log"]), fault=v2p(syms["exy_fault_log"]),
+                touch=v2p(syms["exy_touch_log"]), drv=v2p(syms["exy_drv_log"]), fault=v2p(syms["exy_fault_log"]),
                 smp=v2p(syms["exy_smp_entered"]), ncpus=ncpus)
     return bytes(img), info
 
@@ -1280,7 +1298,7 @@ def _m0xnu_splash_strips():
     return (576, render_strip(576, 656)), (1156, render_strip(1156, 1178))
 
 
-def fit(img, info, out, fb=False):
+def fit(img, info, out, fb=False, check_xnuboot_limit=True):
     sp1_y, sp1_data = (0, b"")
     sp2_y, sp2_data = (0, b"")
     if fb:
@@ -1320,6 +1338,11 @@ def fit(img, info, out, fb=False):
 """
         open(os.path.join(d, "x.its"), "w").write(its)
         subprocess.run([MKIMAGE, "-f", os.path.join(d, "x.its"), out], check=True, stdout=subprocess.DEVNULL)
+    if check_xnuboot_limit:
+        sz = os.path.getsize(out)
+        assert sz <= XNUBOOT_MAX_BYTES, (
+            f"FIT {out} ({sz} bytes) exceeds U-Boot xnuboot read limit ({XNUBOOT_MAX_BYTES} bytes)"
+        )
 
 
 def main():
@@ -1344,7 +1367,7 @@ def main():
                     help="rootdev=md0 instead of rd=md0: launchd runs its normal Boot tasks (fstab mounts md1 "
                          "on /private/var) but keybagd then needs /private/var/keybags/systembag.kb")
     ap.add_argument("--sampler", action="store_true",
-                    help=f"CPU1 samples CPU0's PC every 1 ms into a ring at {SAMPLER_RING:#x} (tools/xnupcs.sh)")
+                    help=f"CPU1 samples CPU0's PC every 1 ms into a ring at {SAMPLER_RING:#x} (tools/xnupcs.py)")
     ap.add_argument("--fb", action="store_true",
                     help=f"panel on (U-Boot xnufb), {FB_W}x{FB_H}x{FB_BPP} framebuffer at {FB_PA:#x} as the video console")
     ap.add_argument("--disp", action="store_true",
@@ -1356,7 +1379,7 @@ def main():
     ap.add_argument("-o", default=os.path.join(ROOT, "out/xnu.itb"))
     a = ap.parse_args()
     cps = [(int(v, 0), mode) for v, mode in (c.split(":") for c in a.cp)]
-    assert all(mode in "at" for _, mode in cps)
+    assert all(mode in ("a", "t") for _, mode in cps)
     traces = [tuple(int(x, 0) for x in t.split(":")) for t in a.trace]
     assert not (a.ramdisk and a.emmc_root), "--ramdisk or --emmc-root"
     assert a.emmc_root or not a.emmc_var, "--emmc-var needs --emmc-root"
@@ -1367,7 +1390,7 @@ def main():
     assert a.emmc_root or not a.gpu_demo, "--gpu-demo runs on the first eMMC root I/O: needs --emmc-root"
     img, info = build(cps, a.stop, args, traces, a.vec, a.ramdisk, a.sampler, a.emmc_root, a.fb, a.emmc_var,
                       a.gpu_demo, a.trust_cache, a.disp, a.gpu)
-    fit(img, info, a.o, a.fb)
+    fit(img, info, a.o, a.fb, check_xnuboot_limit=not a.ramdisk)
     print(" ".join(f"{k}={v:#x}" for k, v in info.items()), f"size={len(img):#x}")
 
 

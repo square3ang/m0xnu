@@ -14,7 +14,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <xf86drm.h>
-#include <drm/lima_drm.h>
+#include <lima_drm.h>
 #include "mali_abi.h"
 
 #define MALI_FAKE_DRM_FD 999
@@ -36,6 +36,7 @@ uint32_t mali_work_pa = 0x5f000000u;
 uint32_t mali_work_size = 0x00100000u;
 static uintptr_t mali_work_va = 0;
 static size_t mali_work_mapped_sz = 0;
+static pthread_mutex_t work_map_mtx = PTHREAD_MUTEX_INITIALIZER;
 static volatile uint32_t *mali_done_seq_va = NULL;
 static int mali_done_map_tried = 0;
 
@@ -74,18 +75,25 @@ void mali_zero_wc(void *dst, size_t n)
 
 static uintptr_t mali_ensure_work_map(void)
 {
-    if (mali_work_va)
-        return mali_work_va;
+    uintptr_t cur = __atomic_load_n(&mali_work_va, __ATOMIC_ACQUIRE);
+    if (cur)
+        return cur;
     if (!mali_iokit_conn)
         return 0;
-    uintptr_t va = 0;
-    size_t sz = 0;
-    /* kIOMapAnywhere = 1 */
-    if (IOConnectMapMemory(mali_iokit_conn, 0, mach_task_self_, &va, &sz, 1u) != 0)
-        return 0;
-    mali_work_va = va;
-    mali_work_mapped_sz = sz;
-    return mali_work_va;
+    pthread_mutex_lock(&work_map_mtx);
+    cur = mali_work_va;
+    if (!cur) {
+        uintptr_t va = 0;
+        size_t sz = 0;
+        /* kIOMapAnywhere = 1 */
+        if (IOConnectMapMemory(mali_iokit_conn, 0, mach_task_self_, &va, &sz, 1u) == 0 && va && sz) {
+            mali_work_mapped_sz = sz;
+            __atomic_store_n(&mali_work_va, va, __ATOMIC_RELEASE);
+            cur = va;
+        }
+    }
+    pthread_mutex_unlock(&work_map_mtx);
+    return cur;
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
@@ -97,7 +105,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
             return MAP_FAILED;
         }
         uint64_t uoff = (uint64_t)offset;
-        if (uoff < mali_work_pa || (uoff - mali_work_pa) + len > mali_work_mapped_sz) {
+        if (uoff < mali_work_pa || (uoff - mali_work_pa) > mali_work_mapped_sz ||
+            len > mali_work_mapped_sz - (size_t)(uoff - mali_work_pa)) {
             errno = EINVAL;
             return MAP_FAILED;
         }
@@ -113,7 +122,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 int munmap(void *addr, size_t len)
 {
     uintptr_t p = (uintptr_t)addr;
-    if (mali_work_va && p >= mali_work_va && p < mali_work_va + mali_work_mapped_sz)
+    uintptr_t wva = __atomic_load_n(&mali_work_va, __ATOMIC_ACQUIRE);
+    if (wva && p >= wva && p < wva + mali_work_mapped_sz)
         return 0;
     typedef int (*munmap_fn)(void *, size_t);
     static munmap_fn real_munmap;
@@ -138,6 +148,8 @@ struct mali_free_ext {
 
 #define MAX_BOS 4096
 static pthread_mutex_t bo_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t bo_cond = PTHREAD_COND_INITIALIZER;
+static uint32_t g_submitting = 0;
 static struct mali_bo_slot bos[MAX_BOS];
 static struct mali_free_ext free_exts[MAX_BOS];
 static int num_free_exts = 0;
@@ -177,7 +189,7 @@ static int pool_alloc(uint32_t sz, uint32_t *out_off)
             free_exts[best] = free_exts[--num_free_exts];
         return 0;
     }
-    if (next_pool_off + sz > mali_work_size) {
+    if (sz > mali_work_size || next_pool_off > mali_work_size - sz) {
         static int oom_n = 0;
         if (oom_n++ < 8) {
             char obuf[128];
@@ -444,8 +456,12 @@ int drmIoctl(int fd, unsigned long request, void *arg)
 
     case DRM_IOCTL_LIMA_GEM_CREATE: {
         struct drm_lima_gem_create *c = (struct drm_lima_gem_create *)arg;
+        if (c->size > mali_work_size)
+            return -ENOMEM;
         uint32_t sz = (c->size + 0xfffu) & ~0xfffu;
         if (!sz) sz = 0x1000u;
+        if (sz > mali_work_size)
+            return -ENOMEM;
         pthread_mutex_lock(&bo_mtx);
         uint32_t va_base = mali_va_base();
         if (!pool_va_mapped && mali_iokit_conn && mali_work_size > 0x10000u) {
@@ -511,27 +527,29 @@ int drmIoctl(int fd, unsigned long request, void *arg)
         if (bo_in_pending_gp(cl->handle))
             flush_pending_gp();
         pthread_mutex_lock(&bo_mtx);
-        uint32_t seq = 0u;
-        int busy = 0;
-        if (g_any_inflight) {
-            refresh_done_seq_locked();
-            struct mali_bo_slot *b0 = find_bo(cl->handle);
-            if (b0 && seq_is_busy_locked(b0->last_seq)) {
-                seq = b0->last_seq;
-                busy = 1;
+        for (;;) {
+            while (g_submitting > 0u)
+                pthread_cond_wait(&bo_cond, &bo_mtx);
+            struct mali_bo_slot *b = find_bo(cl->handle);
+            if (!b) {
+                pthread_mutex_unlock(&bo_mtx);
+                return 0;
             }
-        }
-        pthread_mutex_unlock(&bo_mtx);
-        if (busy)
-            mali_wait_seq(seq);
-        pthread_mutex_lock(&bo_mtx);
-        struct mali_bo_slot *b = find_bo(cl->handle);
-        if (b) {
+            if (g_any_inflight) {
+                refresh_done_seq_locked();
+                if (seq_is_busy_locked(b->last_seq)) {
+                    uint32_t seq = b->last_seq;
+                    pthread_mutex_unlock(&bo_mtx);
+                    mali_wait_seq(seq);
+                    pthread_mutex_lock(&bo_mtx);
+                    continue;
+                }
+            }
             pool_free(b->pa - mali_work_pa, b->size);
             memset(b, 0, sizeof(*b));
+            pthread_mutex_unlock(&bo_mtx);
+            return 0;
         }
-        pthread_mutex_unlock(&bo_mtx);
-        return 0;
     }
 
     case DRM_IOCTL_LIMA_CTX_CREATE: {
@@ -631,6 +649,9 @@ int drmIoctl(int fd, unsigned long request, void *arg)
             uint32_t gp_nr = 0;
             int gp_overflow = 0;
             int kr;
+            pthread_mutex_lock(&bo_mtx);
+            g_submitting++;
+            pthread_mutex_unlock(&bo_mtx);
             if (tls_has_gp) {
                 memcpy(gpp.gp, tls_gp, sizeof(gpp.gp));
                 gp_nr = tls_gp_nr_bos;
@@ -671,6 +692,8 @@ int drmIoctl(int fd, unsigned long request, void *arg)
                     }
                 }
             }
+            if (--g_submitting == 0u)
+                pthread_cond_broadcast(&bo_cond);
             pthread_mutex_unlock(&bo_mtx);
             if (kr != 0) {
                 static int pe = 0;
@@ -733,10 +756,15 @@ int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 /* iOS 9.3.5 libc shims (clock_gettime added in iOS 10, open_memstream in iOS 11). */
 int clock_gettime(clockid_t clk_id, struct timespec *tp)
 {
-    (void)clk_id;
     if (!tp) {
         errno = EINVAL;
         return -1;
+    }
+    if (clk_id != CLOCK_REALTIME) {
+        uint64_t ticks = mach_absolute_time();
+        tp->tv_sec = (time_t)(ticks / 24000000ULL);
+        tp->tv_nsec = (long)(((ticks % 24000000ULL) * 1000ULL) / 24ULL);
+        return 0;
     }
     struct timeval tv;
     if (gettimeofday(&tv, NULL) != 0)

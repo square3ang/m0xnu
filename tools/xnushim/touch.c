@@ -9,15 +9,19 @@ typedef uintptr_t (*ml_io_map_t)(uintptr_t pa, uint32_t size);
 #define ml_io_map ((ml_io_map_t)0x800c0bf5) /* Thumb */
 
 extern uintptr_t mct, mshc, exy_pl310;
+extern uint32_t exy_pl310_lock(void);
+extern void exy_pl310_unlock(uint32_t cpsr);
 
 void exy_clean_line(const void *p)
 {
     __asm__ volatile("mcr p15, 0, %0, c7, c10, 1\ndsb" :: "r"(p) : "memory");
     uintptr_t va = (uintptr_t)p;
     if (exy_pl310 && va >= 0x80000000u && va < 0xa0000000u) {
+        uint32_t f = exy_pl310_lock();
         *(volatile uint32_t *)(exy_pl310 + 0x7b0u) = (uint32_t)((va - 0x40000000u) & ~31u);
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
         __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
     }
 }
 
@@ -29,10 +33,12 @@ static void dma_clean_range(const void *p, uint32_t len)
         __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" :: "r"(x) : "memory");
     __asm__ volatile("dsb" ::: "memory");
     if (exy_pl310) {
+        uint32_t f = exy_pl310_lock();
         for (uintptr_t x = a; x < end; x += 32u)
             *(volatile uint32_t *)(exy_pl310 + 0x7b0u) = (uint32_t)(x - 0x40000000u);
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
         __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
     }
 }
 
@@ -44,17 +50,13 @@ static void dma_clean_inv_range(const void *p, uint32_t len)
         __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" :: "r"(x) : "memory");
     __asm__ volatile("dsb" ::: "memory");
     if (exy_pl310) {
+        uint32_t f = exy_pl310_lock();
         for (uintptr_t x = a; x < end; x += 32u)
             *(volatile uint32_t *)(exy_pl310 + 0x7f0u) = (uint32_t)(x - 0x40000000u);
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
         __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
     }
-}
-
-void exy_dma_clean_inv_pa(uint32_t pa, uint32_t len)
-{
-    if (pa >= 0x40000000u && pa + len <= 0x60000000u)
-        dma_clean_inv_range((const void *)(uintptr_t)(pa + 0x40000000u), len);
 }
 
 static void dma_inv_range(const void *p, uint32_t len)
@@ -62,37 +64,28 @@ static void dma_inv_range(const void *p, uint32_t len)
     uintptr_t a = (uintptr_t)p & ~31u;
     uintptr_t end = (uintptr_t)p + len;
     if (exy_pl310) {
+        uint32_t f = exy_pl310_lock();
         for (uintptr_t x = a; x < end; x += 32u)
             *(volatile uint32_t *)(exy_pl310 + 0x770u) = (uint32_t)(x - 0x40000000u);
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
         __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
     }
     for (uintptr_t x = a; x < end; x += 32u)
         __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" :: "r"(x) : "memory");
     __asm__ volatile("dsb" ::: "memory");
 }
 
-void exy_dma_inv_pa(uint32_t pa, uint32_t len)
-{
-    if (pa >= 0x40000000u && pa + len <= 0x60000000u)
-        dma_inv_range((const void *)(uintptr_t)(pa + 0x40000000u), len);
-}
-
-void exy_dma_inv_l2_nosync(uint32_t pa, uint32_t len)
-{
-    if (!exy_pl310 || pa < 0x40000000u || pa + len > 0x60000000u)
-        return;
-    uint32_t a = pa & ~31u;
-    uint32_t end = pa + len;
-    for (uint32_t x = a; x < end; x += 32u)
-        *(volatile uint32_t *)(exy_pl310 + 0x770u) = x;
-}
-
 void exy_dma_inv_l2_sync(void)
 {
-    if (exy_pl310)
+    if (exy_pl310) {
+        uint32_t f = exy_pl310_lock();
         *(volatile uint32_t *)(exy_pl310 + 0x730u) = 0u;
-    __asm__ volatile("dsb" ::: "memory");
+        __asm__ volatile("dsb" ::: "memory");
+        exy_pl310_unlock(f);
+    } else {
+        __asm__ volatile("dsb" ::: "memory");
+    }
 }
 
 #define CMU_LEFTBUS_PA  0x10034000u
@@ -343,81 +336,94 @@ int exy_i2c_read_reg16(uintptr_t base, uint8_t addr7, uint16_t reg16, uint8_t *o
 
 static volatile uint32_t pmic_i2c_lock;
 
-static void pmic_lock(void)
+static uint32_t pmic_lock(void)
 {
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr\ncpsid i" : "=r"(cpsr) :: "memory");
     while (__sync_lock_test_and_set(&pmic_i2c_lock, 1u))
         __asm__ volatile("yield" ::: "memory");
+    return cpsr;
 }
 
-static void pmic_unlock(void)
+static int pmic_trylock_timeout(uint32_t *out_cpsr)
+{
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr\ncpsid i" : "=r"(cpsr) :: "memory");
+    for (uint32_t i = 0; i < 200000u; i++) {
+        if (!__sync_lock_test_and_set(&pmic_i2c_lock, 1u)) {
+            *out_cpsr = cpsr;
+            return 0;
+        }
+        udelay(5);
+    }
+    __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+    return -1;
+}
+
+static void pmic_unlock(uint32_t cpsr)
 {
     __sync_lock_release(&pmic_i2c_lock);
+    __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+}
+
+static int pmic_write_reg_locked(uint8_t reg, uint8_t val)
+{
+    if (!i2c7_va) return -1;
+    uint8_t b[2] = { reg, val };
+    for (int tries = 0; tries < 4; tries++) {
+        if (i2c_write(i2c7_va, MAX77686_ADDR, b, 2) == 0)
+            return 0;
+        udelay(300);
+        i2c_init_hw(i2c7_va);
+    }
+    return -1;
 }
 
 int exy_pmic_write_reg(uint8_t reg, uint8_t val)
 {
     if (!i2c7_va) return -1;
-    uint8_t b[2] = { reg, val };
-    int rc = -1;
-    pmic_lock();
-    for (int tries = 0; tries < 4; tries++) {
-        if (i2c_write(i2c7_va, MAX77686_ADDR, b, 2) == 0) {
-            rc = 0;
-            break;
-        }
-        udelay(300);
-        i2c_init_hw(i2c7_va);
-    }
-    pmic_unlock();
+    uint32_t cpsr = pmic_lock();
+    int rc = pmic_write_reg_locked(reg, val);
+    pmic_unlock(cpsr);
     return rc;
 }
 
 #define pmic_write_reg exy_pmic_write_reg
 
-static int cur_cpu_opp = -1;
 volatile uint32_t exy_last_touch_mct;
 static uint8_t cur_buck2_code = 0x2au;
 static uint8_t cur_buck4_code = 0x26u;
 
-static int cpu_set_vdd(uint8_t code)
+static int pmic_set_dvs8_locked(uint8_t base_reg, uint8_t code, uint8_t *cached)
 {
-    if (code == cur_buck2_code)
+    if (code == *cached)
         return 0;
     int ok = 1;
-    for (uint8_t r = MAX77686_BUCK2DVS1; r < MAX77686_BUCK2DVS1 + 8u; r++)
-        if (pmic_write_reg(r, code) != 0)
+    for (uint8_t r = base_reg; r < base_reg + 8u; r++)
+        if (pmic_write_reg_locked(r, code) != 0)
             ok = 0;
     if (ok)
-        cur_buck2_code = code;
+        *cached = code;
     return ok ? 0 : -1;
 }
 
 int exy_gpu_set_vdd(uint8_t code)
 {
-    if (code == cur_buck4_code)
-        return 0;
-    int ok = 1;
-    for (uint8_t r = MAX77686_BUCK4DVS1; r < MAX77686_BUCK4DVS1 + 8u; r++)
-        if (pmic_write_reg(r, code) != 0)
-            ok = 0;
-    if (ok)
-        cur_buck4_code = code;
-    return ok ? 0 : -1;
+    uint32_t cpsr = pmic_lock();
+    int rc = pmic_set_dvs8_locked(MAX77686_BUCK4DVS1, code, &cur_buck4_code);
+    pmic_unlock(cpsr);
+    return rc;
 }
 
 /* Restore full boot voltages before warm reset so U-Boot (800 MHz) never browns out. */
 void exy_cpu_prep_reboot(void)
 {
-    (void)cpu_set_vdd(0x2au);
-    (void)exy_gpu_set_vdd(0x26u);
-}
-
-/* Fixed 1000 MHz @ 1.125V set single-core before SMP bring-up (no runtime CLK_DIV_CPU0 SMP scaling);
- * thermal/idle power management scales Mali-400 GPU (147/220/440 MHz) + idle clock-gating. */
-int exy_cpu_set_opp(int opp)
-{
-    (void)opp;
-    return 0;
+    uint32_t cpsr = 0u;
+    if (pmic_trylock_timeout(&cpsr) != 0)
+        return;
+    (void)pmic_set_dvs8_locked(MAX77686_BUCK2DVS1, 0x2au, &cur_buck2_code);
+    (void)pmic_set_dvs8_locked(MAX77686_BUCK4DVS1, 0x26u, &cur_buck4_code);
+    pmic_unlock(cpsr);
 }
 
 static void boost_apll_1000(void)
@@ -443,7 +449,6 @@ static void boost_apll_1000(void)
     wr32(cmu_cpu_va + 0x200u, 0x01000001u);
     while (rd32(cmu_cpu_va + 0x400u) & 0x04440004u)
         ;
-    cur_cpu_opp = 2;
     cur_buck2_code = 0x2au;
     exy_touch_log.apll = rd32(cmu_cpu_va + 0x100u);
 }
@@ -483,7 +488,8 @@ static void boost_buses_400(void)
 
 void exy_pmic_and_touch_init(void)
 {
-    exy_pl310 = ml_io_map(PL310_PA, 0x1000);
+    if (!exy_pl310)
+        exy_pl310 = ml_io_map(PL310_PA, 0x1000);
     exy_touch_log.magic = 0x74756368u; /* "tuch" */
     exy_touch_log.pmic_id = 0x0001u;
     exy_clean_line(&exy_touch_log);
@@ -656,6 +662,7 @@ void exy_synth_touch_inject(uint16_t x, uint16_t y, uint32_t down)
     synth_touch_x = (x > 719u) ? 719u : x;
     synth_touch_y = (y > 1279u) ? 1279u : y;
     synth_touch_down = down ? 1u : 0u;
+    __asm__ volatile("dmb ish" ::: "memory");
     synth_touch_pending = 1u;
 }
 
@@ -668,7 +675,7 @@ static void poll_mms114(void)
     uint8_t pkt_sz = 0;
     if (i2c_read_reg(i2c3_va, MMS114_ADDR, MMS114_PACKET_SIZE, &pkt_sz, 1) != 0)
         return;
-    if (pkt_sz == 0 || pkt_sz > 80u)
+    if (pkt_sz < 6u || pkt_sz > 80u)
         return;
 
     uint8_t buf[80];
@@ -726,13 +733,10 @@ extern struct {
     uint32_t magic, started, self, swaps, last_pa, last_len, copied;
 } exy_disp_log;
 
-extern void exy_drv_otg_check(void);
-
 void exy_touch_poll(struct exy_touch_state *out)
 {
     exy_touch_log.polls++;
     exy_touch_log.last_ms = mct_lo() / 24000u;
-    exy_drv_otg_check();
     probe_tsp_once();
     uint32_t prev_seq = cur_state.seq;
     uint32_t btn = read_buttons();
@@ -749,12 +753,15 @@ void exy_touch_poll(struct exy_touch_state *out)
     }
     uint32_t was_down = cur_state.count;
     if (synth_touch_pending) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        uint16_t sx = synth_touch_x, sy = synth_touch_y;
+        uint32_t sd = synth_touch_down;
         synth_touch_pending = 0u;
         cur_state.f[0].id = 1u;
-        cur_state.f[0].down = (uint8_t)synth_touch_down;
-        cur_state.f[0].x = synth_touch_x;
-        cur_state.f[0].y = synth_touch_y;
-        cur_state.count = synth_touch_down ? 1u : 0u;
+        cur_state.f[0].down = (uint8_t)sd;
+        cur_state.f[0].x = sx;
+        cur_state.f[0].y = sy;
+        cur_state.count = sd ? 1u : 0u;
         cur_state.seq++;
     } else if (cur_state.chip == 0x114u)
         poll_mms114();
@@ -785,6 +792,13 @@ static int emmc_idmac_inited;
 
 static void fast_memcpy32(void *dst, const void *src, uint32_t bytes)
 {
+    if (((uintptr_t)dst | (uintptr_t)src | bytes) & 3u) {
+        uint8_t *db = (uint8_t *)dst;
+        const uint8_t *sb = (const uint8_t *)src;
+        for (uint32_t i = 0; i < bytes; i++)
+            db[i] = sb[i];
+        return;
+    }
     uint32_t *d = (uint32_t *)dst;
     const uint32_t *s = (const uint32_t *)src;
     uint32_t w = bytes >> 2;
@@ -816,6 +830,24 @@ static void emmc_set_clkdiv(uint32_t div)
 }
 
 #define touch_iosleep ((void (*)(uint32_t))0x80328fd1)
+
+static void emmc_idma_abort(uint32_t n)
+{
+    wr32(mshc + 0x00u, (rd32(mshc + 0x00u) & ~(1u << 5)) | (1u << 1) | (1u << 2));
+    for (uint32_t k = 0; k < 100000u && (rd32(mshc + 0x00u) & ((1u << 1) | (1u << 2))); k++)
+        ;
+    wr32(mshc + 0x8cu, 0xffffffffu);
+    wr32(mshc + 0x44u, ~0u);
+    if (n > 1u) {
+        wr32(mshc + 0x28u, 0u);
+        wr32(mshc + 0x2cu, (1u << 31) | (1u << 29) | (1u << 14) | (1u << 8) | (1u << 6) | 12u);
+        for (uint32_t k = 0; k < 100000u && !(rd32(mshc + 0x44u) & (1u << 2)); k++)
+            ;
+        for (uint32_t k = 0; k < 500000u && (rd32(mshc + 0x48u) & (1u << 9)); k++)
+            ;
+        wr32(mshc + 0x44u, ~0u);
+    }
+}
 
 static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int write)
 {
@@ -887,7 +919,7 @@ static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int writ
     for (i = 0; i < MSHC_SPIN; i++) {
         st = rd32(mshc + 0x44u);
         if (st & MSHC_ERRS) {
-            wr32(mshc + 0x00u, rd32(mshc + 0x00u) & ~(1u << 5));
+            emmc_idma_abort(n);
             return st;
         }
         if (st & (1u << 3)) { /* DTO */
@@ -906,7 +938,7 @@ static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int writ
         }
     }
     if (!dto_ok) {
-        wr32(mshc + 0x00u, rd32(mshc + 0x00u) & ~(1u << 5));
+        emmc_idma_abort(n);
         return st | (1u << 31);
     }
 
@@ -929,11 +961,13 @@ static uint32_t emmc_idma_chunk(uint32_t lba, uint32_t n, uint8_t *buf, int writ
         }
     }
 
+    if (i >= MSHC_SPIN) {
+        emmc_idma_abort(n);
+        return st | (1u << 31);
+    }
     wr32(mshc + 0x8cu, 0xffffffffu);
     wr32(mshc + 0x00u, rd32(mshc + 0x00u) & ~(1u << 5));
     wr32(mshc + 0x44u, ~0u);
-    if (i >= MSHC_SPIN)
-        return st | (1u << 31);
 
     if (!write) {
         dma_inv_range(emmc_dma_buf, bytes);

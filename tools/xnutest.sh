@@ -1,12 +1,28 @@
 #!/bin/bash
 # Build with mkxnu.py (args passed through), run on the device, dump the debug state.
 # usage: xnutest.sh [mkxnu.py args...]
-set -eu
+set -euo pipefail
 cd "$(dirname "$0")/.."
+itb=out/xnu.itb
+prev=
+for arg in "$@"; do
+	if [ "$prev" = "-o" ]; then itb=$arg; fi
+	prev=$arg
+done
 info=$(python3 tools/mkxnu.py "$@" | tail -1)
 echo "$info"
-eval "$(tr ' ' '\n' <<< "$info" | grep -E '^(mailbox|fiqs|dbg|log|aic)=')"
-tools/xnurun.sh out/xnu.itb "$mailbox"
+mailbox= fiqs= dbg= log= aic=
+for tok in $info; do
+	case $tok in
+		mailbox=0x*) mailbox=${tok#mailbox=} ;;
+		fiqs=0x*)    fiqs=${tok#fiqs=} ;;
+		dbg=0x*)     dbg=${tok#dbg=} ;;
+		log=0x*)     log=${tok#log=} ;;
+		aic=0x*)     aic=${tok#aic=} ;;
+	esac
+done
+[ -n "$mailbox" ] && [ -n "$fiqs" ] && [ -n "$dbg" ] && [ -n "$log" ] && [ -n "$aic" ] || { echo "mkxnu.py info line missing addresses" >&2; exit 1; }
+tools/xnurun.sh "$itb" "$mailbox"
 m() { timeout 3 fastboot getvar mem:"$(printf '%#x' "$1")" 2>&1 | head -1; }
 echo "mailbox +80 (--vec: r2 r3 lr_svc sp_svc):"; m $((mailbox + 80))
 echo "fiq sample (lr count G_CNT_L spsr | cpu_data+4 cpu_data+0xc - ring_index | last 16 pcs):"

@@ -17,7 +17,7 @@ if any(a in ("--version", "-v", "-dM", "-E") for a in args) and "-c" not in args
     sys.exit(subprocess.call([compiler, "--target=armv7-apple-ios9.0", *args]))
 
 DRM_INC = os.path.join(ROOT, "gpu/ios-gl/toolchain/drm/include")
-UAPI_INC = os.path.join(ROOT, "gpu/linux-lima/include/uapi")
+UAPI_INC = os.path.join(ROOT, "gpu/mesa-lima/include/drm-uapi")
 inc_flags = [
     "--target=armv7-apple-ios9.0",
     "-mcpu=cortex-a9",
@@ -61,11 +61,26 @@ if any(a in ("-c", "-E", "-S") for a in args):
     sys.exit(subprocess.call([compiler, *inc_flags, *args, *undef_flags]))
 
 # Link step: let clang drive our arm-apple-darwin11-ld via -fuse-ld=.
+# ld64 requires libSystem.B.dylib for every armv7 link; bootstrap a minimal stub on a clean
+# checkout (e.g. `meson setup` before `gpu/ios-gl/build.sh` builds the full stubs).
+libsystem = os.path.join(STUB, "libSystem.B.dylib")
+if not os.path.exists(libsystem):
+    os.makedirs(STUB, exist_ok=True)
+    tmp_c = os.path.join(STUB, "_boot_libSystem.c")
+    tmp_o = os.path.join(STUB, "_boot_libSystem.o")
+    kern_d = os.path.join(STUB, "libsystem_kernel.dylib")
+    with open(tmp_c, "w") as f:
+        f.write('__asm__(".align 2\\n.globl dyld_stub_binder\\ndyld_stub_binder: bx lr\\n");\n')
+    subprocess.check_call(["clang", "--target=armv7-apple-ios9.0", "-mthumb", "-c", tmp_c, "-o", tmp_o])
+    subprocess.check_call([LD, "-arch", "armv7", "-ios_version_min", "9.0", "-dylib",
+                           "-install_name", "/usr/lib/system/libsystem_kernel.dylib", "-o", kern_d, tmp_o])
+    subprocess.check_call([LD, "-arch", "armv7", "-ios_version_min", "9.0", "-dylib",
+                           "-install_name", "/usr/lib/libSystem.B.dylib", "-o", libsystem, tmp_o, kern_d])
 link_flags = [
     f"-fuse-ld={LD}",
     "-nostdlib",
     f"-L{STUB}",
-    os.path.join(STUB, "libSystem.B.dylib"),
+    libsystem,
     "-Wl,-undefined,dynamic_lookup",
 ]
 sys.exit(subprocess.call([compiler, *inc_flags, *args, *link_flags]))

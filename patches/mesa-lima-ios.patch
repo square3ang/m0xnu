@@ -38,16 +38,17 @@ index d94ce9f..40fbe83 100644
     default:
        fprintf(stderr, "Unknown DRM_IOCTL_LIMA_GET_PARAM %d\n", gp->param);
 diff --git a/src/gallium/drivers/lima/lima_blit.c b/src/gallium/drivers/lima/lima_blit.c
-index 03916bf..a399aa0 100644
+index 03916bf..8ebc7fc 100644
 --- a/src/gallium/drivers/lima/lima_blit.c
 +++ b/src/gallium/drivers/lima/lima_blit.c
-@@ -55,11 +55,15 @@ lima_pack_blit_cmd(struct lima_job *job,
+@@ -53,13 +53,16 @@ lima_pack_blit_cmd(struct lima_job *job,
+    uint32_t va;
+    void *cpu = lima_job_create_stream_bo(
        job, LIMA_PIPE_PP, lima_blit_buffer_size, &va);
++   if (unlikely(!cpu))
++      return;
  
     struct lima_screen *screen = lima_screen(ctx->base.screen);
-+   static uint32_t cached_reload_len;
-+   if (!cached_reload_len)
-+      cached_reload_len = ((uint32_t *)(screen->pp_buffer->map + pp_reload_program_offset))[0] & 0x1f;
  
 -   lima_pack(cpu + lima_blit_render_state_offset, RENDER_STATE, state)
 +   uint32_t rsw_tmp[16];
@@ -55,11 +56,11 @@ index 03916bf..a399aa0 100644
     {
        state.shader_address = screen->pp_buffer->va + pp_reload_program_offset;
 -      state.fs_first_instr_length = ((uint32_t *)(screen->pp_buffer->map + pp_reload_program_offset))[0] & 0x1f;
-+      state.fs_first_instr_length = cached_reload_len;
++      state.fs_first_instr_length = screen->reload_first_instr_len;
  
        state.varying_type_0 = LIMA_VARYING_TYPE_VEC2_FP32;
  
-@@ -113,6 +117,8 @@ lima_pack_blit_cmd(struct lima_job *job,
+@@ -113,6 +116,8 @@ lima_pack_blit_cmd(struct lima_job *job,
        }
     }
  
@@ -68,7 +69,7 @@ index 03916bf..a399aa0 100644
     unsigned width, height;
     if (job->key.cbuf.texture)
        pipe_surface_size(&job->key.cbuf, &width, &height);
-@@ -122,7 +128,8 @@ lima_pack_blit_cmd(struct lima_job *job,
+@@ -122,7 +127,8 @@ lima_pack_blit_cmd(struct lima_job *job,
     fb_width = width;
     fb_height = height;
  
@@ -78,7 +79,7 @@ index 03916bf..a399aa0 100644
        lima_texture_desc_set_res(ctx, &desc, &res->base, level, level,
                                  first_layer, mrt_idx);
        desc.texel_format = lima_format_get_texel_reload(res->base.format);
-@@ -139,6 +146,7 @@ lima_pack_blit_cmd(struct lima_job *job,
+@@ -139,6 +145,7 @@ lima_pack_blit_cmd(struct lima_job *job,
           desc.mag_img_filter_nearest = false;
        }
     }
@@ -86,7 +87,7 @@ index 03916bf..a399aa0 100644
  
     uint32_t *ta = cpu + lima_blit_tex_array_offset;
     ta[0] = va + lima_blit_tex_desc_offset;
-@@ -282,6 +290,12 @@ lima_do_blit(struct pipe_context *pctx,
+@@ -282,6 +289,12 @@ lima_do_blit(struct pipe_context *pctx,
     struct pipe_surface src_surf;
     lima_set_blit_surface(&src_surf, pctx, info->src.resource, info->src.level);
  
@@ -99,7 +100,7 @@ index 03916bf..a399aa0 100644
     struct lima_job *job;
  
     if (util_format_is_depth_or_stencil(info->dst.resource->format))
-@@ -289,11 +303,17 @@ lima_do_blit(struct pipe_context *pctx,
+@@ -289,11 +302,17 @@ lima_do_blit(struct pipe_context *pctx,
     else
        job = lima_job_get_with_fb(ctx, &dst_surf, NULL);
  
@@ -516,7 +517,7 @@ index 4c6164e..534ed25 100644
     struct lima_context *ctx, struct pipe_resource *prsc);
  
 diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
-index 176726a..e54a0de 100644
+index 176726a..b52ea50 100644
 --- a/src/gallium/drivers/lima/lima_draw.c
 +++ b/src/gallium/drivers/lima/lima_draw.c
 @@ -124,6 +124,8 @@ static void
@@ -528,22 +529,23 @@ index 176726a..e54a0de 100644
     struct lima_context_framebuffer *fb = &ctx->framebuffer;
  
     /* add to job when the buffer is dirty and resolve is clear (not added before) */
-@@ -147,6 +149,14 @@ lima_update_job_wb(struct lima_context *ctx, unsigned buffers)
+@@ -147,6 +149,15 @@ lima_update_job_wb(struct lima_context *ctx, unsigned buffers)
     job->resolve |= buffers;
  }
  
-+static uint32_t g_lima_bo_gen = 1;
++static int g_lima_bo_gen = 1;
 +
 +uint32_t lima_next_bo_gen(void);
 +uint32_t lima_next_bo_gen(void)
 +{
-+   return ++g_lima_bo_gen;
++   uint32_t g = (uint32_t)p_atomic_inc_return(&g_lima_bo_gen);
++   return g ? g : (uint32_t)p_atomic_inc_return(&g_lima_bo_gen);
 +}
 +
  static void
  lima_clear(struct pipe_context *pctx, unsigned buffers,
             uint32_t color_clear_mask, uint8_t stencil_clear_mask,
-@@ -163,6 +173,25 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
+@@ -163,6 +174,25 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
        job = lima_job_get(ctx);
     }
  
@@ -560,7 +562,7 @@ index 176726a..e54a0de 100644
 +         if (new_bo) {
 +            lima_bo_unreference(res->bo);
 +            res->bo = new_bo;
-+            res->bo_gen = ++g_lima_bo_gen;
++            res->bo_gen = lima_next_bo_gen();
 +            ctx->dirty |= LIMA_CONTEXT_DIRTY_TEXTURES;
 +         }
 +      }
@@ -569,7 +571,7 @@ index 176726a..e54a0de 100644
     lima_update_job_wb(ctx, buffers);
  
     /* no need to reload if cleared */
-@@ -203,6 +232,7 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
+@@ -203,6 +233,7 @@ lima_clear(struct pipe_context *pctx, unsigned buffers,
  
     ctx->dirty |= LIMA_CONTEXT_DIRTY_CLEAR;
  
@@ -577,7 +579,7 @@ index 176726a..e54a0de 100644
     lima_damage_rect_union(&job->damage_rect,
                            0, ctx->framebuffer.base.width,
                            0, ctx->framebuffer.base.height);
-@@ -344,10 +374,22 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -344,10 +375,22 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
     struct lima_job *job = lima_job_get(ctx);
     PLBU_CMD_BEGIN(&job->plbu_cmd_array, 32);
  
@@ -604,7 +606,7 @@ index 176726a..e54a0de 100644
  
     if (!info->index_size)
        PLBU_CMD_ARRAYS_SEMAPHORE_BEGIN();
-@@ -376,7 +418,7 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -376,7 +419,7 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
  
     PLBU_CMD_RSW_VERTEX_ARRAY(
        lima_ctx_buff_va(ctx, lima_ctx_buff_pp_plb_rsw),
@@ -613,7 +615,7 @@ index 176726a..e54a0de 100644
  
     /* TODO
      * - we should set it only for the first draw that enabled the scissor and for
-@@ -384,15 +426,29 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -384,15 +427,29 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
      */
  
     assert(cscissor->minx < cscissor->maxx && cscissor->miny < cscissor->maxy);
@@ -646,7 +648,7 @@ index 176726a..e54a0de 100644
  
     if ((info->mode == MESA_PRIM_POINTS && ctx->vs->state.point_size_idx == -1) ||
         ((info->mode >= MESA_PRIM_LINES) && (info->mode < MESA_PRIM_TRIANGLES)))
-@@ -403,9 +459,9 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -403,9 +460,9 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info,
     }
  
     if (info->index_size) {
@@ -658,7 +660,7 @@ index 176726a..e54a0de 100644
  
        PLBU_CMD_INDICES(ctx->index_res->bo->va + draw->start * info->index_size + ctx->index_offset);
     }
-@@ -633,7 +689,43 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+@@ -633,7 +690,43 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
        lima_ctx_buff_alloc(ctx, lima_ctx_buff_pp_plb_rsw,
                            LIMA_RENDER_STATE_LENGTH);
  
@@ -703,7 +705,7 @@ index 176726a..e54a0de 100644
        state.blend_color_b = ctx->blend_color.color[2];
        state.blend_color_g = ctx->blend_color.color[1];
        state.blend_color_r = ctx->blend_color.color[0];
-@@ -730,7 +822,7 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+@@ -730,7 +823,7 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
        }
  
        state.shader_address = ctx->fs->bo->va;
@@ -712,7 +714,7 @@ index 176726a..e54a0de 100644
  
        state.varying_stride = ctx->vs->state.varying_stride;
  
-@@ -781,41 +873,45 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+@@ -781,41 +874,45 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
           state.frag_color_1_register = fs->state.frag_color1_reg;
  
        if (ctx->vs->state.num_varyings) {
@@ -786,7 +788,7 @@ index 176726a..e54a0de 100644
     struct lima_job *job = lima_job_get(ctx);
  
     lima_dump_command_stream_print(
-@@ -840,7 +936,19 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
+@@ -840,7 +937,19 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
        lima_ctx_buff_alloc(ctx, lima_ctx_buff_gp_attribute_info,
                            MAX2(1, ve->num_elements) * 8);
  
@@ -806,7 +808,7 @@ index 176726a..e54a0de 100644
     for (int i = 0; i < ve->num_elements; i++) {
        struct pipe_vertex_element *pve = ve->pipe + i;
  
-@@ -852,13 +960,12 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
+@@ -852,13 +961,12 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
  
        lima_job_add_bo(job, LIMA_PIPE_GP, res->bo, LIMA_SUBMIT_BO_READ);
  
@@ -824,7 +826,7 @@ index 176726a..e54a0de 100644
  
     lima_dump_command_stream_print(
        job->dump, attribute, n * 4, false, "update attribute info at va %x\n",
-@@ -873,25 +980,54 @@ lima_update_gp_uniform(struct lima_context *ctx)
+@@ -873,25 +981,54 @@ lima_update_gp_uniform(struct lima_context *ctx)
     struct lima_vs_compiled_shader *vs = ctx->vs;
     int uniform_size = MIN2(vs->state.uniform_size, ccb->size);
  
@@ -897,7 +899,7 @@ index 176726a..e54a0de 100644
  
     if (lima_debug & LIMA_DEBUG_GP) {
        float *vs_const_buff_f = vs_const_buff;
-@@ -916,24 +1052,49 @@ static void
+@@ -916,24 +1053,49 @@ static void
  lima_update_pp_uniform(struct lima_context *ctx)
  {
     const float *const_buff = ctx->const_buffer[MESA_SHADER_FRAGMENT].buffer;
@@ -960,7 +962,7 @@ index 176726a..e54a0de 100644
  
     lima_dump_command_stream_print(
        job->dump, fp16_const_buff, const_buff_size * 2,
-@@ -958,28 +1119,28 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -958,28 +1120,28 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
        lima_ctx_buff_alloc(ctx, lima_ctx_buff_gp_varying_info,
                            vs->state.num_outputs * 8);
     int n = 0;
@@ -970,23 +972,23 @@ index 176726a..e54a0de 100644
 +         struct lima_varying_info *v = vs->state.varying + i;
  
 -   int offset = 0;
--
--   for (int i = 0; i < vs->state.num_outputs; i++) {
--      struct lima_varying_info *v = vs->state.varying + i;
 +         if (i == vs->state.gl_pos_idx ||
 +             i == vs->state.point_size_idx)
 +            continue;
  
+-   for (int i = 0; i < vs->state.num_outputs; i++) {
+-      struct lima_varying_info *v = vs->state.varying + i;
++         int size = v->component_size * 4;
+ 
 -      if (i == vs->state.gl_pos_idx ||
 -          i == vs->state.point_size_idx)
 -         continue;
-+         int size = v->component_size * 4;
- 
--      int size = v->component_size * 4;
 +         /* does component_size == 2 need to be 16 aligned? */
 +         if (v->component_size == 4)
 +            offset = align(offset, 16);
  
+-      int size = v->component_size * 4;
+-
 -      /* does component_size == 2 need to be 16 aligned? */
 -      if (v->component_size == 4)
 -         offset = align(offset, 16);
@@ -1004,7 +1006,7 @@ index 176726a..e54a0de 100644
     /* gl_Position is always present, allocate space for it */
     gp_output_size = align(4 * 4 * num, 0x40);
  
-@@ -995,33 +1156,52 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
+@@ -995,33 +1157,57 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info,
        gp_output_size += 4 * num;
     }
  
@@ -1017,6 +1019,8 @@ index 176726a..e54a0de 100644
 -   lima_job_add_bo(job, LIMA_PIPE_PP, ctx->gp_output, LIMA_SUBMIT_BO_READ);
 +   /* Suballocate small/medium gp_output (<=32KB, UI quads & 3D meshes up to ~500 verts)
 +    * from ctx->uploader to avoid per-draw BO create/wait/cache_put. */
++   ctx->gp_output = NULL;
++   ctx->gp_output_va = 0;
 +   if (gp_output_size <= 32768 && !job->dump) {
 +      unsigned gp_off = 0;
 +      struct pipe_resource *gp_res = NULL;
@@ -1025,14 +1029,17 @@ index 176726a..e54a0de 100644
 +      u_upload_alloc(ctx->uploader, 0, gp_output_size, 0x40, &gp_off, &gp_res, &gp_rel, &gp_ptr);
 +      if (unlikely(gp_rel))
 +         pipe_resource_reference(&gp_rel, NULL);
-+      struct lima_bo *gp_bo = lima_resource(gp_res)->bo;
-+      ctx->gp_output = NULL;
-+      ctx->gp_output_va = gp_bo->va + gp_off;
-+      lima_job_add_bo(job, LIMA_PIPE_GP, gp_bo, LIMA_SUBMIT_BO_WRITE);
-+      lima_job_add_bo(job, LIMA_PIPE_PP, gp_bo, LIMA_SUBMIT_BO_READ);
-+   } else {
++      if (likely(gp_res && lima_resource(gp_res)->bo)) {
++         struct lima_bo *gp_bo = lima_resource(gp_res)->bo;
++         ctx->gp_output_va = gp_bo->va + gp_off;
++         lima_job_add_bo(job, LIMA_PIPE_GP, gp_bo, LIMA_SUBMIT_BO_WRITE);
++         lima_job_add_bo(job, LIMA_PIPE_PP, gp_bo, LIMA_SUBMIT_BO_READ);
++      }
++   }
++   if (!ctx->gp_output_va) {
 +      ctx->gp_output = lima_bo_create(screen, gp_output_size, 0);
-+      assert(ctx->gp_output);
++      if (unlikely(!ctx->gp_output))
++         return;
 +      ctx->gp_output_va = ctx->gp_output->va;
 +      lima_job_add_bo(job, LIMA_PIPE_GP, ctx->gp_output, LIMA_SUBMIT_BO_WRITE);
 +      lima_job_add_bo(job, LIMA_PIPE_PP, ctx->gp_output, LIMA_SUBMIT_BO_READ);
@@ -1071,7 +1078,16 @@ index 176726a..e54a0de 100644
  
     lima_dump_command_stream_print(
        job->dump, varying, n * 4, false, "update varying info at va %x\n",
-@@ -1114,7 +1294,59 @@ lima_draw_vbo_indexed(struct pipe_context *pctx,
+@@ -1061,6 +1247,8 @@ lima_draw_vbo_update(struct pipe_context *pctx,
+    }
+ 
+    lima_update_varying(ctx, info, draw);
++   if (unlikely(!ctx->gp_output_va))
++      return;
+ 
+    lima_pack_vs_cmd(ctx, info, draw);
+ 
+@@ -1114,7 +1302,59 @@ lima_draw_vbo_indexed(struct pipe_context *pctx,
     }
  
     if (needs_indices) {
@@ -1132,7 +1148,7 @@ index 176726a..e54a0de 100644
        if (!info->has_user_indices)
           pan_minmax_cache_add(ctx->index_res->index_cache, info->index_size,
                                draw->start, draw->count,
-@@ -1183,7 +1415,10 @@ lima_draw_vbo(struct pipe_context *pctx,
+@@ -1183,7 +1423,10 @@ lima_draw_vbo(struct pipe_context *pctx,
        return;
     }
  
@@ -1144,7 +1160,7 @@ index 176726a..e54a0de 100644
     if (lima_is_scissor_zero(ctx))
        return;
  
-@@ -1195,8 +1430,175 @@ lima_draw_vbo(struct pipe_context *pctx,
+@@ -1195,8 +1438,198 @@ lima_draw_vbo(struct pipe_context *pctx,
        return;
  
     struct lima_job *job = lima_job_get(ctx);
@@ -1198,7 +1214,8 @@ index 176726a..e54a0de 100644
 +      float fbw = (float)ctx->framebuffer.base.width;
 +      float fbh = (float)ctx->framebuffer.base.height;
 +      const float *vs_u = (const float *)ctx->const_buffer[MESA_SHADER_VERTEX].buffer;
-+      if (vs_u && ctx->const_buffer[MESA_SHADER_VERTEX].size >= 64 &&
++      if (vs_u && ctx->vs && ctx->vs->state.uniform_size == 64 &&
++          ctx->const_buffer[MESA_SHADER_VERTEX].size >= 64 &&
 +          fbw > 0.0f && fbh > 0.0f &&
 +          fabsf(fabsf(vs_u[0]) - (2.0f / fbw)) < 1e-3f &&
 +          fabsf(fabsf(vs_u[5]) - (2.0f / fbh)) < 1e-3f &&
@@ -1226,27 +1243,34 @@ index 176726a..e54a0de 100644
 +                  idx_ok = true;
 +               } else if (info->index.resource) {
 +                  struct lima_resource *ires = lima_resource(info->index.resource);
-+                  if (ires && ires->bo && ires->bo->map) {
++                  uint64_t need_idx = ((uint64_t)draws[0].start + (uint64_t)draws[0].count) * 2ull;
++                  if (ires && ires->bo && ires->bo->map && need_idx <= (uint64_t)ires->bo->size) {
 +                     idx16 = (const uint16_t *)ires->bo->map + draws[0].start;
 +                     idx_ok = true;
 +                  }
 +               }
 +            }
 +            if (idx_ok && vres && vres->bo && vres->bo->map) {
-+               const uint8_t *vbase = (const uint8_t *)vres->bo->map + vb0->buffer_offset + ve0->src_offset;
-+               uint32_t vlimit = vres->bo->size;
++               const uint8_t *vmap = (const uint8_t *)vres->bo->map;
++               uint64_t vlimit = (uint64_t)vres->bo->size;
++               uint64_t elem_sz = is_vec4 ? 16ull : 8ull;
 +               float dminx = 1e9f, dminy = 1e9f, dmaxx = -1e9f, dmaxy = -1e9f;
++               float vpx[32], vpy[32];
 +               float sx = ctx->viewport.transform.scale[0], tx = ctx->viewport.transform.translate[0];
 +               float sy = ctx->viewport.transform.scale[1], ty = ctx->viewport.transform.translate[1];
 +               ok = true;
 +               for (unsigned k = 0; k < draws[0].count; k++) {
 +                  int vi = idx16 ? ((int)idx16[k] + draws[0].index_bias) : (int)(draws[0].start + k);
-+                  uint32_t off = vb0->buffer_offset + ve0->src_offset + (uint32_t)vi * ve0->src_stride;
-+                  if (vi < 0 || off + (is_vec4 ? 16u : 8u) > vlimit) { ok = false; break; }
-+                  const float *fp = (const float *)(vbase + (uint32_t)vi * ve0->src_stride);
++                  uint64_t off64 = (uint64_t)vb0->buffer_offset + (uint64_t)ve0->src_offset +
++                                   (uint64_t)(uint32_t)vi * (uint64_t)ve0->src_stride;
++                  if (vi < 0 || off64 + elem_sz > vlimit) { ok = false; break; }
++                  float fp[4];
++                  memcpy(fp, vmap + off64, (size_t)elem_sz);
 +                  if (is_vec4 && fabsf(fp[3] - 1.0f) > 1e-3f) { ok = false; break; }
 +                  float px = (fp[0] * vs_u[0] + vs_u[12]) * sx + tx;
 +                  float py = (fp[1] * vs_u[5] + vs_u[13]) * sy + ty;
++                  vpx[k] = px;
++                  vpy[k] = py;
 +                  if (px < dminx) dminx = px;
 +                  if (px > dmaxx) dmaxx = px;
 +                  if (py < dminy) dminy = py;
@@ -1256,7 +1280,22 @@ index 176726a..e54a0de 100644
 +                  struct pipe_scissor_state *cs = &ctx->clipped_scissor;
 +                  /* Record opaque draw #0 coverage so lima_pack_reload_plbu_cmd can skip
 +                   * full or interior-tile reloads (e.g. Home Screen opaque wallpaper). */
-+                  if (check_reload_skip && ctx->blend && ctx->zsa) {
++                  bool quad_ok = false;
++                  if (check_reload_skip && dminx < dmaxx && dminy < dmaxy) {
++                     unsigned cmask = 0;
++                     quad_ok = true;
++                     for (unsigned k = 0; k < draws[0].count; k++) {
++                        int hi_x = fabsf(vpx[k] - dmaxx) < 0.5f;
++                        int lo_x = fabsf(vpx[k] - dminx) < 0.5f;
++                        int hi_y = fabsf(vpy[k] - dmaxy) < 0.5f;
++                        int lo_y = fabsf(vpy[k] - dminy) < 0.5f;
++                        if (!(lo_x || hi_x) || !(lo_y || hi_y)) { quad_ok = false; break; }
++                        cmask |= 1u << ((hi_y ? 2u : 0u) | (hi_x ? 1u : 0u));
++                     }
++                     if (cmask != 0xfu)
++                        quad_ok = false;
++                  }
++                  if (quad_ok && ctx->blend && ctx->zsa) {
 +                     struct pipe_rt_blend_state *rt = ctx->blend->base.rt;
 +                     bool opaque_blend = !rt->blend_enable ||
 +                        (rt->rgb_func == PIPE_BLEND_ADD &&
@@ -1321,7 +1360,7 @@ index 176726a..e54a0de 100644
        job->dump, ctx->vs->bo->map, ctx->vs->state.shader_size, false,
        "add vs at va %x\n", ctx->vs->bo->va);
 diff --git a/src/gallium/drivers/lima/lima_job.c b/src/gallium/drivers/lima/lima_job.c
-index 8e803f7..8994c6a 100644
+index 8e803f7..648c426 100644
 --- a/src/gallium/drivers/lima/lima_job.c
 +++ b/src/gallium/drivers/lima/lima_job.c
 @@ -108,28 +108,47 @@ lima_job_create(struct lima_context *ctx,
@@ -1398,13 +1437,15 @@ index 8e803f7..8994c6a 100644
     s->dump = lima_dump_create();
  
     return s;
-@@ -164,7 +188,13 @@ lima_job_free(struct lima_job *job)
+@@ -164,7 +188,15 @@ lima_job_free(struct lima_job *job)
     lima_dump_free(job->dump);
     job->dump = NULL;
  
 -   /* TODO: do we need a cache for job? */
 +   if (ctx->pp_u_job == job)
 +      ctx->pp_u_job = NULL;
++   if (ctx->gp_u_job == job)
++      ctx->gp_u_job = NULL;
 +   if (ctx->job_pool_cnt < ARRAY_SIZE(ctx->job_pool)) {
 +      ctx->job_pool[ctx->job_pool_cnt++] = job;
 +      return;
@@ -1413,7 +1454,7 @@ index 8e803f7..8994c6a 100644
     ralloc_free(job);
  }
  
-@@ -218,9 +248,16 @@ lima_job_get(struct lima_context *ctx)
+@@ -218,9 +250,16 @@ lima_job_get(struct lima_context *ctx)
  bool lima_job_add_bo(struct lima_job *job, int pipe,
                       struct lima_bo *bo, uint32_t flags)
  {
@@ -1430,7 +1471,7 @@ index 8e803f7..8994c6a 100644
           return true;
        }
     }
-@@ -229,6 +266,8 @@ bool lima_job_add_bo(struct lima_job *job, int pipe,
+@@ -229,6 +268,8 @@ bool lima_job_add_bo(struct lima_job *job, int pipe,
        util_dynarray_grow(job->gem_bos + pipe, struct drm_lima_gem_submit_bo, 1);
     job_bo->handle = bo->handle;
     job_bo->flags = flags;
@@ -1439,7 +1480,7 @@ index 8e803f7..8994c6a 100644
  
     struct lima_bo **jbo = util_dynarray_grow(job->bos + pipe, struct lima_bo *, 1);
     *jbo = bo;
-@@ -287,7 +326,7 @@ lima_job_wait(struct lima_job *job, int pipe, uint64_t timeout_ns)
+@@ -287,7 +328,7 @@ lima_job_wait(struct lima_job *job, int pipe, uint64_t timeout_ns)
  static bool
  lima_job_has_bo(struct lima_job *job, struct lima_bo *bo, bool all)
  {
@@ -1448,7 +1489,7 @@ index 8e803f7..8994c6a 100644
        util_dynarray_foreach(job->gem_bos + i, struct drm_lima_gem_submit_bo, gem_bo) {
           if (bo->handle == gem_bo->handle) {
              if (all || gem_bo->flags & LIMA_SUBMIT_BO_WRITE)
-@@ -310,15 +349,16 @@ lima_job_create_stream_bo(struct lima_job *job, int pipe,
+@@ -310,15 +351,20 @@ lima_job_create_stream_bo(struct lima_job *job, int pipe,
     void *cpu;
     unsigned offset;
     struct pipe_resource *pres = NULL;
@@ -1457,6 +1498,10 @@ index 8e803f7..8994c6a 100644
 +   u_upload_alloc(ctx->uploader, 0, size, 0x40, &offset, &pres, &rel, &cpu);
 +   if (unlikely(rel))
 +      pipe_resource_reference(&rel, NULL);
++   if (unlikely(!pres || !cpu)) {
++      *va = 0;
++      return NULL;
++   }
  
     struct lima_resource *res = lima_resource(pres);
     *va = res->bo->va + offset;
@@ -1468,7 +1513,7 @@ index 8e803f7..8994c6a 100644
     return cpu;
  }
  
-@@ -369,6 +409,8 @@ lima_fb_zsbuf_needs_reload(struct lima_job *job)
+@@ -369,6 +415,8 @@ lima_fb_zsbuf_needs_reload(struct lima_job *job)
     return false;
  }
  
@@ -1477,7 +1522,7 @@ index 8e803f7..8994c6a 100644
  static void
  lima_pack_reload_plbu_cmd(struct lima_job *job, struct pipe_surface *psurf)
  {
-@@ -395,6 +437,43 @@ lima_pack_reload_plbu_cmd(struct lima_job *job, struct pipe_surface *psurf)
+@@ -395,6 +443,43 @@ lima_pack_reload_plbu_cmd(struct lima_job *job, struct pipe_surface *psurf)
                              PIPE_TEX_FILTER_NEAREST, false,
                              (1 << i), i);
        }
@@ -1521,7 +1566,7 @@ index 8e803f7..8994c6a 100644
     } else {
        lima_pack_blit_cmd(job, &job->plbu_cmd_head,
                           psurf, &src, &dst,
-@@ -876,6 +955,16 @@ lima_do_job(struct lima_job *job)
+@@ -876,6 +961,16 @@ lima_do_job(struct lima_job *job)
     #define pp_stack_pp_size 0x400
  
     struct lima_context *ctx = job->ctx;
@@ -1538,7 +1583,7 @@ index 8e803f7..8994c6a 100644
  
     lima_pack_head_plbu_cmd(job);
     lima_finish_plbu_cmd(&job->plbu_cmd_array);
-@@ -883,33 +972,32 @@ lima_do_job(struct lima_job *job)
+@@ -883,33 +978,36 @@ lima_do_job(struct lima_job *job)
     lima_update_job_bo(job);
  
     int vs_cmd_size = job->vs_cmd_array.size;
@@ -1557,6 +1602,8 @@ index 8e803f7..8994c6a 100644
 +      int vs_aligned = align(vs_cmd_size, 0x40);
 +      uint8_t *cmd = lima_job_create_stream_bo(
 +         job, LIMA_PIPE_GP, vs_aligned + plbu_cmd_size, &vs_cmd_va);
++      if (unlikely(!cmd))
++         goto out_free;
 +      memcpy(cmd, util_dynarray_begin(&job->vs_cmd_array), vs_cmd_size);
 +      plbu_cmd_va = vs_cmd_va + vs_aligned;
 +      memcpy(cmd + vs_aligned,
@@ -1568,6 +1615,8 @@ index 8e803f7..8994c6a 100644
 +   } else {
 +      void *plbu_cmd = lima_job_create_stream_bo(
 +         job, LIMA_PIPE_GP, plbu_cmd_size, &plbu_cmd_va);
++      if (unlikely(!plbu_cmd))
++         goto out_free;
 +      memcpy(plbu_cmd,
 +             util_dynarray_begin(&job->plbu_cmd_head),
 +             job->plbu_cmd_head.size);
@@ -1594,8 +1643,11 @@ index 8e803f7..8994c6a 100644
     struct lima_screen *screen = lima_screen(ctx->base.screen);
     struct drm_lima_gp_frame gp_frame;
     struct lima_gp_frame_reg *gp_frame_reg = (void *)gp_frame.frame;
-@@ -1031,6 +1119,10 @@ lima_do_job(struct lima_job *job)
+@@ -1029,8 +1127,13 @@ lima_do_job(struct lima_job *job)
+       res->reload |= (job->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL));
+    }
  
++out_free:
     if (ctx->job == job)
        ctx->job = NULL;
 +   if (ctx->pp_u_job == job)
@@ -1605,7 +1657,7 @@ index 8e803f7..8994c6a 100644
  
     lima_job_free(job);
  }
-@@ -1055,6 +1147,18 @@ lima_flush_job_accessing_bo(
+@@ -1055,6 +1158,18 @@ lima_flush_job_accessing_bo(
     }
  }
  
@@ -1624,7 +1676,7 @@ index 8e803f7..8994c6a 100644
  /*
   * This is for current job flush previous job which write to the resource it wants
   * to read. Tipical usage is flush the FBO which is used as current task's texture.
-@@ -1063,6 +1167,14 @@ void
+@@ -1063,6 +1178,14 @@ void
  lima_flush_previous_job_writing_resource(
     struct lima_context *ctx, struct pipe_resource *prsc)
  {
@@ -1883,7 +1935,7 @@ index 1c61519..823feba 100644
     uint32_t mrt_pitch;
     bool tiled;
 diff --git a/src/gallium/drivers/lima/lima_screen.c b/src/gallium/drivers/lima/lima_screen.c
-index ebb9c18..0695ebf 100644
+index ebb9c18..cfb07d8 100644
 --- a/src/gallium/drivers/lima/lima_screen.c
 +++ b/src/gallium/drivers/lima/lima_screen.c
 @@ -153,7 +153,7 @@ lima_init_screen_caps(struct pipe_screen *screen)
@@ -1895,8 +1947,28 @@ index ebb9c18..0695ebf 100644
     caps->surface_sample_count = true;
  
     /* not clear supported */
+@@ -624,6 +624,7 @@ lima_screen_create(int fd, const struct pipe_screen_config *config,
+    };
+    memcpy(lima_bo_map(screen->pp_buffer) + pp_reload_program_offset,
+           pp_reload_program, sizeof(pp_reload_program));
++   screen->reload_first_instr_len = pp_reload_program[0] & 0x1f;
+ 
+    /* 0/1/2 vertex index for reload/clear draw */
+    static const uint8_t pp_shared_index[] = { 0, 1, 2 };
+diff --git a/src/gallium/drivers/lima/lima_screen.h b/src/gallium/drivers/lima/lima_screen.h
+index 5f76edd..05b752c 100644
+--- a/src/gallium/drivers/lima/lima_screen.h
++++ b/src/gallium/drivers/lima/lima_screen.h
+@@ -87,6 +87,7 @@ struct lima_screen {
+    struct ra_regs *pp_ra;
+ 
+    struct lima_bo *pp_buffer;
++   uint32_t reload_first_instr_len;
+    #define pp_frame_rsw_offset       0x0000
+    #define pp_clear_program_offset   0x0040
+    #define pp_reload_program_offset  0x0080
 diff --git a/src/gallium/drivers/lima/lima_state.c b/src/gallium/drivers/lima/lima_state.c
-index 9936557..49f8b07 100644
+index 9936557..14d68c2 100644
 --- a/src/gallium/drivers/lima/lima_state.c
 +++ b/src/gallium/drivers/lima/lima_state.c
 @@ -50,6 +50,20 @@ lima_set_framebuffer_state(struct pipe_context *pctx,
@@ -1983,17 +2055,20 @@ index 9936557..49f8b07 100644
     ctx->stencil_ref = stencil_ref;
     ctx->dirty |= LIMA_CONTEXT_DIRTY_STENCIL_REF;
  }
-@@ -294,7 +322,9 @@ lima_create_sampler_state(struct pipe_context *pctx,
+@@ -294,7 +322,12 @@ lima_create_sampler_state(struct pipe_context *pctx,
     if (!so)
        return NULL;
  
-+   static uint32_t g_lima_sampler_id = 1;
++   static int g_lima_sampler_id = 1;
     memcpy(so, cso, sizeof(*cso));
-+   so->id = ++g_lima_sampler_id;
++   uint32_t sid = (uint32_t)p_atomic_inc_return(&g_lima_sampler_id);
++   if (!sid)
++      sid = (uint32_t)p_atomic_inc_return(&g_lima_sampler_id);
++   so->id = sid;
  
     return so;
  }
-@@ -314,21 +344,30 @@ lima_sampler_states_bind(struct pipe_context *pctx,
+@@ -314,21 +347,30 @@ lima_sampler_states_bind(struct pipe_context *pctx,
     struct lima_texture_stateobj *lima_tex = &ctx->tex_stateobj;
     unsigned i;
     unsigned new_nr = 0;
@@ -2028,7 +2103,7 @@ index 9936557..49f8b07 100644
  }
  
  static struct pipe_sampler_view *
-@@ -377,6 +416,7 @@ lima_set_sampler_views(struct pipe_context *pctx,
+@@ -377,6 +419,7 @@ lima_set_sampler_views(struct pipe_context *pctx,
     struct lima_texture_stateobj *lima_tex = &ctx->tex_stateobj;
     int i;
     unsigned new_nr = 0;
@@ -2036,7 +2111,7 @@ index 9936557..49f8b07 100644
  
     assert(start == 0);
  
-@@ -384,15 +424,23 @@ lima_set_sampler_views(struct pipe_context *pctx,
+@@ -384,15 +427,23 @@ lima_set_sampler_views(struct pipe_context *pctx,
        if (views[i])
           new_nr = i + 1;
  
@@ -2064,7 +2139,7 @@ index 9936557..49f8b07 100644
  }
  
  static void
-@@ -400,7 +448,10 @@ lima_set_sample_mask(struct pipe_context *pctx,
+@@ -400,7 +451,10 @@ lima_set_sample_mask(struct pipe_context *pctx,
                       unsigned sample_mask)
  {
     struct lima_context *ctx = lima_context(pctx);
@@ -2200,7 +2275,7 @@ index 489dcf1..5ebce8c 100644
     lima_dump_command_stream_print(
        job->dump, descs, size, false, "add textures_desc at va %x\n",
 diff --git a/src/mesa/glapi/glapi/glapi.h b/src/mesa/glapi/glapi/glapi.h
-index 14575cc..6a49758 100644
+index 14575cc..c9e263d 100644
 --- a/src/mesa/glapi/glapi/glapi.h
 +++ b/src/mesa/glapi/glapi/glapi.h
 @@ -44,6 +44,7 @@
@@ -2211,7 +2286,7 @@ index 14575cc..6a49758 100644
  #include "util/macros.h"
  #include "util/u_thread.h"
  #include "util/detect_os.h"
-@@ -72,7 +73,31 @@ struct _glapi_table;
+@@ -72,7 +73,39 @@ struct _glapi_table;
  _GLAPI_EXPORT extern __THREAD_INITIAL_EXEC struct _glapi_table * _mesa_glapi_tls_Dispatch;
  _GLAPI_EXPORT extern __THREAD_INITIAL_EXEC void * _mesa_glapi_tls_Context;
  
@@ -2225,8 +2300,12 @@ index 14575cc..6a49758 100644
 +{
 +   uintptr_t t;
 +   __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(t));
-+   if (__builtin_expect(t == _mesa_glapi_fast_tid && _mesa_glapi_fast_ctx != NULL, 1))
-+      return _mesa_glapi_fast_ctx;
++   uintptr_t ft = __atomic_load_n(&_mesa_glapi_fast_tid, __ATOMIC_ACQUIRE);
++   if (__builtin_expect(t == ft, 1)) {
++      void *c = __atomic_load_n(&_mesa_glapi_fast_ctx, __ATOMIC_ACQUIRE);
++      if (__builtin_expect(c != NULL && __atomic_load_n(&_mesa_glapi_fast_tid, __ATOMIC_ACQUIRE) == t, 1))
++         return c;
++   }
 +   return _mesa_glapi_tls_Context;
 +}
 +
@@ -2234,8 +2313,12 @@ index 14575cc..6a49758 100644
 +{
 +   uintptr_t t;
 +   __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(t));
-+   if (__builtin_expect(t == _mesa_glapi_fast_tid && _mesa_glapi_fast_disp != NULL, 1))
-+      return _mesa_glapi_fast_disp;
++   uintptr_t ft = __atomic_load_n(&_mesa_glapi_fast_tid, __ATOMIC_ACQUIRE);
++   if (__builtin_expect(t == ft, 1)) {
++      struct _glapi_table *d = __atomic_load_n(&_mesa_glapi_fast_disp, __ATOMIC_ACQUIRE);
++      if (__builtin_expect(d != NULL && __atomic_load_n(&_mesa_glapi_fast_tid, __ATOMIC_ACQUIRE) == t, 1))
++         return d;
++   }
 +   return _mesa_glapi_tls_Dispatch;
 +}
 +# define GET_DISPATCH() _mesa_glapi_inline_disp()
@@ -2245,10 +2328,10 @@ index 14575cc..6a49758 100644
  # define GET_CURRENT_CONTEXT(C)  struct gl_context *C = (struct gl_context *) _mesa_glapi_get_context()
  #else
 diff --git a/src/mesa/glapi/shared-glapi/core.c b/src/mesa/glapi/shared-glapi/core.c
-index 04a0caa..1cc453a 100644
+index 04a0caa..8b9db28 100644
 --- a/src/mesa/glapi/shared-glapi/core.c
 +++ b/src/mesa/glapi/shared-glapi/core.c
-@@ -152,6 +152,20 @@ __THREAD_INITIAL_EXEC struct _glapi_table *_mesa_glapi_tls_Dispatch
+@@ -152,6 +152,32 @@ __THREAD_INITIAL_EXEC struct _glapi_table *_mesa_glapi_tls_Dispatch
     = (struct _glapi_table *)table_noop_array;
  __THREAD_INITIAL_EXEC void *_mesa_glapi_tls_Context;
  
@@ -2257,6 +2340,18 @@ index 04a0caa..1cc453a 100644
 +struct _glapi_table *_mesa_glapi_fast_disp = NULL;
 +uintptr_t _mesa_glapi_fast_tid = 0;
 +static int _mesa_glapi_multi_tid = 0;
++static volatile int _mesa_glapi_fast_lock = 0;
++
++static inline void _mesa_glapi_spin_lock(void)
++{
++   while (__atomic_test_and_set(&_mesa_glapi_fast_lock, __ATOMIC_ACQUIRE))
++      __asm__ volatile("yield" ::: "memory");
++}
++
++static inline void _mesa_glapi_spin_unlock(void)
++{
++   __atomic_clear(&_mesa_glapi_fast_lock, __ATOMIC_RELEASE);
++}
 +
 +static inline uintptr_t _mesa_glapi_cur_tid(void)
 +{
@@ -2269,28 +2364,38 @@ index 04a0caa..1cc453a 100644
  static int
  stub_compare(const void *key, const void *elem)
  {
-@@ -239,6 +253,20 @@ void
+@@ -239,6 +265,30 @@ void
  _mesa_glapi_set_context(void *ptr)
  {
     _mesa_glapi_tls_Context = ptr;
 +#if defined(__arm__) && defined(__APPLE__)
-+   if (!_mesa_glapi_multi_tid) {
-+      uintptr_t tid = _mesa_glapi_cur_tid();
-+      if (_mesa_glapi_fast_tid == 0 || _mesa_glapi_fast_tid == tid) {
-+         _mesa_glapi_fast_ctx = ptr;
-+         _mesa_glapi_fast_tid = ptr ? tid : 0;
-+      } else if (ptr != NULL) {
-+         _mesa_glapi_multi_tid = 1;
-+         _mesa_glapi_fast_tid = 0;
-+         _mesa_glapi_fast_ctx = NULL;
-+         _mesa_glapi_fast_disp = NULL;
++   if (!__atomic_load_n(&_mesa_glapi_multi_tid, __ATOMIC_ACQUIRE)) {
++      _mesa_glapi_spin_lock();
++      if (!_mesa_glapi_multi_tid) {
++         uintptr_t tid = _mesa_glapi_cur_tid();
++         if (_mesa_glapi_fast_tid == 0 || _mesa_glapi_fast_tid == tid) {
++            if (ptr) {
++               __atomic_store_n(&_mesa_glapi_fast_ctx, ptr, __ATOMIC_RELEASE);
++               __atomic_store_n(&_mesa_glapi_fast_tid, tid, __ATOMIC_RELEASE);
++            } else {
++               __atomic_store_n(&_mesa_glapi_fast_tid, (uintptr_t)0, __ATOMIC_RELEASE);
++               __atomic_store_n(&_mesa_glapi_fast_ctx, (void *)NULL, __ATOMIC_RELEASE);
++               __atomic_store_n(&_mesa_glapi_fast_disp, (struct _glapi_table *)NULL, __ATOMIC_RELEASE);
++            }
++         } else if (ptr != NULL) {
++            __atomic_store_n(&_mesa_glapi_multi_tid, 1, __ATOMIC_RELEASE);
++            __atomic_store_n(&_mesa_glapi_fast_tid, (uintptr_t)0, __ATOMIC_RELEASE);
++            __atomic_store_n(&_mesa_glapi_fast_ctx, (void *)NULL, __ATOMIC_RELEASE);
++            __atomic_store_n(&_mesa_glapi_fast_disp, (struct _glapi_table *)NULL, __ATOMIC_RELEASE);
++         }
 +      }
++      _mesa_glapi_spin_unlock();
 +   }
 +#endif
  }
  
  /**
-@@ -263,8 +291,12 @@ _mesa_glapi_set_dispatch(struct _glapi_table *tbl)
+@@ -263,8 +313,16 @@ _mesa_glapi_set_dispatch(struct _glapi_table *tbl)
     static once_flag flag = ONCE_FLAG_INIT;
     call_once(&flag, entry_patch_public);
  
@@ -2299,8 +2404,12 @@ index 04a0caa..1cc453a 100644
 +   struct _glapi_table *d = tbl ? tbl : (struct _glapi_table *)table_noop_array;
 +   _mesa_glapi_tls_Dispatch = d;
 +#if defined(__arm__) && defined(__APPLE__)
-+   if (!_mesa_glapi_multi_tid && _mesa_glapi_fast_tid == _mesa_glapi_cur_tid())
-+      _mesa_glapi_fast_disp = d;
++   if (!__atomic_load_n(&_mesa_glapi_multi_tid, __ATOMIC_ACQUIRE)) {
++      _mesa_glapi_spin_lock();
++      if (!_mesa_glapi_multi_tid && _mesa_glapi_fast_tid == _mesa_glapi_cur_tid())
++         __atomic_store_n(&_mesa_glapi_fast_disp, d, __ATOMIC_RELEASE);
++      _mesa_glapi_spin_unlock();
++   }
 +#endif
  }
  

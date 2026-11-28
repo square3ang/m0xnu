@@ -3,18 +3,11 @@
 
 usage: fbdump.py out.png [rows]    (default: all 1280 rows; ~2 ms per 16 bytes)
 """
-import re, subprocess, sys
+import sys
 from PIL import Image
+from fbmem import mem_words as mem
 
 FB, W, H = 0x60000000, 720, 1280
-
-
-def mem(addr):
-    out = subprocess.run(["fastboot", "getvar", f"mem:{addr:#x}"], capture_output=True, text=True, timeout=5)
-    m = re.search(r"mem:0x[0-9a-f]+: ((?:[0-9a-f]{8} ?){4})", out.stdout + out.stderr)
-    if not m:
-        sys.exit(f"read {addr:#x} failed: {out.stderr.strip()}")
-    return [int(w, 16) for w in m.group(1).split()]
 
 
 def main():
@@ -30,4 +23,5 @@ def main():
     img.save(sys.argv[1])
 
 
-main()
+if __name__ == "__main__":
+    main()

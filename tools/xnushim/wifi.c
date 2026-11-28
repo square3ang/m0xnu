@@ -86,6 +86,7 @@ extern uintptr_t gpio_r_va;
 #define WIFI_OP_FW_WRITE    2u
 #define WIFI_OP_NVRAM_BOOT  3u
 #define WIFI_OP_CDC_CMD     4u
+#define WIFI_OP_NVRAM_WRITE 5u
 
 struct exy_wifi_status {
     uint32_t probed;
@@ -124,11 +125,14 @@ static uint16_t w_cdc_id;
 static void *w_en0;
 static int w_rx_started;
 static volatile int w_busy;
+static volatile int w_state_busy;
 
-static uint8_t w_tx_buf[2056] __attribute__((aligned(4)));
-static uint8_t w_rx_buf[2056] __attribute__((aligned(4)));
+static uint8_t w_tx_buf[2560] __attribute__((aligned(4)));
+static uint8_t w_rx_buf[2560] __attribute__((aligned(4)));
 static uint8_t w_cdc_pkt[2048] __attribute__((aligned(4)));
 static uint8_t w_ctl_rsp[2048];
+static uint8_t w_nvram_buf[2048];
+static uint32_t w_nvram_len;
 static volatile uint32_t w_ctl_rsp_len;
 static volatile uint32_t w_ctl_status;
 static volatile uint16_t w_ctl_wait_id;
@@ -172,13 +176,20 @@ static uint32_t w_assoc_len;
 static volatile int      w_wpa_active;
 static volatile int      w_wpa_done;
 static volatile int      w_assoc_fail;
+static int               w_wpa_m1_seen;
+static int               w_wpa_replay_valid;
+static uint8_t           w_wpa_anonce[32];
+static uint8_t           w_wpa_replay[8];
+static uint8_t           w_wpa_bssid[6];
 static uint8_t           w_wpa_pmk[32];
 static uint8_t           w_wpa_ptk[48];
 static uint8_t           w_wpa_snonce[32];
 static uint8_t           w_wpa_rsnie[32];
 static uint32_t          w_wpa_rsnie_len;
-static uint8_t           w_wpa_eapol_rx[512];
-static volatile uint32_t w_wpa_eapol_len;
+static uint8_t           w_wpa_eapol_q[2][512];
+static uint32_t          w_wpa_eapol_qlen[2];
+static volatile uint32_t w_wpa_eapol_head;
+static volatile uint32_t w_wpa_eapol_tail;
 static uint32_t          w_wpa_nonce_ctr;
 
 static inline uint32_t wrd(uintptr_t a) { return *(volatile uint32_t *)a; }
@@ -207,6 +218,25 @@ static void w_lock(void)
 static void w_unlock(void)
 {
     __sync_lock_release(&w_busy);
+}
+
+static void w_state_lock(void)
+{
+    while (__sync_lock_test_and_set(&w_state_busy, 1))
+        __asm__ volatile("yield" ::: "memory");
+}
+
+static void w_state_unlock(void)
+{
+    __sync_lock_release(&w_state_busy);
+}
+
+static void sd3_reset_cmd_dat(void)
+{
+    wwr(w_sd3 + 0x2cu, wrd(w_sd3 + 0x2cu) | (0x06u << 24)); /* SW_RST_CMD | SW_RST_DAT */
+    for (uint32_t i = 0; i < 1000u && (wrd(w_sd3 + 0x2cu) & (0x06u << 24)); i++)
+        w_udelay(5);
+    wwr(w_sd3 + 0x30u, 0xffffffffu);
 }
 
 /* --- Exynos 4412 SDHCI3 low-level CMD / CMD52 / CMD53 ---------------------- */
@@ -270,11 +300,16 @@ static int sdio_cmd53_chunk(uint32_t func, uint32_t addr, uint8_t *buf, uint32_t
     /* CMD53: data present (bit 5 = 0x20) + R5 (0x1a) = 0x3a */
     wwr(w_sd3 + 0x0cu, (((53u << 8) | 0x3au) << 16) | trn);
 
+    uint32_t cmd_done = 0u;
     for (uint32_t i = 0; i < 6000u; i++) {
         uint32_t st = wrd(w_sd3 + 0x30u);
-        if (st & (1u << 15)) { wwr(w_sd3 + 0x30u, st); return -1; }
-        if (st & 1u) { wwr(w_sd3 + 0x30u, 1u); break; }
+        if (st & (1u << 15)) { wwr(w_sd3 + 0x30u, st); sd3_reset_cmd_dat(); return -1; }
+        if (st & 1u) { wwr(w_sd3 + 0x30u, 1u); cmd_done = 1u; break; }
         w_udelay(5);
+    }
+    if (!cmd_done) {
+        sd3_reset_cmd_dat();
+        return -1;
     }
 
     uint32_t rem = len;
@@ -284,14 +319,14 @@ static int sdio_cmd53_chunk(uint32_t func, uint32_t addr, uint8_t *buf, uint32_t
         uint32_t waited = 0u;
         for (; waited < 10000u; waited++) {
             uint32_t st = wrd(w_sd3 + 0x30u);
-            if (st & (1u << 15)) { wwr(w_sd3 + 0x30u, st); return -2; }
+            if (st & (1u << 15)) { wwr(w_sd3 + 0x30u, st); sd3_reset_cmd_dat(); return -2; }
             if (st & want_bit) {
                 wwr(w_sd3 + 0x30u, want_bit);
                 break;
             }
             w_udelay(2);
         }
-        if (waited >= 10000u) return -3;
+        if (waited >= 10000u) { sd3_reset_cmd_dat(); return -3; }
         uint32_t chunk = (rem > bsz) ? bsz : rem;
         uint32_t words = (chunk + 3u) >> 2;
         if (write) {
@@ -315,10 +350,11 @@ static int sdio_cmd53_chunk(uint32_t func, uint32_t addr, uint8_t *buf, uint32_t
 
     for (uint32_t i = 0; i < 10000u; i++) {
         uint32_t st = wrd(w_sd3 + 0x30u);
-        if (st & (1u << 15)) { wwr(w_sd3 + 0x30u, st); return -(int)((st >> 16) | 0x4000u); }
+        if (st & (1u << 15)) { wwr(w_sd3 + 0x30u, st); sd3_reset_cmd_dat(); return -(int)((st >> 16) | 0x4000u); }
         if (st & 2u) { wwr(w_sd3 + 0x30u, 2u); return 0; } /* XFER_COMPLETE */
         w_udelay(2);
     }
+    sd3_reset_cmd_dat();
     return -5;
 }
 
@@ -611,7 +647,8 @@ static int sdpcm_tx_frame(uint8_t chan, const uint8_t *payload, uint32_t plen)
     /* Send on Function 2 (FIFO addr 0x8000, non-incrementing) */
     if (padded >= 512u) {
         uint32_t blks = (padded + 511u) & ~511u;
-        if (blks > sizeof(w_tx_buf)) blks = sizeof(w_tx_buf);
+        if (blks > sizeof(w_tx_buf))
+            return -1;
         for (uint32_t i = padded; i < blks; i++) w_tx_buf[i] = 0u;
         return sdio_cmd53_chunk(2u, 0x8000u, w_tx_buf, blks, 1, 0, 1, 512u);
     }
@@ -651,13 +688,22 @@ static int sdpcm_poll_rx_once(void)
         return 0;
     uint16_t len = (uint16_t)hdr[0] | ((uint16_t)hdr[1] << 8);
     uint16_t chk = (uint16_t)hdr[2] | ((uint16_t)hdr[3] << 8);
-    if (len < 12u || len > sizeof(w_rx_buf) || (uint16_t)(len ^ chk) != 0xffffu)
+    if (len < 12u || (uint16_t)(len ^ chk) != 0xffffu)
         return 0;
-    w_rx_buf[0] = hdr[0]; w_rx_buf[1] = hdr[1]; w_rx_buf[2] = hdr[2]; w_rx_buf[3] = hdr[3];
     uint32_t rem = ((uint32_t)len - 4u + 3u) & ~3u;
     uint32_t rd_len = (rem > 512u) ? ((rem + 511u) & ~511u) : rem;
-    if (rd_len + 4u > sizeof(w_rx_buf))
-        return 0;
+    if (rd_len + 4u > sizeof(w_rx_buf)) {
+        /* Drain oversized SDPCM payload in 512 B chunks so the F2 FIFO never desyncs. */
+        while (rem > 0u) {
+            uint32_t d = (rem >= 512u) ? 512u : rem;
+            int blk = (d == 512u) ? 1 : 0;
+            if (sdio_cmd53_chunk(2u, 0x8000u, w_rx_buf, d, 0, 0, blk, blk ? 512u : d) != 0)
+                break;
+            rem -= d;
+        }
+        return 1;
+    }
+    w_rx_buf[0] = hdr[0]; w_rx_buf[1] = hdr[1]; w_rx_buf[2] = hdr[2]; w_rx_buf[3] = hdr[3];
     int blk = (rd_len >= 512u) ? 1 : 0;
     if (sdio_cmd53_chunk(2u, 0x8000u, w_rx_buf + 4u, rd_len, 0, 0, blk, blk ? 512u : rd_len) != 0)
         return 0;
@@ -688,9 +734,16 @@ static int sdpcm_poll_rx_once(void)
             const uint8_t *eth = pl + bdc_off;
             uint32_t elen = plen - bdc_off;
             if (w_wpa_active && elen >= 14u && eth[12] == 0x88u && eth[13] == 0x8eu) {
-                if (!w_wpa_eapol_len && elen <= sizeof(w_wpa_eapol_rx)) {
-                    for (uint32_t i = 0u; i < elen; i++) w_wpa_eapol_rx[i] = eth[i];
-                    w_wpa_eapol_len = elen;
+                if (elen <= sizeof(w_wpa_eapol_q[0])) {
+                    w_state_lock();
+                    if ((uint32_t)(w_wpa_eapol_head - w_wpa_eapol_tail) < 2u) {
+                        uint32_t slot = w_wpa_eapol_head & 1u;
+                        for (uint32_t i = 0u; i < elen; i++) w_wpa_eapol_q[slot][i] = eth[i];
+                        w_wpa_eapol_qlen[slot] = elen;
+                        __asm__ volatile("dmb ish" ::: "memory");
+                        w_wpa_eapol_head++;
+                    }
+                    w_state_unlock();
                 }
             } else {
                 wifi_deliver_rx_eth(eth, elen);
@@ -734,7 +787,7 @@ static int sdpcm_poll_rx_once(void)
     return 1;
 }
 
-static int bcm_cdc_cmd(uint32_t cmd, int is_set, uint8_t *buf, uint32_t len, uint32_t *out_len)
+static int bcm_cdc_cmd(uint32_t cmd, int is_set, uint8_t *buf, uint32_t len, uint32_t *out_len, uint32_t *out_status)
 {
     if (!w_st.f2_ready || len > 2000u)
         return -1;
@@ -753,6 +806,7 @@ static int bcm_cdc_cmd(uint32_t cmd, int is_set, uint8_t *buf, uint32_t len, uin
 
     w_ctl_wait_id = id;
     w_ctl_got = 0;
+    w_ctl_status = 0xffffffffu;
     int rc = sdpcm_tx_frame(SDPCM_CH_CTRL, w_cdc_pkt, 16u + len);
     if (rc == 0) {
         for (int tries = 0; tries < 250 && !w_ctl_got; tries++) {
@@ -762,11 +816,14 @@ static int bcm_cdc_cmd(uint32_t cmd, int is_set, uint8_t *buf, uint32_t len, uin
     }
     int got = w_ctl_got;
     uint32_t rlen = w_ctl_rsp_len;
+    uint32_t cstat = w_ctl_status;
     if (got && out_len) {
         uint32_t cpy = (rlen < *out_len) ? rlen : *out_len;
         for (uint32_t i = 0; i < cpy; i++) buf[i] = w_ctl_rsp[i];
         *out_len = cpy;
     }
+    if (out_status)
+        *out_status = got ? cstat : 0xffffffffu;
     w_unlock();
     return (rc == 0 && got) ? 0 : -2;
 }
@@ -941,7 +998,7 @@ static uint32_t wifi_do_scan(int post_event)
         sp[65u + c * 2u] = 0x10u;
     }
     uint32_t sl = sizeof(sp);
-    if (bcm_cdc_cmd(50u /* WLC_SCAN */, 1, sp, sizeof(sp), &sl) != 0)
+    if (bcm_cdc_cmd(50u /* WLC_SCAN */, 1, sp, sizeof(sp), &sl, 0) != 0)
         return 0u;
 
     static uint8_t sres[2000];
@@ -952,19 +1009,20 @@ static uint32_t wifi_do_scan(int post_event)
         sres[0] = (uint8_t)(sizeof(sres) & 0xffu);
         sres[1] = (uint8_t)(sizeof(sres) >> 8);
         srl = sizeof(sres);
-        if (bcm_cdc_cmd(51u /* WLC_SCAN_RESULTS */, 0, sres, sizeof(sres), &srl) == 0 && srl > 12u) {
+        if (bcm_cdc_cmd(51u /* WLC_SCAN_RESULTS */, 0, sres, sizeof(sres), &srl, 0) == 0 && srl > 12u) {
             cnt = (uint32_t)sres[8] | ((uint32_t)sres[9] << 8) |
                   ((uint32_t)sres[10] << 16) | ((uint32_t)sres[11] << 24);
             if (cnt > 0u) break;
         }
     }
+    w_state_lock();
     w_ap_cnt = 0u;
     w_ap_idx = 0u;
     uint32_t pos = 12u;
-    for (uint32_t k = 0u; k < cnt && w_ap_cnt < WIFI_MAX_APS && pos + 84u <= srl; k++) {
+    for (uint32_t k = 0u; k < cnt && w_ap_cnt < WIFI_MAX_APS && pos <= srl && srl - pos >= 84u; k++) {
         uint32_t blen = (uint32_t)sres[pos + 4u] | ((uint32_t)sres[pos + 5u] << 8) |
                         ((uint32_t)sres[pos + 6u] << 16) | ((uint32_t)sres[pos + 7u] << 24);
-        if (blen < 84u || pos + blen > srl) break;
+        if (blen < 84u || blen > srl - pos) break;
         struct wifi_ap_entry *ap = &w_aps[w_ap_cnt];
         for (int i = 0; i < 6; i++) ap->bssid[i] = sres[pos + 8u + i];
         ap->beacon_int = (uint16_t)sres[pos + 14u] | ((uint16_t)sres[pos + 15u] << 8);
@@ -984,13 +1042,13 @@ static uint32_t wifi_do_scan(int post_event)
             uint32_t iel = (uint32_t)sres[pos + 120u] | ((uint32_t)sres[pos + 121u] << 8) |
                            ((uint32_t)sres[pos + 122u] << 16) | ((uint32_t)sres[pos + 123u] << 24);
             if (ieo >= 84u && ieo < blen && iel > 0u) {
-                if (ieo + iel > blen) iel = blen - ieo;
+                if (iel > blen - ieo) iel = blen - ieo;
                 if (iel > sizeof(ap->ies)) iel = sizeof(ap->ies);
                 /* Trim on whole 802.11 IE TLV boundaries so wifid's IE parser never drops the AP. */
                 uint32_t valid_ie = 0u;
                 while (valid_ie + 2u <= iel) {
                     uint32_t elen = 2u + (uint32_t)sres[pos + ieo + valid_ie + 1u];
-                    if (valid_ie + elen > iel) break;
+                    if (elen > iel - valid_ie) break;
                     valid_ie += elen;
                 }
                 for (uint32_t j = 0u; j < valid_ie; j++) ap->ies[j] = sres[pos + ieo + j];
@@ -998,10 +1056,13 @@ static uint32_t wifi_do_scan(int post_event)
             }
         }
         w_ap_cnt++;
-        pos += (blen + 3u) & ~3u;
+        uint32_t step = (blen + 3u) & ~3u;
+        if (step < blen || step > srl - pos) break;
+        pos += step;
     }
-    w_puts("[WIFI-SCAN] aps="); w_putx(w_ap_cnt);
-    for (uint32_t k = 0u; k < w_ap_cnt && k < 8u; k++) {
+    uint32_t found = w_ap_cnt;
+    w_puts("[WIFI-SCAN] aps="); w_putx(found);
+    for (uint32_t k = 0u; k < found && k < 8u; k++) {
         extern void exy_putc(char);
         w_puts(" [");
         for (uint8_t j = 0u; j < w_aps[k].ssid_len; j++) {
@@ -1019,9 +1080,10 @@ static uint32_t wifi_do_scan(int post_event)
         w_puts("]");
     }
     w_puts("\n");
+    w_state_unlock();
     if (post_event)
         wifi_post_80211_event(10u /* APPLE80211_M_SCAN_DONE */, 0, 0u);
-    return w_ap_cnt;
+    return found;
 }
 
 static void wifi_post_dl_event(uint32_t code)
@@ -1124,17 +1186,16 @@ static int wifi_install_key(uint32_t idx, uint32_t algo, uint32_t flags,
     *(uint32_t *)(wk + 116u) = flags; /* 2=WL_PRIMARY_KEY */
     if (ea)
         for (int i = 0; i < 6; i++) wk[156u + i] = ea[i];
-    uint32_t l = sizeof(wk);
-    int rc = bcm_cdc_cmd(45u /* WLC_SET_KEY */, 1, wk, sizeof(wk), &l);
-    uint32_t st = w_ctl_status;
+    uint32_t l = sizeof(wk), st = 0xffffffffu;
+    int rc = bcm_cdc_cmd(45u /* WLC_SET_KEY */, 1, wk, sizeof(wk), &l, &st);
     if (rc != 0 || st != 0u) {
         static const char k_wk[] = "wsec_key";
         uint8_t iv[9 + 164];
         for (unsigned i = 0; i < 9u; i++) iv[i] = (uint8_t)k_wk[i];
         for (unsigned i = 0; i < 164u; i++) iv[9u + i] = wk[i];
-        uint32_t ivl = sizeof(iv);
-        rc = bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, iv, sizeof(iv), &ivl);
-        st = (st << 16) | (w_ctl_status & 0xffffu);
+        uint32_t ivl = sizeof(iv), st2 = 0xffffffffu;
+        rc = bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, iv, sizeof(iv), &ivl, &st2);
+        st = (st << 16) | (st2 & 0xffffu);
     }
     w_puts("[WIFI-KEY] i="); w_putx(idx); w_puts(" a="); w_putx(algo);
     w_puts(" l="); w_putx(klen); w_puts(" st="); w_putx(st); w_puts("\n");
@@ -1155,121 +1216,171 @@ static void wifi_send_eapol(const uint8_t dst[6], const uint8_t *eapol, uint32_t
     w_unlock();
 }
 
+static int wpa_mac_nonzero(const uint8_t a[6])
+{
+    return (a[0] | a[1] | a[2] | a[3] | a[4] | a[5]) != 0u;
+}
+
+static int wpa_bytes_eq(const uint8_t *a, const uint8_t *b, uint32_t n)
+{
+    uint8_t diff = 0u;
+    for (uint32_t i = 0u; i < n; i++)
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0u;
+}
+
+static int wpa_replay_gt(const uint8_t a[8], const uint8_t b[8])
+{
+    for (int i = 0; i < 8; i++) {
+        if (a[i] != b[i])
+            return a[i] > b[i];
+    }
+    return 0;
+}
+
 static void wifi_process_eapol(void)
 {
-    uint32_t elen = w_wpa_eapol_len;
-    if (!elen) return;
-    uint8_t pkt[512];
-    if (elen > sizeof(pkt)) elen = sizeof(pkt);
-    for (uint32_t i = 0u; i < elen; i++) pkt[i] = w_wpa_eapol_rx[i];
-    w_wpa_eapol_len = 0u;
+    for (;;) {
+        uint8_t pkt[512];
+        uint32_t elen = 0u;
+        w_state_lock();
+        if (w_wpa_eapol_tail != w_wpa_eapol_head) {
+            uint32_t slot = w_wpa_eapol_tail & 1u;
+            elen = w_wpa_eapol_qlen[slot];
+            if (elen > sizeof(pkt)) elen = sizeof(pkt);
+            for (uint32_t i = 0u; i < elen; i++) pkt[i] = w_wpa_eapol_q[slot][i];
+            w_wpa_eapol_tail++;
+        }
+        w_state_unlock();
+        if (!elen)
+            return;
 
-    if (!w_wpa_active || elen < 14u + 99u)
-        return;
-    const uint8_t *src = pkt + 6;
-    const uint8_t *ep  = pkt + 14; /* EAPOL header: ver(1), type(1), len(2), desc_type(1), key_info(2)... */
-    uint32_t ep_avail = elen - 14u;
-    if (ep[1] != 3u /* EAPOL-Key */)
-        return;
-    uint16_t body_len = ((uint16_t)ep[2] << 8) | ep[3];
-    uint32_t ep_len = 4u + (uint32_t)body_len;
-    if (ep_len > ep_avail || ep_len < 99u)
-        return;
-    uint8_t desc_type = ep[4];
-    uint16_t kinfo = ((uint16_t)ep[5] << 8) | ep[6];
-    uint16_t kd_len = ((uint16_t)ep[97] << 8) | ep[98];
-    w_puts("[WIFI-EAPOL] dt="); w_putx(desc_type); w_puts(" ki="); w_putx(kinfo);
-    w_puts(" kd="); w_putx(kd_len); w_puts("\n");
-    if (99u + (uint32_t)kd_len > ep_len)
-        return;
-    uint16_t kver = kinfo & 0x0007u;
-    int is_pw  = (kinfo & 0x0008u) != 0u;
-    int is_ack = (kinfo & 0x0080u) != 0u;
-    int is_mic = (kinfo & 0x0100u) != 0u;
-    int is_sec = (kinfo & 0x0200u) != 0u;
-    int is_enc = (kinfo & 0x1000u) != 0u;
+        if (!w_wpa_active || elen < 14u + 99u)
+            continue;
+        const uint8_t *src = pkt + 6;
+        const uint8_t *ep  = pkt + 14; /* EAPOL header: ver(1), type(1), len(2), desc_type(1), key_info(2)... */
+        uint32_t ep_avail = elen - 14u;
+        if (ep[1] != 3u /* EAPOL-Key */)
+            continue;
+        uint16_t body_len = ((uint16_t)ep[2] << 8) | ep[3];
+        uint32_t ep_len = 4u + (uint32_t)body_len;
+        if (ep_len > ep_avail || ep_len < 99u)
+            continue;
+        uint8_t desc_type = ep[4];
+        uint16_t kinfo = ((uint16_t)ep[5] << 8) | ep[6];
+        uint16_t kd_len = ((uint16_t)ep[97] << 8) | ep[98];
+        w_puts("[WIFI-EAPOL] dt="); w_putx(desc_type); w_puts(" ki="); w_putx(kinfo);
+        w_puts(" kd="); w_putx(kd_len); w_puts("\n");
+        if (99u + (uint32_t)kd_len > ep_len)
+            continue;
+        uint16_t kver = kinfo & 0x0007u;
+        if (kver != 2u) /* Only WPA2 HMAC-SHA1-128 + AES Key Wrap is implemented */
+            continue;
+        int is_pw  = (kinfo & 0x0008u) != 0u;
+        int is_ack = (kinfo & 0x0080u) != 0u;
+        int is_mic = (kinfo & 0x0100u) != 0u;
+        int is_sec = (kinfo & 0x0200u) != 0u;
+        int is_enc = (kinfo & 0x1000u) != 0u;
 
-    /* 1. Pairwise Message 1/4: Pairwise | Ack | !MIC */
-    if (is_pw && is_ack && !is_mic) {
-        /* Generate fresh SNonce via SHA-1(mct || mac || counter || anonce) */
-        struct wpa_sha1_ctx sc;
-        uint8_t seed[48], d0[20], d1[20];
-        uint32_t t = mct ? *(volatile uint32_t *)(mct + 0x100u) : 0x12345678u;
-        uint32_t ctr = ++w_wpa_nonce_ctr;
-        for (int i = 0; i < 4; i++) seed[i] = (uint8_t)(t >> (i * 8));
-        for (int i = 0; i < 4; i++) seed[4 + i] = (uint8_t)(ctr >> (i * 8));
-        for (int i = 0; i < 6; i++) seed[8 + i] = w_st.mac[i];
-        for (int i = 0; i < 32; i++) seed[14 + i] = ep[17 + i];
-        seed[46] = 0u; seed[47] = 1u;
-        wpa_sha1_init(&sc); wpa_sha1_update(&sc, seed, 47u); wpa_sha1_final(&sc, d0);
-        seed[46] = 1u;
-        wpa_sha1_init(&sc); wpa_sha1_update(&sc, seed, 48u); wpa_sha1_final(&sc, d1);
-        for (int i = 0; i < 20; i++) w_wpa_snonce[i] = d0[i];
-        for (int i = 0; i < 12; i++) w_wpa_snonce[20 + i] = d1[i];
+        /* 1. Pairwise Message 1/4: Pairwise | Ack | !MIC (rejected once PTK is installed) */
+        if (is_pw && is_ack && !is_mic) {
+            if (w_wpa_done)
+                continue;
+            if (wpa_mac_nonzero(w_cur_bssid) && !wpa_bytes_eq(src, w_cur_bssid, 6u))
+                continue;
+            /* Generate fresh SNonce via SHA-1(mct || mac || counter || anonce) */
+            struct wpa_sha1_ctx sc;
+            uint8_t seed[48], d0[20], d1[20];
+            uint32_t t = mct ? *(volatile uint32_t *)(mct + 0x100u) : 0x12345678u;
+            uint32_t ctr = ++w_wpa_nonce_ctr;
+            for (int i = 0; i < 4; i++) seed[i] = (uint8_t)(t >> (i * 8));
+            for (int i = 0; i < 4; i++) seed[4 + i] = (uint8_t)(ctr >> (i * 8));
+            for (int i = 0; i < 6; i++) seed[8 + i] = w_st.mac[i];
+            for (int i = 0; i < 32; i++) seed[14 + i] = ep[17 + i];
+            seed[46] = 0u; seed[47] = 1u;
+            wpa_sha1_init(&sc); wpa_sha1_update(&sc, seed, 47u); wpa_sha1_final(&sc, d0);
+            seed[46] = 1u;
+            wpa_sha1_init(&sc); wpa_sha1_update(&sc, seed, 48u); wpa_sha1_final(&sc, d1);
+            for (int i = 0; i < 20; i++) w_wpa_snonce[i] = d0[i];
+            for (int i = 0; i < 12; i++) w_wpa_snonce[20 + i] = d1[i];
 
-        wpa_derive_ptk(w_wpa_pmk, src, w_st.mac, ep + 17, w_wpa_snonce, w_wpa_ptk);
+            for (int i = 0; i < 32; i++) w_wpa_anonce[i] = ep[17 + i];
+            for (int i = 0; i < 6; i++) w_wpa_bssid[i] = src[i];
+            w_wpa_m1_seen = 1;
+            wpa_derive_ptk(w_wpa_pmk, src, w_st.mac, ep + 17, w_wpa_snonce, w_wpa_ptk);
 
-        /* Sync exact RSN IE that BCM4334 transmitted in 802.11 AssocReq so AP's M2 check matches byte-for-byte */
-        {
-            static const char k_arie[] = "assoc_req_ies";
-            uint8_t ieb[256];
-            for (unsigned i = 0; i < sizeof(ieb); i++) ieb[i] = (i < sizeof(k_arie)) ? (uint8_t)k_arie[i] : 0u;
-            uint32_t iel = sizeof(ieb);
-            if (bcm_cdc_cmd(262u /* WLC_GET_VAR */, 0, ieb, sizeof(ieb), &iel) == 0 && w_ctl_status == 0u) {
-                uint32_t p = 0u;
-                while (p + 2u <= iel) {
-                    uint8_t tag = ieb[p], tl = ieb[p + 1u];
-                    if (p + 2u + tl > iel) break;
-                    if (tag == 0x30u && (uint32_t)tl + 2u <= sizeof(w_wpa_rsnie)) {
-                        w_wpa_rsnie_len = (uint32_t)tl + 2u;
-                        for (uint32_t i = 0u; i < w_wpa_rsnie_len; i++) w_wpa_rsnie[i] = ieb[p + i];
-                        break;
+            /* Sync exact RSN IE that BCM4334 transmitted in 802.11 AssocReq so AP's M2 check matches byte-for-byte */
+            {
+                static const char k_arie[] = "assoc_req_ies";
+                uint8_t ieb[256];
+                for (unsigned i = 0; i < sizeof(ieb); i++) ieb[i] = (i < sizeof(k_arie)) ? (uint8_t)k_arie[i] : 0u;
+                uint32_t iel = sizeof(ieb), ie_st = 0xffffffffu;
+                if (bcm_cdc_cmd(262u /* WLC_GET_VAR */, 0, ieb, sizeof(ieb), &iel, &ie_st) == 0 && ie_st == 0u) {
+                    uint32_t p = 0u;
+                    while (p + 2u <= iel) {
+                        uint8_t tag = ieb[p], tl = ieb[p + 1u];
+                        if (p + 2u + tl > iel) break;
+                        if (tag == 0x30u && (uint32_t)tl + 2u <= sizeof(w_wpa_rsnie)) {
+                            w_wpa_rsnie_len = (uint32_t)tl + 2u;
+                            for (uint32_t i = 0u; i < w_wpa_rsnie_len; i++) w_wpa_rsnie[i] = ieb[p + i];
+                            break;
+                        }
+                        p += 2u + tl;
                     }
-                    p += 2u + tl;
                 }
             }
+
+            /* Build EAPOL-Key Message 2/4 */
+            uint32_t m2_len = 99u + w_wpa_rsnie_len;
+            uint8_t m2[160];
+            for (unsigned i = 0; i < sizeof(m2); i++) m2[i] = 0u;
+            m2[0] = 1u; m2[1] = 3u;
+            m2[2] = (uint8_t)((m2_len - 4u) >> 8); m2[3] = (uint8_t)(m2_len - 4u);
+            m2[4] = desc_type;
+            uint16_t m2_ki = kver | 0x0108u; /* Pairwise | MIC */
+            m2[5] = (uint8_t)(m2_ki >> 8); m2[6] = (uint8_t)m2_ki;
+            for (int i = 0; i < 8; i++) m2[9 + i] = ep[9 + i];       /* Replay Counter */
+            for (int i = 0; i < 32; i++) m2[17 + i] = w_wpa_snonce[i]; /* SNonce */
+            m2[97] = (uint8_t)(w_wpa_rsnie_len >> 8); m2[98] = (uint8_t)w_wpa_rsnie_len;
+            for (uint32_t i = 0u; i < w_wpa_rsnie_len; i++) m2[99u + i] = w_wpa_rsnie[i];
+            uint8_t mic[20];
+            wpa_hmac_sha1(w_wpa_ptk, 16u, m2, m2_len, mic);
+            for (int i = 0; i < 16; i++) m2[81 + i] = mic[i];
+            wifi_send_eapol(src, m2, m2_len);
+            w_puts("[WIFI-WPA] M1->M2 ver="); w_putx(kver); w_puts(" ie="); w_putx(w_wpa_rsnie_len); w_puts("\n");
+            continue;
         }
 
-        /* Build EAPOL-Key Message 2/4 */
-        uint32_t m2_len = 99u + w_wpa_rsnie_len;
-        uint8_t m2[160];
-        for (unsigned i = 0; i < sizeof(m2); i++) m2[i] = 0u;
-        m2[0] = 1u; m2[1] = 3u;
-        m2[2] = (uint8_t)((m2_len - 4u) >> 8); m2[3] = (uint8_t)(m2_len - 4u);
-        m2[4] = desc_type;
-        uint16_t m2_ki = kver | 0x0108u; /* Pairwise | MIC */
-        m2[5] = (uint8_t)(m2_ki >> 8); m2[6] = (uint8_t)m2_ki;
-        for (int i = 0; i < 8; i++) m2[9 + i] = ep[9 + i];       /* Replay Counter */
-        for (int i = 0; i < 32; i++) m2[17 + i] = w_wpa_snonce[i]; /* SNonce */
-        m2[97] = (uint8_t)(w_wpa_rsnie_len >> 8); m2[98] = (uint8_t)w_wpa_rsnie_len;
-        for (uint32_t i = 0u; i < w_wpa_rsnie_len; i++) m2[99u + i] = w_wpa_rsnie[i];
-        uint8_t mic[20];
-        wpa_hmac_sha1(w_wpa_ptk, 16u, m2, m2_len, mic);
-        for (int i = 0; i < 16; i++) m2[81 + i] = mic[i];
-        wifi_send_eapol(src, m2, m2_len);
-        w_puts("[WIFI-WPA] M1->M2 ver="); w_putx(kver); w_puts(" ie="); w_putx(w_wpa_rsnie_len); w_puts("\n");
-        return;
-    }
-
-    /* 2. Pairwise Message 3/4: Pairwise | Ack | MIC */
-    if (is_pw && is_ack && is_mic) {
-        /* Verify MIC over M3 */
-        uint8_t chk[512], mic[20];
-        for (uint32_t i = 0u; i < ep_len; i++) chk[i] = ep[i];
-        for (int i = 0; i < 16; i++) chk[81 + i] = 0u;
-        wpa_hmac_sha1(w_wpa_ptk, 16u, chk, ep_len, mic);
-        int bad = 0;
-        for (int i = 0; i < 16; i++) if (mic[i] != ep[81 + i]) bad = 1;
-        if (bad) {
-            w_puts("[WIFI-WPA] M3_BADMIC\n");
-            return;
-        }
-        /* Unwrap GTK from Key Data (RFC 3394 AES Key Unwrap with KEK = ptk[16..31]) */
-        uint8_t gtk[32];
-        uint32_t gtk_len = 0u, gtk_id = 0u;
-        if (is_enc && kd_len >= 16u && kd_len <= 320u) {
-            uint8_t plain[320];
-            if (wpa_aes_unwrap(w_wpa_ptk + 16, ep + 99, kd_len, plain) == 0) {
+        /* 2. Pairwise Message 3/4: Pairwise | Ack | MIC (require M1 seen, !done, matching BSSID/ANonce & replay) */
+        if (is_pw && is_ack && is_mic) {
+            if (!w_wpa_m1_seen || w_wpa_done)
+                continue;
+            if (!wpa_bytes_eq(src, w_wpa_bssid, 6u) || !wpa_bytes_eq(ep + 17, w_wpa_anonce, 32u))
+                continue;
+            if (w_wpa_replay_valid && !wpa_replay_gt(ep + 9, w_wpa_replay))
+                continue;
+            /* Constant-time MIC verification over M3 */
+            uint8_t chk[512], mic[20];
+            for (uint32_t i = 0u; i < ep_len; i++) chk[i] = ep[i];
+            for (int i = 0; i < 16; i++) chk[81 + i] = 0u;
+            wpa_hmac_sha1(w_wpa_ptk, 16u, chk, ep_len, mic);
+            if (!wpa_bytes_eq(mic, ep + 81, 16u)) {
+                w_puts("[WIFI-WPA] M3_BADMIC\n");
+                continue;
+            }
+            /* Unwrap GTK from Key Data (RFC 3394 AES Key Unwrap with KEK = ptk[16..31]) */
+            uint8_t gtk[32];
+            uint32_t gtk_len = 0u, gtk_id = 0u;
+            if (is_enc) {
+                if (kd_len < 24u || kd_len > 320u) {
+                    w_puts("[WIFI-WPA] M3_BADKD\n");
+                    continue;
+                }
+                uint8_t plain[320];
+                if (wpa_aes_unwrap(w_wpa_ptk + 16, ep + 99, kd_len, plain) != 0) {
+                    w_puts("[WIFI-WPA] M3_UNWRAP_FAIL\n");
+                    continue;
+                }
                 uint32_t plen = (uint32_t)kd_len - 8u;
                 uint32_t p = 0u;
                 while (p + 2u <= plen) {
@@ -1287,74 +1398,93 @@ static void wifi_process_eapol(void)
                     p += 2u + tl;
                 }
             }
-        }
-        /* Send EAPOL-Key Message 4/4 BEFORE installing PTK so M4 is sent in the clear */
-        uint8_t m4[99];
-        for (unsigned i = 0; i < sizeof(m4); i++) m4[i] = 0u;
-        m4[0] = 1u; m4[1] = 3u; m4[2] = 0u; m4[3] = 95u;
-        m4[4] = desc_type;
-        uint16_t m4_ki = kver | 0x0308u; /* Pairwise | MIC | Secure */
-        m4[5] = (uint8_t)(m4_ki >> 8); m4[6] = (uint8_t)m4_ki;
-        for (int i = 0; i < 8; i++) m4[9 + i] = ep[9 + i]; /* Replay Counter */
-        wpa_hmac_sha1(w_wpa_ptk, 16u, m4, 99u, mic);
-        for (int i = 0; i < 16; i++) m4[81 + i] = mic[i];
-        wifi_send_eapol(src, m4, 99u);
-        k_iosleep(20u);
+            /* Send EAPOL-Key Message 4/4 BEFORE installing PTK so M4 is sent in the clear */
+            uint8_t m4[99];
+            for (unsigned i = 0; i < sizeof(m4); i++) m4[i] = 0u;
+            m4[0] = 1u; m4[1] = 3u; m4[2] = 0u; m4[3] = 95u;
+            m4[4] = desc_type;
+            uint16_t m4_ki = kver | 0x0308u; /* Pairwise | MIC | Secure */
+            m4[5] = (uint8_t)(m4_ki >> 8); m4[6] = (uint8_t)m4_ki;
+            for (int i = 0; i < 8; i++) m4[9 + i] = ep[9 + i]; /* Replay Counter */
+            wpa_hmac_sha1(w_wpa_ptk, 16u, m4, 99u, mic);
+            for (int i = 0; i < 16; i++) m4[81 + i] = mic[i];
+            wifi_send_eapol(src, m4, 99u);
+            k_iosleep(20u);
 
-        /* Install PTK (TK = ptk[32..47], AES-CCM) and GTK */
-        for (int i = 0; i < 6; i++) w_cur_bssid[i] = src[i];
-        (void)wifi_install_key(0u, 4u /* AES_CCM */, 2u /* WL_PRIMARY_KEY */, w_wpa_ptk + 32, 16u, src);
-        if (gtk_len >= 16u) {
-            uint8_t z6[6] = { 0 };
-            uint32_t galgo = (gtk_len == 16u) ? 4u /* AES_CCM */ : 2u /* TKIP */;
-            (void)wifi_install_key(gtk_id, galgo, 2u, gtk, gtk_len, z6);
+            /* Install PTK (TK = ptk[32..47], AES-CCM) and GTK; abort on firmware key-install failure */
+            for (int i = 0; i < 6; i++) w_cur_bssid[i] = src[i];
+            if (wifi_install_key(0u, 4u /* AES_CCM */, 2u /* WL_PRIMARY_KEY */, w_wpa_ptk + 32, 16u, src) != 0) {
+                w_puts("[WIFI-WPA] PTK_FAIL\n");
+                continue;
+            }
+            if (gtk_len >= 16u) {
+                uint8_t z6[6] = { 0 };
+                uint32_t galgo = (gtk_len == 16u) ? 4u /* AES_CCM */ : 2u /* TKIP */;
+                if (wifi_install_key(gtk_id, galgo, 2u, gtk, gtk_len, z6) != 0) {
+                    w_puts("[WIFI-WPA] GTK_FAIL\n");
+                    continue;
+                }
+            }
+            for (int i = 0; i < 8; i++) w_wpa_replay[i] = ep[9 + i];
+            w_wpa_replay_valid = 1;
+            w_wpa_done = 1;
+            w_st.link_up = 1u;
+            w_puts("[WIFI-WPA] M3->M4 OK gtk="); w_putx((gtk_id << 8) | gtk_len); w_puts("\n");
+            continue;
         }
-        w_wpa_done = 1;
-        w_st.link_up = 1u;
-        w_puts("[WIFI-WPA] M3->M4 OK gtk="); w_putx((gtk_id << 8) | gtk_len); w_puts("\n");
-        return;
-    }
 
-    /* 3. Group Key Handshake Message 1/2 (periodic GTK rekey): !Pairwise | Ack | MIC | Secure */
-    if (!is_pw && is_ack && is_mic && is_sec && w_wpa_done) {
-        uint8_t chk[512], mic[20];
-        for (uint32_t i = 0u; i < ep_len; i++) chk[i] = ep[i];
-        for (int i = 0; i < 16; i++) chk[81 + i] = 0u;
-        wpa_hmac_sha1(w_wpa_ptk, 16u, chk, ep_len, mic);
-        for (int i = 0; i < 16; i++) if (mic[i] != ep[81 + i]) return;
-        if (is_enc && kd_len >= 16u && kd_len <= 320u) {
+        /* 3. Group Key Handshake Message 1/2 (periodic GTK rekey): !Pairwise | Ack | MIC | Secure */
+        if (!is_pw && is_ack && is_mic && is_sec && w_wpa_done) {
+            if (!wpa_bytes_eq(src, w_wpa_bssid, 6u))
+                continue;
+            if (!w_wpa_replay_valid || !wpa_replay_gt(ep + 9, w_wpa_replay))
+                continue;
+            uint8_t chk[512], mic[20];
+            for (uint32_t i = 0u; i < ep_len; i++) chk[i] = ep[i];
+            for (int i = 0; i < 16; i++) chk[81 + i] = 0u;
+            wpa_hmac_sha1(w_wpa_ptk, 16u, chk, ep_len, mic);
+            if (!wpa_bytes_eq(mic, ep + 81, 16u))
+                continue;
+            if (!is_enc || kd_len < 24u || kd_len > 320u)
+                continue;
             uint8_t plain[320];
-            if (wpa_aes_unwrap(w_wpa_ptk + 16, ep + 99, kd_len, plain) == 0) {
-                uint32_t plen = (uint32_t)kd_len - 8u, p = 0u;
-                while (p + 2u <= plen) {
-                    uint8_t tag = plain[p], tl = plain[p + 1u];
-                    if (tag == 0xddu && tl == 0u) break;
-                    if (p + 2u + tl > plen) break;
-                    if (tag == 0xddu && tl >= 8u &&
-                        plain[p + 2u] == 0x00u && plain[p + 3u] == 0x0fu &&
-                        plain[p + 4u] == 0xacu && plain[p + 5u] == 0x01u) {
-                        uint32_t gid = plain[p + 6u] & 0x03u;
-                        uint32_t gl = (uint32_t)tl - 6u;
-                        if (gl >= 16u && gl <= 32u) {
-                            uint8_t z6[6] = { 0 };
-                            (void)wifi_install_key(gid, (gl == 16u) ? 4u : 2u, 2u, plain + p + 8u, gl, z6);
+            if (wpa_aes_unwrap(w_wpa_ptk + 16, ep + 99, kd_len, plain) != 0)
+                continue;
+            int installed = 0;
+            uint32_t plen = (uint32_t)kd_len - 8u, p = 0u;
+            while (p + 2u <= plen) {
+                uint8_t tag = plain[p], tl = plain[p + 1u];
+                if (tag == 0xddu && tl == 0u) break;
+                if (p + 2u + tl > plen) break;
+                if (tag == 0xddu && tl >= 8u &&
+                    plain[p + 2u] == 0x00u && plain[p + 3u] == 0x0fu &&
+                    plain[p + 4u] == 0xacu && plain[p + 5u] == 0x01u) {
+                    uint32_t gid = plain[p + 6u] & 0x03u;
+                    uint32_t gl = (uint32_t)tl - 6u;
+                    if (gl >= 16u && gl <= 32u) {
+                        uint8_t z6[6] = { 0 };
+                        if (wifi_install_key(gid, (gl == 16u) ? 4u : 2u, 2u, plain + p + 8u, gl, z6) == 0) {
+                            installed = 1;
                             w_puts("[WIFI-WPA] GTK_REKEY "); w_putx(gid); w_puts("\n");
                         }
                     }
-                    p += 2u + tl;
                 }
+                p += 2u + tl;
             }
+            if (!installed)
+                continue;
+            for (int i = 0; i < 8; i++) w_wpa_replay[i] = ep[9 + i];
+            uint8_t gm2[99];
+            for (unsigned i = 0; i < sizeof(gm2); i++) gm2[i] = 0u;
+            gm2[0] = 1u; gm2[1] = 3u; gm2[2] = 0u; gm2[3] = 95u;
+            gm2[4] = desc_type;
+            uint16_t gki = kver | 0x0300u; /* Group | MIC | Secure */
+            gm2[5] = (uint8_t)(gki >> 8); gm2[6] = (uint8_t)gki;
+            for (int i = 0; i < 8; i++) gm2[9 + i] = ep[9 + i];
+            wpa_hmac_sha1(w_wpa_ptk, 16u, gm2, 99u, mic);
+            for (int i = 0; i < 16; i++) gm2[81 + i] = mic[i];
+            wifi_send_eapol(src, gm2, 99u);
         }
-        uint8_t gm2[99];
-        for (unsigned i = 0; i < sizeof(gm2); i++) gm2[i] = 0u;
-        gm2[0] = 1u; gm2[1] = 3u; gm2[2] = 0u; gm2[3] = 95u;
-        gm2[4] = desc_type;
-        uint16_t gki = kver | 0x0300u; /* Group | MIC | Secure */
-        gm2[5] = (uint8_t)(gki >> 8); gm2[6] = (uint8_t)gki;
-        for (int i = 0; i < 8; i++) gm2[9 + i] = ep[9 + i];
-        wpa_hmac_sha1(w_wpa_ptk, 16u, gm2, 99u, mic);
-        for (int i = 0; i < 16; i++) gm2[81 + i] = mic[i];
-        wifi_send_eapol(src, gm2, 99u);
     }
 }
 
@@ -1376,33 +1506,38 @@ static int wifi_do_associate(const uint8_t *ad, uint32_t ad_len)
     w_assoc_result = 0xffffu; /* wifid 0xa9820 in-progress sentinel */
     w_wpa_active = 0;
     w_wpa_done = 0;
+    w_wpa_m1_seen = 0;
+    w_wpa_replay_valid = 0;
     w_assoc_fail = 0;
-    w_wpa_eapol_len = 0u;
-
-    /* Sync channel/RSSI and AP RSN group cipher from last scan cache if matched */
+    w_state_lock();
+    w_wpa_eapol_head = w_wpa_eapol_tail = 0u;
+    /* Sync channel/RSSI and AP RSN group cipher from last scan cache (prefer exact BSSID match) */
     uint8_t grp_cipher[4] = { 0x00u, 0x0fu, 0xacu, 0x04u }; /* default AES-CCMP */
+    int want_bssid = wpa_mac_nonzero(w_cur_bssid);
+    const struct wifi_ap_entry *best = 0;
     for (uint32_t i = 0u; i < w_ap_cnt; i++) {
-        if (w_aps[i].ssid_len == slen) {
-            int eq = 1;
-            for (uint32_t j = 0u; j < slen; j++)
-                if (w_aps[i].ssid[j] != w_cur_ssid[j]) { eq = 0; break; }
-            if (eq) {
-                w_cur_chan = w_aps[i].channel;
-                w_cur_rssi = w_aps[i].rssi;
-                uint16_t pos = 0u;
-                while (pos + 2u <= w_aps[i].ie_len) {
-                    uint8_t id = w_aps[i].ies[pos], tl = w_aps[i].ies[pos + 1u];
-                    if (pos + 2u + tl > w_aps[i].ie_len) break;
-                    if (id == 48u && tl >= 6u) {
-                        for (int k = 0; k < 4; k++) grp_cipher[k] = w_aps[i].ies[pos + 4u + k];
-                        break;
-                    }
-                    pos = (uint16_t)(pos + 2u + tl);
-                }
+        if (want_bssid && wpa_bytes_eq(w_aps[i].bssid, w_cur_bssid, 6u)) {
+            best = &w_aps[i];
+            break;
+        }
+        if (!best && w_aps[i].ssid_len == slen && wpa_bytes_eq(w_aps[i].ssid, w_cur_ssid, slen))
+            best = &w_aps[i];
+    }
+    if (best) {
+        w_cur_chan = best->channel;
+        w_cur_rssi = best->rssi;
+        uint16_t pos = 0u;
+        while (pos + 2u <= best->ie_len) {
+            uint8_t id = best->ies[pos], tl = best->ies[pos + 1u];
+            if (pos + 2u + tl > best->ie_len) break;
+            if (id == 48u && tl >= 6u) {
+                for (int k = 0; k < 4; k++) grp_cipher[k] = best->ies[pos + 4u + k];
                 break;
             }
+            pos = (uint16_t)(pos + 2u + tl);
         }
     }
+    w_state_unlock();
 
     /* Configure BCM4334 auth/security (Open or host-handled WPA/WPA2-PSK via EAPOL + WLC_SET_KEY) */
     uint32_t wsec = 0u, wpa_auth = 0u;
@@ -1431,23 +1566,21 @@ static int wifi_do_associate(const uint8_t *ad, uint32_t ad_len)
     }
 
     uint8_t b4[4];
-    uint32_t l4 = 4u;
+    uint32_t l4 = 4u, wsec_st = 0u, wpa_st = 0u;
     b4[0] = 1u; b4[1] = 0u; b4[2] = 0u; b4[3] = 0u;
-    (void)bcm_cdc_cmd(20u /* WLC_SET_INFRA */, 1, b4, 4u, &l4);
+    (void)bcm_cdc_cmd(20u /* WLC_SET_INFRA */, 1, b4, 4u, &l4, 0);
     b4[0] = (auth_lo == 2u) ? 1u : 0u; b4[1] = 0u; b4[2] = 0u; b4[3] = 0u; l4 = 4u;
-    (void)bcm_cdc_cmd(22u /* WLC_SET_AUTH */, 1, b4, 4u, &l4);
+    (void)bcm_cdc_cmd(22u /* WLC_SET_AUTH */, 1, b4, 4u, &l4, 0);
     b4[0] = (uint8_t)wsec; b4[1] = 0u; b4[2] = 0u; b4[3] = 0u; l4 = 4u;
-    (void)bcm_cdc_cmd(134u /* WLC_SET_WSEC */, 1, b4, 4u, &l4);
-    uint32_t wsec_st = w_ctl_status;
+    (void)bcm_cdc_cmd(134u /* WLC_SET_WSEC */, 1, b4, 4u, &l4, &wsec_st);
     b4[0] = (uint8_t)wpa_auth; b4[1] = 0u; b4[2] = 0u; b4[3] = 0u; l4 = 4u;
-    (void)bcm_cdc_cmd(165u /* WLC_SET_WPA_AUTH */, 1, b4, 4u, &l4);
-    uint32_t wpa_st = w_ctl_status;
+    (void)bcm_cdc_cmd(165u /* WLC_SET_WPA_AUTH */, 1, b4, 4u, &l4, &wpa_st);
     {
         static const char k_sw[] = "sup_wpa";
         uint8_t sw[16];
         for (unsigned i = 0; i < sizeof(sw); i++) sw[i] = (i < sizeof(k_sw)) ? (uint8_t)k_sw[i] : 0u;
         uint32_t swl = sizeof(k_sw) + 4u;
-        (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, sw, swl, &swl);
+        (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, sw, swl, &swl, 0);
     }
     {
         static const char k_wr[] = "wsec_restrict";
@@ -1455,7 +1588,7 @@ static int wifi_do_associate(const uint8_t *ad, uint32_t ad_len)
         for (unsigned i = 0; i < sizeof(wr); i++) wr[i] = (i < sizeof(k_wr)) ? (uint8_t)k_wr[i] : 0u;
         wr[sizeof(k_wr)] = (uint8_t)(wpa_auth ? 1u : 0u);
         uint32_t wrl = sizeof(k_wr) + 4u;
-        (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, wr, wrl, &wrl);
+        (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, wr, wrl, &wrl, 0);
     }
     if (wsec_st || wpa_st) {
         w_puts("[WIFI-SEC] ws="); w_putx(wsec_st); w_puts(" wa="); w_putx(wpa_st); w_puts("\n");
@@ -1465,9 +1598,8 @@ static int wifi_do_associate(const uint8_t *ad, uint32_t ad_len)
     for (unsigned i = 0; i < sizeof(ssid_req); i++) ssid_req[i] = 0u;
     ssid_req[0] = (uint8_t)slen;
     for (uint32_t i = 0; i < slen; i++) ssid_req[4u + i] = w_cur_ssid[i];
-    uint32_t srl = sizeof(ssid_req);
-    int rc = bcm_cdc_cmd(26u /* WLC_SET_SSID */, 1, ssid_req, sizeof(ssid_req), &srl);
-    uint32_t ssid_st = w_ctl_status;
+    uint32_t srl = sizeof(ssid_req), ssid_st = 0u;
+    int rc = bcm_cdc_cmd(26u /* WLC_SET_SSID */, 1, ssid_req, sizeof(ssid_req), &srl, &ssid_st);
 
     /* Wait up to 6s while actively pumping SDPCM RX for EAPOL 4-way handshake (or BSSID for Open AP). */
     int linked = 0;
@@ -1477,7 +1609,7 @@ static int wifi_do_associate(const uint8_t *ad, uint32_t ad_len)
             for (int r = 0; r < 8 && sdpcm_poll_rx_once(); r++)
                 ;
             w_unlock();
-            if (w_wpa_eapol_len)
+            if (w_wpa_eapol_tail != w_wpa_eapol_head)
                 wifi_process_eapol();
             if (w_assoc_fail)
                 break;
@@ -1488,8 +1620,8 @@ static int wifi_do_associate(const uint8_t *ad, uint32_t ad_len)
                 }
             } else if (w_st.link_up || (tries % 15) == 14) {
                 uint8_t bss[6] = { 0 };
-                uint32_t bl = 6u;
-                if (bcm_cdc_cmd(23u /* WLC_GET_BSSID */, 0, bss, 6u, &bl) == 0 && w_ctl_status == 0u) {
+                uint32_t bl = 6u, bss_st = 0xffffffffu;
+                if (bcm_cdc_cmd(23u /* WLC_GET_BSSID */, 0, bss, 6u, &bl, &bss_st) == 0 && bss_st == 0u) {
                     if (bss[0] | bss[1] | bss[2] | bss[3] | bss[4] | bss[5]) {
                         for (int i = 0; i < 6; i++) w_cur_bssid[i] = bss[i];
                         linked = 1;
@@ -1540,6 +1672,14 @@ struct xnu_apple80211req {
     uint32_t req_len;
     uint32_t req_data;
 };
+
+static void w_copy_ap(struct wifi_ap_entry *dst, const struct wifi_ap_entry *src)
+{
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (uint32_t i = 0u; i < (uint32_t)sizeof(*dst); i++)
+        d[i] = s[i];
+}
 
 static int wifi_handle_a80211(struct xnu_apple80211req *req, int is_set)
 {
@@ -1598,12 +1738,22 @@ static int wifi_handle_a80211(struct xnu_apple80211req *req, int is_set)
             if (req->req_data && req->req_len >= 6u) rc = k_copyout(w_cur_bssid, req->req_data, 6u);
             break;
         case 11: /* APPLE80211_IOC_SCAN_RESULT */
-            if (w_ap_idx >= w_ap_cnt) {
-                rc = 5; /* EIO: exact end-of-scan-results sentinel checked by wifid */
-                break;
-            }
             if (!req->req_data || req->req_len < 144u) { rc = 22; break; }
-            rc = wifi_fill_scan_result(req->req_data, &w_aps[w_ap_idx++]);
+            {
+                struct wifi_ap_entry snap;
+                int have = 0;
+                w_state_lock();
+                if (w_ap_idx < w_ap_cnt) {
+                    w_copy_ap(&snap, &w_aps[w_ap_idx++]);
+                    have = 1;
+                }
+                w_state_unlock();
+                if (!have) {
+                    rc = 5; /* EIO: exact end-of-scan-results sentinel checked by wifid */
+                    break;
+                }
+                rc = wifi_fill_scan_result(req->req_data, &snap);
+            }
             break;
         case 12: /* APPLE80211_IOC_CARD_CAPABILITIES: wifid 0x9b85e reads 8 raw cap bytes into ref+0x2c (no version hdr) */
             tmp[0] = 0x6fu; /* WEP|TKIP|AES|AES_CCM|IBSS|PMGT */
@@ -1696,17 +1846,27 @@ static int wifi_handle_a80211(struct xnu_apple80211req *req, int is_set)
             if (!w_st.link_up || !w_cur_ssid_len) { rc = 57 /* ENOTCONN */; break; }
             if (!req->req_data || req->req_len < 144u) { rc = 22; break; }
             {
+                struct wifi_ap_entry snap;
+                int have = 0;
+                int want_bssid = wpa_mac_nonzero(w_cur_bssid);
+                w_state_lock();
                 const struct wifi_ap_entry *hit = 0;
                 for (uint32_t i = 0u; i < w_ap_cnt; i++) {
-                    if (w_aps[i].ssid_len == w_cur_ssid_len) {
-                        int eq = 1;
-                        for (uint32_t j = 0u; j < w_cur_ssid_len; j++)
-                            if (w_aps[i].ssid[j] != w_cur_ssid[j]) { eq = 0; break; }
-                        if (eq) { hit = &w_aps[i]; break; }
+                    if (want_bssid && wpa_bytes_eq(w_aps[i].bssid, w_cur_bssid, 6u)) {
+                        hit = &w_aps[i];
+                        break;
                     }
+                    if (!hit && w_aps[i].ssid_len == w_cur_ssid_len &&
+                        wpa_bytes_eq(w_aps[i].ssid, w_cur_ssid, w_cur_ssid_len))
+                        hit = &w_aps[i];
                 }
                 if (hit) {
-                    rc = wifi_fill_scan_result(req->req_data, hit);
+                    w_copy_ap(&snap, hit);
+                    have = 1;
+                }
+                w_state_unlock();
+                if (have) {
+                    rc = wifi_fill_scan_result(req->req_data, &snap);
                 } else {
                     struct wifi_ap_entry cur;
                     for (uint32_t i = 0; i < sizeof(cur); i++) ((uint8_t *)&cur)[i] = 0u;
@@ -1744,12 +1904,16 @@ static int wifi_handle_a80211(struct xnu_apple80211req *req, int is_set)
     } else {
         switch (t) {
         case 19: /* APPLE80211_IOC_POWER */
-            if (req->req_data && req->req_len >= 12u && k_copyin(req->req_data, tmp, 12u) == 0) {
+            if (!req->req_data || req->req_len < 12u) {
+                rc = 22; /* EINVAL */
+            } else if (k_copyin(req->req_data, tmp, 12u) != 0) {
+                rc = 14; /* EFAULT */
+            } else {
                 uint32_t np = *(uint32_t *)(tmp + 8);
                 w_power = np ? 1u : 0u;
                 uint8_t d4[4] = { 0 };
                 uint32_t dl = 4u;
-                (void)bcm_cdc_cmd(w_power ? 2u /* WLC_UP */ : 3u /* WLC_DOWN */, 1, d4, 0u, &dl);
+                (void)bcm_cdc_cmd(w_power ? 2u /* WLC_UP */ : 3u /* WLC_DOWN */, 1, d4, 0u, &dl, 0);
                 if (!w_power && w_st.link_up) {
                     w_st.link_up = 0u;
                     w_cur_ssid_len = 0u;
@@ -1767,10 +1931,13 @@ static int wifi_handle_a80211(struct xnu_apple80211req *req, int is_set)
         case 20: /* APPLE80211_IOC_ASSOCIATE */
             if (req->req_data && req->req_len >= 56u) {
                 uint32_t cpy = (req->req_len < sizeof(w_assoc_buf)) ? req->req_len : sizeof(w_assoc_buf);
-                if (k_copyin(req->req_data, w_assoc_buf, cpy) == 0) {
+                if (k_copyin(req->req_data, tmp, cpy) == 0) {
+                    w_state_lock();
+                    for (uint32_t i = 0u; i < cpy; i++) w_assoc_buf[i] = tmp[i];
                     w_assoc_len = cpy;
                     w_assoc_result = 0xffffu; /* wifid 0xa9820 in-progress sentinel */
                     w_assoc_pending = 1u; /* run async in wifi_rx_thread after ioctl returns */
+                    w_state_unlock();
                     rc = 0;
                 } else {
                     rc = 14;
@@ -1785,11 +1952,13 @@ static int wifi_handle_a80211(struct xnu_apple80211req *req, int is_set)
                 uint8_t d4[4];
                 d4[0] = 0u; d4[1] = 0u; d4[2] = 0u; d4[3] = 0u;
                 uint32_t dl = 4u;
-                (void)bcm_cdc_cmd(52u /* WLC_DISASSOC */, 1, d4, 0u, &dl);
+                (void)bcm_cdc_cmd(52u /* WLC_DISASSOC */, 1, d4, 0u, &dl, 0);
                 w_st.link_up = 0u;
                 w_assoc_result = 0u;
                 w_wpa_active = 0;
                 w_wpa_done = 0;
+                w_wpa_m1_seen = 0;
+                w_wpa_replay_valid = 0;
                 w_cur_ssid_len = 0u;
                 if (was_up) {
                     wifi_post_80211_event(4u /* APPLE80211_M_LINK_CHANGED */, 0, 0u);
@@ -1846,11 +2015,22 @@ static void wifi_rx_thread(void *param, int wait_res)
             continue;
         }
         if (w_assoc_pending) {
-            w_assoc_pending = 0u;
-            idle_cnt = 0u;
-            k_iosleep(30u); /* let wifid arm its async ASSOC_DONE waiter after ioctl(20) returns */
-            (void)wifi_do_associate(w_assoc_buf, w_assoc_len);
-            continue;
+            uint8_t assoc_copy[512];
+            uint32_t assoc_len = 0u;
+            w_state_lock();
+            if (w_assoc_pending) {
+                w_assoc_pending = 0u;
+                assoc_len = w_assoc_len;
+                if (assoc_len > sizeof(assoc_copy)) assoc_len = sizeof(assoc_copy);
+                for (uint32_t i = 0u; i < assoc_len; i++) assoc_copy[i] = w_assoc_buf[i];
+            }
+            w_state_unlock();
+            if (assoc_len) {
+                idle_cnt = 0u;
+                k_iosleep(30u); /* let wifid arm its async ASSOC_DONE waiter after ioctl(20) returns */
+                (void)wifi_do_associate(assoc_copy, assoc_len);
+                continue;
+            }
         }
         if (w_scan_pending) {
             w_scan_pending = 0u;
@@ -1863,7 +2043,7 @@ static void wifi_rx_thread(void *param, int wait_res)
         w_lock();
         got = sdpcm_poll_rx_once();
         w_unlock();
-        if (w_wpa_eapol_len)
+        if (w_wpa_eapol_tail != w_wpa_eapol_head)
             wifi_process_eapol();
         uint32_t cur_tx = w_st.tx_pkts;
         if (got || cur_tx != prev_tx) {
@@ -1975,6 +2155,8 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
 {
     if (!in_buf || in_len < 16u || !out_buf || !out_len || *out_len < 8u)
         return -1;
+    uint32_t max_in_data = in_len - 16u;
+    uint32_t max_out_data = *out_len - 8u;
     const struct exy_wifi_req *req = (const struct exy_wifi_req *)in_buf;
     struct exy_wifi_rsp *rsp = (struct exy_wifi_rsp *)out_buf;
     rsp->err = 0;
@@ -1982,6 +2164,8 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
 
     if (req->op == WIFI_OP_STATUS) {
         uint32_t sz = sizeof(w_st);
+        if (max_out_data < sz)
+            return -1;
         const uint8_t *s = (const uint8_t *)&w_st;
         for (uint32_t i = 0; i < sz; i++) rsp->data[i] = s[i];
         rsp->out_len = sz;
@@ -1998,13 +2182,34 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
     if (req->op == WIFI_OP_FW_WRITE) {
         uint32_t off = req->arg0;
         uint32_t n   = req->arg1;
-        if (!w_st.probed || n > sizeof(req->data) || off + n > BCM4334_RAM_SZ) {
+        if (!w_st.probed || n > sizeof(req->data) || n > max_in_data ||
+            off > BCM4334_RAM_SZ || n > BCM4334_RAM_SZ - off) {
             rsp->err = -10;
             *out_len = 8u;
             return 0;
         }
         w_lock();
         rsp->err = bcm_bp_write_mem(off, req->data, n);
+        w_unlock();
+        *out_len = 8u;
+        return 0;
+    }
+    if (req->op == WIFI_OP_NVRAM_WRITE) {
+        uint32_t off = req->arg0;
+        uint32_t n   = req->arg1;
+        if (n > sizeof(req->data) || n > max_in_data ||
+            off > sizeof(w_nvram_buf) || n > sizeof(w_nvram_buf) - off) {
+            rsp->err = -10;
+            *out_len = 8u;
+            return 0;
+        }
+        w_lock();
+        if (off == 0u)
+            w_nvram_len = 0u;
+        for (uint32_t i = 0u; i < n; i++)
+            w_nvram_buf[off + i] = req->data[i];
+        if (off + n > w_nvram_len)
+            w_nvram_len = off + n;
         w_unlock();
         *out_len = 8u;
         return 0;
@@ -2109,14 +2314,17 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
             *out_len = 8u;
             return 0;
         }
-        uint32_t n = (uint32_t)sizeof(k_midas_nvram);
+        w_lock();
+        const uint8_t *nv_src = (w_nvram_len > 0u && w_nvram_len <= sizeof(w_nvram_buf))
+                                ? w_nvram_buf : (const uint8_t *)k_midas_nvram;
+        uint32_t n = (w_nvram_len > 0u && w_nvram_len <= sizeof(w_nvram_buf))
+                     ? w_nvram_len : (uint32_t)sizeof(k_midas_nvram);
         uint32_t padded = (n + 3u) & ~3u;
         uint32_t words = padded >> 2;
         uint32_t token = ((~words & 0xffffu) << 16) | (words & 0xffffu);
         uint32_t nv_addr = BCM4334_RAM_SZ - 4u - padded;
 
-        w_lock();
-        int rc = bcm_bp_write_mem(nv_addr, (const uint8_t *)k_midas_nvram, n);
+        int rc = bcm_bp_write_mem(nv_addr, nv_src, n);
         if (rc == 0 && padded > n) {
             uint8_t zpad[4] = { 0, 0, 0, 0 };
             rc = bcm_bp_write_mem(nv_addr + n, zpad, padded - n);
@@ -2228,10 +2436,10 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
                     w_puts(" idx="); w_putx(lidx);
                     w_puts("\n");
                     if (lbuf >= 0x1000u && lbuf < BCM4334_RAM_SZ && lsz > 0u && lsz <= 0x4000u) {
-                        uint32_t n = (lidx > 0u && lidx <= lsz) ? lidx : lsz;
-                        if (n > 512u) n = 512u;
+                        uint32_t cn = (lidx > 0u && lidx <= lsz) ? lidx : lsz;
+                        if (cn > 512u) cn = 512u;
                         w_puts("[WIFI-LOG] ");
-                        for (uint32_t off = 0u; off < n; off += 4u) {
+                        for (uint32_t off = 0u; off < cn; off += 4u) {
                             uint32_t w = 0u;
                             if (bcm_bp_read32((lbuf + off) & ~3u, &w) != 0) break;
                             for (int b = 0; b < 4; b++) {
@@ -2261,7 +2469,7 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
             for (unsigned i = 0; i < sizeof(q); i++)
                 q[i] = (i < sizeof(k_eth_var)) ? (uint8_t)k_eth_var[i] : 0u;
             uint32_t ql = sizeof(q);
-            int crc = bcm_cdc_cmd(262u /* WLC_GET_VAR */, 0, q, 20u, &ql);
+            int crc = bcm_cdc_cmd(262u /* WLC_GET_VAR */, 0, q, 20u, &ql, 0);
             w_puts("[WIFI-CDC] rc="); w_putx((uint32_t)crc);
             w_puts(" ql="); w_putx(ql);
             if (crc == 0 && ql >= 6u) {
@@ -2273,10 +2481,10 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
             /* Enable MPC & PM_FAST power-save, enable event_msgs, bring radio up, pre-populate scan cache */
             uint8_t mpc[8] = { 'm', 'p', 'c', 0u, 1u, 0u, 0u, 0u };
             uint32_t ml = 8u;
-            (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, mpc, 8u, &ml);
+            (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, mpc, 8u, &ml, 0);
             uint8_t pm[4] = { 2u, 0u, 0u, 0u }; /* PM_FAST */
             uint32_t pml = 4u;
-            (void)bcm_cdc_cmd(86u /* WLC_SET_PM */, 1, pm, 4u, &pml);
+            (void)bcm_cdc_cmd(86u /* WLC_SET_PM */, 1, pm, 4u, &pml, 0);
             {
                 static const char k_ev[] = "event_msgs";
                 uint8_t evm[32];
@@ -2284,14 +2492,14 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
                 for (unsigned i = 0; i < sizeof(k_ev); i++) evm[i] = (uint8_t)k_ev[i];
                 for (unsigned i = 0; i < 8u; i++) evm[sizeof(k_ev) + i] = 0xffu; /* events 0..63 */
                 uint32_t evl = sizeof(k_ev) + 16u;
-                (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, evm, evl, &evl);
+                (void)bcm_cdc_cmd(263u /* WLC_SET_VAR */, 1, evm, evl, &evl, 0);
             }
             uint8_t infra[4] = { 1u, 0u, 0u, 0u };
             uint32_t il = 4u;
-            (void)bcm_cdc_cmd(20u /* WLC_SET_INFRA */, 1, infra, 4u, &il);
+            (void)bcm_cdc_cmd(20u /* WLC_SET_INFRA */, 1, infra, 4u, &il, 0);
             uint8_t dummy[4] = { 0 };
             uint32_t dl = 4u;
-            (void)bcm_cdc_cmd(2u /* WLC_UP */, 1, dummy, 0u, &dl);
+            (void)bcm_cdc_cmd(2u /* WLC_UP */, 1, dummy, 0u, &dl, 0);
             k_iosleep(100u);
             (void)wifi_do_scan(0);
             wifi_attach_en0();
@@ -2304,10 +2512,14 @@ int exy_wifi_handle_op(const void *in_buf, uint32_t in_len, void *out_buf, uint3
         uint32_t cmd = req->arg0;
         uint32_t n   = req->arg1;
         int is_set   = (req->arg2 & 1u) ? 1 : 0;
-        if (n > sizeof(rsp->data)) n = sizeof(rsp->data);
+        if (n > sizeof(rsp->data) || n > max_in_data || max_out_data < n) {
+            rsp->err = -10;
+            *out_len = 8u;
+            return 0;
+        }
         for (uint32_t i = 0; i < n; i++) rsp->data[i] = req->data[i];
-        uint32_t rl = sizeof(rsp->data);
-        rsp->err = bcm_cdc_cmd(cmd, is_set, rsp->data, n, &rl);
+        uint32_t rl = (max_out_data < sizeof(rsp->data)) ? max_out_data : sizeof(rsp->data);
+        rsp->err = bcm_cdc_cmd(cmd, is_set, rsp->data, n, &rl, 0);
         rsp->out_len = (rsp->err == 0) ? rl : 0u;
         *out_len = 8u + rsp->out_len;
         return 0;

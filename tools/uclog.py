@@ -3,20 +3,13 @@
 
 usage: uclog.py <uc= address from the mkxnu info line>
 """
-import re, struct, subprocess, sys
+import struct, sys
+from fbmem import mem_bytes as mem
 
 RING, PIDS = 128, 32  # disp.c UC_RING, UC_PIDS
 
 
-def mem(addr):
-    o = subprocess.run(["fastboot", "getvar", f"mem:{addr:#x}"], capture_output=True, text=True, timeout=5)
-    m = re.search(r"mem:0x[0-9a-f]+: ((?:[0-9a-f]{8} ?){4})", o.stdout + o.stderr)
-    if not m:
-        sys.exit(f"getvar mem:{addr:#x} failed")
-    return struct.pack("<4I", *(int(w, 16) for w in m[1].split()))
-
-
-def cstr(va, cache={}):
+def cstr(va, cache):
     if not va:
         return "?"
     if va not in cache:
@@ -42,9 +35,10 @@ def main():
             break
         names[pid] = e[4:].split(b"\0")[0].decode("latin1")
     print(f"{count} entries")
+    cache = {}
     for n in range(max(0, count - RING), count):
         pid, sel, name, reps = struct.unpack("<4I", mem(base + 16 + 16 * (n % RING)))
-        print(f"{n:5} {pid:4} {names.get(pid, '?'):12} {cstr(name):40} sel {sel:3} x{reps}")
+        print(f"{n:5} {pid:4} {names.get(pid, '?'):12} {cstr(name, cache):40} sel {sel:3} x{reps}")
 
 
 if __name__ == "__main__":
